@@ -1,0 +1,19 @@
+find_package(Catch2 3 REQUIRED)
+
+add_executable(unit_tests
+    test_mock_protocol.cpp
+    test_pointcloud.cpp
+    test_export.cpp
+    test_usb_devices.cpp
+)
+target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain protocol pointcloud io usb util)
+target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+include(CTest)
+add_test(NAME unit_tests COMMAND unit_tests)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(
+    NAME python_tools
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_python_tools.py
+)

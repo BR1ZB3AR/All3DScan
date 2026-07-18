@@ -1,0 +1,20 @@
+# Grants non-root USB access to supported consumer 3D scanners so All3DScan
+# can talk to them via libusb/hidraw and V4L2 without running as root.
+#
+# Confirmed IDs:
+#   2207:110c  Revopoint POP4 / POP / POP2 / POP3 / MINI / RANGE (Chishine3d)
+#   2bc5:06da  Creality CR-Scan Otter (Orbbec depth module)
+# Vendor-wide rules also cover newer Revopoint (2207) and Creality (2bc5)
+# models. Add your Einstar/Shining3D VID here once confirmed with `lsusb`.
+#
+# Reload with:
+#   sudo cp resources/99-all3dscan-scanners.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Revopoint (vendor 2207)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2207", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2207", MODE="0666", GROUP="plugdev"
+
+# Creality (vendor 2bc5)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2bc5", MODE="0666", GROUP="plugdev"

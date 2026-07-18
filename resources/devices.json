@@ -1,0 +1,38 @@
+{
+  "_comment": "Supported/candidate USB IDs for consumer structured-light 3D scanners. Confirmed IDs come from dmesg/lsusb captures; unconfirmed IDs are shipped with \"enabled\": false so they are ignored until verified on real hardware. Omit productId (or set it to \"*\") to match every product from a vendor.",
+  "devices": [
+    {
+      "vendor": "Revopoint",
+      "vendorId": "2207",
+      "productId": "110c",
+      "label": "Revopoint POP4 / POP / POP2 / POP3 / MINI / RANGE (Chishine3d ZXProduct, confirmed 2026-07-16)"
+    },
+    {
+      "vendor": "Revopoint",
+      "vendorId": "2207",
+      "productId": "*",
+      "enabled": true,
+      "label": "Revopoint (any product on vendor 2207 — covers newer firmware/models)"
+    },
+    {
+      "vendor": "Creality",
+      "vendorId": "2bc5",
+      "productId": "06da",
+      "label": "Creality CR-Scan Otter (Orbbec module, confirmed via dmesg 2bc5:06da)"
+    },
+    {
+      "vendor": "Creality",
+      "vendorId": "2bc5",
+      "productId": "*",
+      "enabled": true,
+      "label": "Creality CR-Scan Ferret / Ferret Pro / Raptor (any product on vendor 2bc5)"
+    },
+    {
+      "vendor": "Einstar",
+      "vendorId": "2231",
+      "productId": "*",
+      "enabled": false,
+      "label": "Einstar / Shining3D (UNCONFIRMED VID — run `lsusb` with the scanner attached, set the real idVendor here, then flip \"enabled\" to true)"
+    }
+  ]
+}

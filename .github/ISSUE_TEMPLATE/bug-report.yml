@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible All3DScan problem
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: All3DScan version or commit
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Linux distribution, kernel, and GPU
+    validations:
+      required: true
+  - type: input
+    id: scanner
+    attributes:
+      label: Scanner model and firmware
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Remove serial numbers, credentials, and other personal information.
+    validations:
+      required: true

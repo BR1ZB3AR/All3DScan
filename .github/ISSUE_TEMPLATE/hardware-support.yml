@@ -1,0 +1,58 @@
+name: Scanner hardware support
+description: Report a scanner model or contribute Linux protocol evidence
+title: "[Hardware] "
+labels: ["hardware", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Detection is not full support. Please provide evidence so the compatibility matrix remains accurate. Remove serial numbers, credentials, and other personal data.
+  - type: input
+    id: vendor
+    attributes:
+      label: Vendor and exact model
+      placeholder: "Example: Creality CR-Scan Otter"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+  - type: input
+    id: system
+    attributes:
+      label: Linux distribution and kernel
+      placeholder: "Ubuntu 24.04, kernel 6.8.0"
+    validations:
+      required: true
+  - type: textarea
+    id: usb
+    attributes:
+      label: Sanitized lsusb output
+      description: Include `lsusb` and, if possible, `lsusb -v -d VID:PID`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: video
+    attributes:
+      label: V4L2 devices and formats
+      description: Include `v4l2-ctl --list-devices` and format output for each node.
+      render: shell
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: What currently works?
+      options:
+        - USB detection only
+        - Raw RGB preview
+        - Raw depth/IR preview
+        - Projector/control
+        - Metric point cloud
+        - Continuous scanning and reconstruction
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes or sanitized captures

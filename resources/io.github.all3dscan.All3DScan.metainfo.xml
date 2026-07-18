@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.all3dscan.All3DScan</id>
+  <name>All3DScan</name>
+  <summary>Native Linux scanning app for Revopoint, Creality and Einstar scanners</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>All3DScan contributors</developer_name>
+  <description>
+    <p>
+      Clean-room open-source Linux scanning application with a Revo Scan-style
+      dark interface. Captures data from consumer structured-light 3D scanners
+      (Revopoint, Creality, Einstar) on Ubuntu and related distributions, using
+      a native C++/Qt acquisition shell with Python/Open3D processing workers.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.all3dscan.All3DScan.desktop</launchable>
+  <provides>
+    <binary>all3dscan</binary>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+    <category>Science</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-07-18">
+      <description>
+        <p>Revo Scan-style dark UI, multi-vendor device detection, and hybrid Python meshing bridge.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=All3DScan
+Comment=Capture and process scans from Revopoint, Creality and Einstar 3D scanners
+Exec=all3dscan
+Icon=io.github.all3dscan.All3DScan
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+Keywords=3D;scanner;point cloud;mesh;revopoint;creality;einstar;
+StartupNotify=true

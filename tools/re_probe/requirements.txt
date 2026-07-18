@@ -1,0 +1,5 @@
+numpy
+hidapi
+opencv-python-headless
+v4l2py
+pyusb

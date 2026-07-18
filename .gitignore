@@ -1,0 +1,7 @@
+build/
+build-release/
+dist/
+*.o
+*.pcapng
+compile_commands.json
+.venv/
