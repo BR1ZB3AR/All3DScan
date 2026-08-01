@@ -1,4 +1,5 @@
-# All3DScan — Open-Source Native Linux 3D Scanning App [Project Still Under-Development]
+# All3DScan — Open-Source Native Linux 3D Scanning App 
+[Project Still Under-Development]
 
 A clean-room, open-source **native** Linux scanning application with a dark interface, targeting consumer structured-light 3D scanners
 from **Revopoint, Creality, and Einstar**. This is **not** a Wine wrapper:
