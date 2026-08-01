@@ -5,6 +5,7 @@ add_executable(unit_tests
     test_pointcloud.cpp
     test_export.cpp
     test_usb_devices.cpp
+    test_pop4_protocol.cpp
 )
 target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain protocol pointcloud io usb util)
 target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -25,16 +25,21 @@ target_include_directories(util PUBLIC src)
 add_library(protocol
     src/protocol/ScannerProtocol.h
     src/protocol/MockProtocol.cpp
+    src/protocol/RevopointPop4Protocol.h
+    src/protocol/RevopointPop4Protocol.cpp
 )
 target_include_directories(protocol PUBLIC src)
 
 add_library(usb
     src/usb/UsbDevice.h
     src/usb/UsbDevice.cpp
+    src/usb/V4l2Capture.h
+    src/usb/V4l2Capture.cpp
 )
 target_include_directories(usb PUBLIC src ${LIBUSB_INCLUDE_DIRS})
 target_link_libraries(usb PUBLIC ${LIBUSB_LIBRARIES} nlohmann_json::nlohmann_json)
 target_compile_options(usb PRIVATE ${LIBUSB_CFLAGS_OTHER})
+target_link_libraries(protocol PUBLIC usb)
 
 add_library(pointcloud
     src/pointcloud/PointCloud.h

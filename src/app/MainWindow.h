@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QMainWindow>
 
+#include <cstdint>
 #include <memory>
 
 #include "ScannerController.h"
@@ -30,6 +31,10 @@ private slots:
     void onCancel();
     void onExport();
     void onFrameReady(const pointcloud::PointCloud& cloud);
+    void onRawSensorFrame(uint32_t width,
+                          uint32_t height,
+                          uint32_t nonZeroSamples,
+                          uint64_t timestampUs);
     void onError(const QString& message);
 
 private:
@@ -39,6 +44,7 @@ private:
     QWidget* buildStatusBar();
     void buildMenus();
     void updateControlStates();
+    void updateFrameTelemetry();
 
     std::unique_ptr<ScannerController> controller_;
 

@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QTimer>
 
+#include <cstdint>
 #include <memory>
 
 #include "pointcloud/PointCloud.h"
@@ -31,6 +32,10 @@ signals:
     void connected();
     void disconnected();
     void frameReady(const pointcloud::PointCloud& cloud);
+    void rawSensorFrameReady(uint32_t width,
+                             uint32_t height,
+                             uint32_t nonZeroSamples,
+                             uint64_t timestampUs);
     void errorOccurred(const QString& message);
 
 private slots:

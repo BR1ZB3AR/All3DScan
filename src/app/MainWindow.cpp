@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProcessEnvironment>
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -57,8 +58,18 @@ QFrame* ribbonSeparator(QWidget* parent) {
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(tr("Untitled — All3DScan"));
 
-    controller_ = std::make_unique<ScannerController>(protocol::makeMockProtocol(), this);
+    const QString backend =
+        QProcessEnvironment::systemEnvironment().value("ALL3DSCAN_BACKEND").toLower();
+    auto scannerProtocol = backend == QStringLiteral("mock")
+                               ? protocol::makeMockProtocol()
+                               : protocol::makeRevopointPop4Protocol();
+    controller_ =
+        std::make_unique<ScannerController>(std::move(scannerProtocol), this);
     connect(controller_.get(), &ScannerController::frameReady, this, &MainWindow::onFrameReady);
+    connect(controller_.get(),
+            &ScannerController::rawSensorFrameReady,
+            this,
+            &MainWindow::onRawSensorFrame);
     connect(controller_.get(), &ScannerController::errorOccurred, this, &MainWindow::onError);
 
     buildMenus();
@@ -361,9 +372,26 @@ void MainWindow::onFrameReady(const pointcloud::PointCloud& cloud) {
     }
     distanceScale_->setDepthSamplesMm(depths);
 
+    updateFrameTelemetry();
+}
+
+void MainWindow::onRawSensorFrame(uint32_t width,
+                                  uint32_t height,
+                                  uint32_t nonZeroSamples,
+                                  uint64_t) {
+    connLabel_->setText(
+        tr("● POP4 raw Y16 %1×%2 — %3 active samples (metric decode pending)")
+            .arg(width)
+            .arg(height)
+            .arg(nonZeroSamples));
+    connLabel_->setStyleSheet("color:#e0a83e;");
+    updateFrameTelemetry();
+}
+
+void MainWindow::updateFrameTelemetry() {
     ++frameCount_;
     ++renderFrames_;
-    framesLabel_->setText(tr("Rendering Frames: %1").arg(renderFrames_));
+    framesLabel_->setText(tr("Captured Frames: %1").arg(renderFrames_));
     const qint64 elapsed = fpsTimer_.elapsed();
     if (elapsed >= 500) {
         const double fps = frameCount_ * 1000.0 / static_cast<double>(elapsed);

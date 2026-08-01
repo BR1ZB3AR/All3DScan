@@ -13,7 +13,7 @@ Support levels are evidence-based:
 
 | Vendor | Model/family | USB identity | Level | Notes |
 | --- | --- | --- | --- | --- |
-| Revopoint | POP4 | `2207:110c` | Capture (experimental) | UVC depth/RGB enumerates; native XU projector arming confirmed. Qt app still needs the real protocol backend. |
+| Revopoint | POP4 | `2207:110c` | Capture (experimental) | Native C++ XU arming, V4L2 node discovery, MMAP Y16 capture, and Qt backend selection work. Metric structured-light decode and calibration remain unresolved. |
 | Revopoint | POP/POP2/POP3/MINI/RANGE | vendor `2207` | Candidate | Vendor-wide detection is enabled, but this does not prove protocol compatibility. |
 | Creality | CR-Scan Otter | `2bc5:06da` | Detected | Public Linux descriptor evidence confirms three UVC functions plus HID. Capture/control protocol is not implemented. |
 | Creality | Ferret/Ferret Pro/Raptor | vendor `2bc5` | Candidate | Vendor-wide detection is enabled; model VID/PIDs and protocol behavior require hardware captures. |

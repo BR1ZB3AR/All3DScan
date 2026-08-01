@@ -4,6 +4,14 @@ namespace revoscan::pointcloud {
 
 PointCloud fromDepthFrame(const protocol::RawFrame& frame, const protocol::CameraIntrinsics& intrinsics) {
     PointCloud cloud;
+    const size_t expected =
+        static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height);
+    if (frame.encoding != protocol::DepthEncoding::MetricMillimeters ||
+        frame.width == 0 || frame.height == 0 ||
+        frame.depthMm.size() != expected ||
+        intrinsics.fx <= 0.0 || intrinsics.fy <= 0.0) {
+        return cloud;
+    }
     cloud.points.reserve(frame.depthMm.size());
 
     const bool hasColor = frame.rgb.size() == frame.depthMm.size() * 3;

@@ -6,6 +6,30 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Native C++ milestone (2026-07-18)
+
+All3DScan now contains a native `RevopointPop4Protocol` backend:
+
+- opens the confirmed `2207:110c` device through libusb;
+- detaches `uvcvideo` from depth VideoControl interface 0;
+- sends XU unit 4 CS10 (`01 00 00 00`) and the 60-byte CS7 settings payload;
+- releases the interface and reattaches `uvcvideo`;
+- discovers the matching V4L2 capture node through sysfs/VID/PID and advertised
+  format instead of assuming `/dev/video0`;
+- captures 640×512 Y16 with V4L2 MMAP.
+
+The native smoke test:
+
+```sh
+./build/all3dscan --probe-pop4
+```
+
+was run against a physical POP4 and captured 327,680 Y16 samples, 14,678 of
+them nonzero. The frame is intentionally tagged `VendorRawY16`; point-cloud
+generation rejects it because packed structured-light decoding and factory
+calibration are not yet known. This prevents visually plausible but false
+metric geometry.
+
 ## Background reading (not POP4-specific, but relevant context)
 
 - `frostworx/revopoint-pop2-linux-info` (GitHub): the POP2 runs an embedded

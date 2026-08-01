@@ -5,3 +5,7 @@ dist/
 *.pcapng
 compile_commands.json
 .venv/
+__pycache__/
+*.py[cod]
+tools/re_probe/*_log*.csv
+tools/re_probe/*.log

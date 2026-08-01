@@ -8,16 +8,23 @@
 
 namespace revoscan::protocol {
 
+enum class DepthEncoding {
+    MetricMillimeters,
+    // Raw vendor sensor words. These must never be projected as metric depth
+    // until the model-specific decoder and factory calibration are known.
+    VendorRawY16,
+};
+
 // One captured frame from the scanner. Depth is in millimeters, row-major,
 // width*height entries. rgb is optional (interleaved 8-bit RGB), also
-// row-major. Real POP4 sensor resolutions are unknown until Phase B capture
-// work fills them in; MockProtocol uses placeholder sizes.
+// row-major, unless encoding explicitly marks a vendor-raw diagnostic frame.
 struct RawFrame {
     uint32_t width = 0;
     uint32_t height = 0;
     std::vector<uint16_t> depthMm;
     std::vector<uint8_t> rgb; // empty if not available
     uint64_t timestampUs = 0;
+    DepthEncoding encoding = DepthEncoding::MetricMillimeters;
 };
 
 struct CameraIntrinsics {
@@ -64,8 +71,12 @@ public:
 
     virtual void setParams(const ScannerParams& params) = 0;
     virtual CameraIntrinsics intrinsics() const = 0;
+
+    virtual std::string backendName() const = 0;
+    virtual std::string lastError() const = 0;
 };
 
 std::unique_ptr<IScannerProtocol> makeMockProtocol();
+std::unique_ptr<IScannerProtocol> makeRevopointPop4Protocol();
 
 } // namespace revoscan::protocol

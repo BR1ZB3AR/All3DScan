@@ -1,4 +1,4 @@
-# All3DScan — Open-Source Native Linux 3D Scanning App
+# All3DScan — Open-Source Native Linux 3D Scanning App [Project Still Under-Development]
 
 A clean-room, open-source **native** Linux scanning application with a Revo
 Scan 6-style dark interface, targeting consumer structured-light 3D scanners
@@ -34,14 +34,16 @@ set the real `vendorId` in `resources/devices.json`, and flip `"enabled": true`.
 
 ## Status
 
-**Projector arming works on native Linux** for the Revopoint POP4 via the
-vendor UVC Extension Unit (CS10 enable + CS7 payload). Depth `Y16` nonzero
-count jumps from ~35 (laser off) to thousands when armed — see
-`tools/re_probe/xu_arm_replay.py` and `docs/protocol/RE_NOTES.md`.
+**Native C++ projector arming and raw capture work on Revopoint POP4.** The
+backend issues the vendor UVC Extension Unit CS10 + CS7 sequence through
+libusb, returns control to `uvcvideo`, discovers the correct node without
+assuming `/dev/videoN`, and streams 640×512 Y16 through V4L2 MMAP. A physical
+POP4 smoke test captured 327,680 samples with 14,678 nonzero values.
 
-Still open: structured-light decode of packed `Y16` buffers into metric depth,
-and a real capture protocol wired into the Qt app (today the GUI still uses
-`MockProtocol`).
+Still open: structured-light decoding of packed `Y16` buffers into metric
+depth, factory calibration extraction, RGB/depth registration, and a known
+projector-off command. All3DScan explicitly marks these frames as vendor-raw
+and refuses to project them as millimetres.
 
 ## Build (Ubuntu / Debian-based)
 
@@ -56,6 +58,19 @@ cmake --build build -j
 Run the app:
 ```sh
 ./build/all3dscan
+```
+
+The default backend is the native POP4 backend. Run the synthetic UI backend
+without hardware with:
+
+```sh
+ALL3DSCAN_BACKEND=mock ./build/all3dscan
+```
+
+Run a native, non-GUI POP4 arm/capture smoke test:
+
+```sh
+./build/all3dscan --probe-pop4
 ```
 
 Run tests:

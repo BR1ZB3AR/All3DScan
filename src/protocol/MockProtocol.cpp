@@ -96,6 +96,9 @@ public:
         };
     }
 
+    std::string backendName() const override { return "Mock scanner"; }
+    std::string lastError() const override { return {}; }
+
 private:
     static constexpr uint32_t kWidth = 320;
     static constexpr uint32_t kHeight = 240;

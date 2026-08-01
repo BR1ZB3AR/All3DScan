@@ -25,3 +25,26 @@ TEST_CASE("fromDepthFrame skips zero-depth pixels and back-projects correctly") 
     REQUIRE(p.g == 20);
     REQUIRE(p.b == 30);
 }
+
+TEST_CASE("fromDepthFrame rejects malformed metric frames") {
+    protocol::RawFrame frame;
+    frame.width = 2;
+    frame.height = 2;
+    frame.depthMm = {1000}; // should contain four samples
+    protocol::CameraIntrinsics intrinsics{
+        .fx = 100.0, .fy = 100.0, .cx = 1.0, .cy = 1.0};
+
+    REQUIRE(pointcloud::fromDepthFrame(frame, intrinsics).points.empty());
+}
+
+TEST_CASE("fromDepthFrame never interprets vendor raw Y16 as millimeters") {
+    protocol::RawFrame frame;
+    frame.width = 2;
+    frame.height = 1;
+    frame.depthMm = {1000, 2000};
+    frame.encoding = protocol::DepthEncoding::VendorRawY16;
+    protocol::CameraIntrinsics intrinsics{
+        .fx = 100.0, .fy = 100.0, .cx = 1.0, .cy = 0.0};
+
+    REQUIRE(pointcloud::fromDepthFrame(frame, intrinsics).points.empty());
+}
