@@ -194,6 +194,7 @@ void PointCloudView::setMesh(const geometry::TriangleMesh& mesh, bool textured) 
     meshTextured_ = textured && mesh.hasColors;
 
     cloud_.points.clear();
+    pointCount_ = 0; // the point VBO is about to be emptied; never draw stale counts
     selection_.clear();
     if (selectedCount_ != 0) {
         selectedCount_ = 0;
@@ -227,7 +228,9 @@ void PointCloudView::setMesh(const geometry::TriangleMesh& mesh, bool textured) 
     }
 
     // Per-vertex normals as the area-weighted sum of adjacent face normals.
-    meshIndices_ = mesh.indices;
+    // Triangles referencing missing vertices are dropped here so glDrawElements
+    // can never read past the vertex buffer.
+    meshIndices_.reserve(mesh.indices.size());
     for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
         const uint32_t ia = mesh.indices[t + 0];
         const uint32_t ib = mesh.indices[t + 1];
@@ -235,6 +238,7 @@ void PointCloudView::setMesh(const geometry::TriangleMesh& mesh, bool textured) 
         if (ia >= vcount || ib >= vcount || ic >= vcount) {
             continue;
         }
+        meshIndices_.insert(meshIndices_.end(), {ia, ib, ic});
         const MeshVertex& a = meshVertices_[ia];
         const MeshVertex& b = meshVertices_[ib];
         const MeshVertex& c = meshVertices_[ic];
@@ -453,8 +457,11 @@ void PointCloudView::uploadCloud() {
     }
 
     if (!vbo_ || !vao_) {
+        pointCount_ = 0;
         return;
     }
+    // Draw exactly what the buffer holds, whatever callers did to cloud_.
+    pointCount_ = vertices_.size();
     vao_->bind();
     vbo_->bind();
     if (vertices_.empty()) {
