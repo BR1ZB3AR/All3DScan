@@ -21,4 +21,10 @@ std::optional<std::string> findDevicesJson();
 std::optional<std::string> findMeshWorkerScript();
 std::optional<std::string> findAppIcon();
 
+// Returns an argv prefix that launches OrcaSlicer (or a compatible slicer),
+// e.g. {"orca-slicer"} or {"flatpak","run","com.orcaslicer.OrcaSlicer"}.
+// The file to open is appended by the caller. nullopt if none is found.
+// Override with ALL3DSCAN_SLICER (path or command).
+std::optional<std::vector<std::string>> findSlicerCommand();
+
 } // namespace revoscan::util

@@ -1,0 +1,146 @@
+# Changelog
+
+All notable changes to All3DScan are logged here, newest first. Versions
+follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
+project is pre-release reverse-engineering work, not semver.
+
+## Alpha-v20260802-1557
+
+### Fixed
+- **Stereo Auto-Swap Startup Lock Fix**: Fixed a bug where `commitAutoSwap()` locked `autoSwapCache()` on frame 0 during startup when illumination/power was initializing:
+  - Added a minimum valid point threshold (`validPoints >= 100`) before committing auto-swap orientation, preventing unilluminated startup frames from permanently caching the wrong L/R view order.
+  - Added `resetAutoSwapCache()` inside `Pop4DepthDecoder::setCalibration()` to reset cached orientation whenever the scanner connects or updates calibration, allowing continuous accurate orientation scoring under active illumination.
+
+## Alpha-v20260802-1550
+
+### Fixed
+- **Emitter Control Power Scaling & Shutter Fix**: Corrected raw default values in `ScannerControlState` ([ScannerProtocol.h](file:///home/br1zb3ar/Reverse-Engineer-All3DScan-On-Linux/src/protocol/ScannerProtocol.h#L102)):
+  - Updated illumination, laser, and exposure to default to their proper 50% / 70% raw byte constants (`kIllumDefault = 130`, `kLaserDefault = 180`, `kExposureDefault = 3000us`).
+  - Previously, setting small percentage values (e.g. 50) directly into 0..255 and 500..6000 hardware fields clamped exposure to 500us (minimum shutter time / 0% exposure) and laser/illumination to <10%, starving the camera of structured light.
+  - Now on connect, the scanner emits bright structured light patterns at 50% illumination, 70% laser, and 3000us exposure.
+
+## Alpha-v20260802-1538
+
+### Fixed
+- **Fringe Modulation Threshold Adjustment**: Lowered `kModulationMin` from `6.5f` to **`2.5f`** in both CPU ([Pop4DepthDecoder.cpp](file:///home/br1zb3ar/Reverse-Engineer-All3DScan-On-Linux/src/decoder/Pop4DepthDecoder.cpp#L25)) and CUDA ([Pop4StereoCuda.cu](file:///home/br1zb3ar/Reverse-Engineer-All3DScan-On-Linux/src/decoder/Pop4StereoCuda.cu#L21)) kernels to match the official APK `libRPASpeckleStereo.so` threshold:
+  - Previously, `6.5f` was over 2x too strict, discarding valid low-contrast fringe phase data across 97% of the surface and starving the decoder (`Depth lock: 2%`).
+  - Setting it to `2.5f` allows the phase decoder to process valid fringe signals across the full object surface.
+
+## Alpha-v20260802-1534
+
+### Fixed
+- **Fringe Period Uniqueness Exclusion Fix**: Resolved the mathematical bug causing 3% depth lock and concentric funnel ring steps:
+  - Previously, the rival cost search only excluded $\pm 1\text{px}$ (`|d - bestD| <= 1`), accidentally comparing the winner against the shoulder of its own local cost bowl ($\pm 2, \pm 3\text{px}$) rather than actual rival fringe periods ($\approx 8\text{--}16\text{px}$).
+  - Updated the exclusion window to **`|d - bestD| < 6`** in both CPU ([Pop4DepthDecoder.cpp](file:///home/br1zb3ar/Reverse-Engineer-All3DScan-On-Linux/src/decoder/Pop4DepthDecoder.cpp#L280)) and CUDA ([Pop4StereoCuda.cu](file:///home/br1zb3ar/Reverse-Engineer-All3DScan-On-Linux/src/decoder/Pop4StereoCuda.cu#L165)) kernels.
+  - This allows real surface points to easily pass uniqueness against actual rival periods, unlocking dense valid 3D points and eliminating concentric ring step artifacts.
+
+## Alpha-v20260802-1528
+
+### Fixed
+- **Structured Light Projector / Laser Default Power Fix**: Fixed a critical bug in control initialization where `illuminationPower` and `laserPower` defaulted to `0%`. This caused the projector hardware to stream without active fringe patterns, leading to 2% depth lock and noisy funnel clouds. Default active power levels are now initialized on connect (`Illumination: 50%`, `Scan Laser: 70%`, `Exposure: 50%`, `Emitters On`).
+
+## Alpha-v20260802-1516
+
+### Added
+- **PCL Moving Least Squares (MLS) Surface Smoothing**: Integrated PCL's native `pcl::MovingLeastSquares` polynomial surface reconstruction engine (inspired by `3DScanr` and `pointclouds.org`):
+  - Smooths out depth sensor noise while preserving sharp feature edges.
+  - Re-computes accurate surface normals for high-fidelity meshing.
+  - Added the **MLS Smooth Surface (PCL)** button in the post-processing Edit panel.
+
+## Alpha-v20260802-1504
+
+### Fixed
+- **Specular & Metallic Target Support**: Resolved the fronto-parallel cone/vase deformation on highly specular/reflective surfaces (e.g. metallic soda cans):
+  - Balanced the intensity weighting to `0.05f` to prevent specular highlight mismatches from corrupting phase matching.
+  - Tightened the Left-Right consistency check from `3.5px` to `1.2px` (`lrMaxDiff`) to geometrically filter out wrong-period ghost layers rather than relying heavily on surface albedo.
+  - Set uniqueness ratio to `0.93f` for a balanced match selection.
+
+## Alpha-v20260802-1453
+
+### Added
+- **PCL (Point Cloud Library) Integration**: Fully linked PCL (v1.14.0) into the build system and replaced the slow, custom $O(N^2)$ outlier removal algorithm in the edit panel with a high-performance, KdTree-based `pcl::StatisticalOutlierRemoval` filter.
+
+## Alpha-v20260802-1112
+
+### Added
+- **Immediate Live Preview (Preview Mode)**: Automatically start streaming and polling from the scanner immediately on connection to show the live camera view in the viewport.
+- **Fringe Ambiguity Resolution**: Tightened matching parameters to resolve true 3D shape and eliminate concentric ghost layers:
+  - Tightened uniqueness ratio from `0.95f` to `0.90f` to reject ambiguous rival matches.
+  - Increased minimum cost margin from `0.001f` to `0.005f`.
+  - Tuned default modulation threshold to `6.5f` and intensity weighting to `0.08f`.
+
+### Fixed
+- **Scan Accumulation Control**: Rewired the Scan/Pause button to toggle point cloud accumulation/fusion, keeping the live stream running in preview mode prior to scanning.
+
+## Alpha-v20260802-1033
+
+### Fixed
+- **Clean Grayscale IR Stream**: Removed the experimental blue/cyan coverage overlay tint from the IR Stream albedo view, restoring a pure grayscale feed that matches Revo Scan.
+- **Pill-shaped Zoom Button Layout**: Embedded the `1x`, `1.5x`, and `2x` zoom buttons inside a semi-transparent floating pill-shaped overlay widget directly on top of the video container, preventing them from shifting the video layout downward.
+- **Default Mode to Depth**: Set the default camera mode of the Depth Camera view to the colorized Depth Map on launch/stream.
+
+## Alpha-v20260802-1025
+
+### Added
+- **Depth Map View Mode in Depth Camera**: The depth camera panel can now toggle between displaying the raw IR stream (grayscale fringes) and a colorized metric depth map. The colorization uses standard zone colors matching the working distance widget (Too Near: red, Excellent: green/cyan, Good: green, Far: orange, Too Far: red).
+- **Digital Zoom Crops**: Added `1x`, `1.5x`, and `2x` digital zoom buttons inside the depth camera preview to crop and focus on fine-grained areas during scans.
+
+### Fixed
+- **Distance Scale Edge Sync**: Dynamic band edges are now updated dynamically on the vertical scale widget alongside scanning distance combo selections.
+
+## Alpha-v20260802-1009
+
+Prompted by a real-hardware scan of a small object (Revopoint POP4) where the
+live point cloud was a shapeless blob unrelated to the object's actual shape,
+even though tracking/fusion reported success. Root cause: the ribbon's
+"Scanning Distance" presets (120-219mm / 210-400mm / 250-500mm) only ever
+adjusted post-decode `ForegroundIsolation` clipping — the POP4 stereo phase
+decoder itself always searched a fixed disparity window (8-120px) and clamped
+to a fixed 200-650mm depth band, regardless of the selected preset. Objects
+closer than ~220mm produce real disparities the decoder structurally couldn't
+search, so it locked onto the best *available but wrong* fringe-period match
+inside the fixed window — producing incoherent, noisy geometry that still
+passed the decoder's own validity gates.
+
+### Fixed
+- **Decoder search band now follows the selected scanning distance.**
+  `Pop4DepthDecoder::setDepthRange(minMm, maxMm)` derives the disparity
+  search range `[dispMin, dispMax]` from the calibration's stereo Q matrix
+  each decode, instead of a hardcoded band tuned for one preset. Both the CPU
+  path (`Pop4DepthDecoder.cpp`) and the CUDA kernel (`Pop4StereoCuda.cu`) take
+  this as a runtime parameter now. `MainWindow::onScanDistanceChanged` calls
+  `IScannerProtocol::setDepthRangeHint()` alongside the existing isolation/
+  depth-clip updates, so picking "120-219mm" for a close-up object actually
+  retunes the decoder instead of only affecting downstream cropping.
+- **"Accuracy" ribbon control was decorative.** The "High Accuracy" /
+  "Standard" dropdown existed but had zero signal connections; fusion voxel
+  sizes were hardcoded `constexpr`. `ScanPipeline::setPointDistance(mm)` makes
+  the fused-model point spacing (Revo Scan's "point distance") a runtime
+  atomic; the combo now drives it (1.0mm / 2.2mm), matching the point-distance
+  quality/speed trade-off praised in the POP4 hands-on review this update was
+  based on watching.
+
+### Added
+- **Live depth-decode confidence readout.** A new "Depth lock: NN% (CUDA/CPU,
+  σ=X.Xpx)" label next to Tracking status, driven by
+  `IScannerProtocol::depthDecodeStats()` / `Pop4DepthDecoder::lastStats()`.
+  Surfaces per-frame valid-match fraction and disparity spread that were
+  previously only visible via `ALL3DSCAN_POP4_DEBUG=1` stderr logging, so a
+  garbage frame is visibly flagged (red/amber) instead of silently accepted.
+
+### Known limitation (not fixed by this update)
+This does not make POP4 depth reconstruction calibrated or accurate — the
+decoder is still a clean-room approximation (`ApproximatePop4FullField`
+calibration, single-frequency phase matching) without Revopoint's factory
+calibration or exact algorithm. Single-frequency phase matching is inherently
+period-ambiguous; even with the search band now correctly targeted, textureless
+or repetitive-pattern surfaces can still produce wrong-period matches. The new
+"Depth lock" readout is meant to make that visible and actionable (reposition
+the object, adjust the distance preset) rather than to eliminate it. See
+`docs/protocol/RE_NOTES.md` and `docs/protocol/USBCAP_CHECKLIST.md` for the
+path to real calibration.
+
+### Also in this session
+- Wired the previously-decorative "Accuracy" ribbon dropdown (see Fixed,
+  above) after a review of the Revopoint POP4 hands-on video prompted a
+  broader pass over scan-mode / quality UI stubs.

@@ -6,6 +6,311 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Native C++ milestone (2026-07-18)
+
+All3DScan now contains a native `RevopointPop4Protocol` backend:
+
+- opens the confirmed `2207:110c` device through libusb;
+- detaches `uvcvideo` from depth VideoControl interface 0;
+- sends XU unit 4 CS10 (`01 00 00 00`) and the 60-byte CS7 settings payload;
+- releases the interface and reattaches `uvcvideo`;
+- discovers the matching V4L2 capture node through sysfs/VID/PID and advertised
+  format instead of assuming `/dev/video0`;
+- captures **640×2560** packed Y16 when advertised (five stacked 640×512
+  planes), with **640×512** as fallback;
+- runs an approximate full-field decoder (`Pop4DepthDecoder`): four-step phase
+  → row phase match → Q-based mm using FOV/baseline defaults marked
+  `ApproximatePop4FullField`.
+
+The native smoke test:
+
+```sh
+./build/all3dscan --probe-pop4
+```
+
+reports packed-plane nonzero counts and whether metric decode succeeded.
+Factory `camparam.yaml` / true `depthScale` (`PROPERTY_EXT_DEPTH_SCALE=0x0918`)
+are still required for absolute millimetre accuracy — the shipped path is
+explicitly approximate.
+
+For physical target calibration before factory parameters are available, the
+assumed 55 mm stereo baseline can be overridden without rebuilding:
+
+```sh
+ALL3DSCAN_POP4_BASELINE_MM=55 ./build/all3dscan --probe-pop4
+```
+
+Measure a planar target at a known distance and adjust this value
+proportionally (`newBaseline = oldBaseline × knownDistance / measuredDistance`).
+Accepted values are 20–120 mm.
+
+### CUDA stereo decode (optional)
+
+When built with `ALL3DSCAN_WITH_CUDA=ON` (default if a CUDA toolkit is found),
+`Pop4DepthDecoder` runs phase + disparity matching on the GPU and falls back to
+CPU on failure. Force CPU with `ALL3DSCAN_POP4_CUDA=0`. Rebuild:
+
+```sh
+cmake -S . -B build -DALL3DSCAN_WITH_CUDA=ON
+cmake --build build -j
+```
+
+CUDA speeds matching; it does **not** replace factory `camparam` / Q accuracy.
+The status string reports `CUDA` or `CPU` in the POP4 backend name.
+
+### Robust disparity — fixing the "green blob / slab" (2026-07-21)
+
+Symptom: live POP4 scans ran (CUDA active, depth view plausible) but the fused
+3D result was a dense green cube/blob instead of the real object (a handheld
+fan).
+
+Root cause: the four-step phase is a **single-frequency wrapped phase** (0..2π),
+which is *periodic* across the field. The winner-take-all disparity search
+matched wrapped phase per pixel with only a weak margin gate, so the depth
+clamp (210–500 mm → disparity ≈ 42–99 px, narrower than one fringe period)
+left essentially one surviving periodic candidate per pixel at a nearly
+constant disparity. That back-projects to a **fronto-parallel slab**; ICP then
+fuses slabs from every sweep pose into a filled cube. Foreground isolation also
+kept the background plane, and no median/speckle cleanup removed wrong-fringe
+matches.
+
+Fixes (mirrored in `Pop4DepthDecoder.cpp` **decodeCpu** and
+`Pop4StereoCuda.cu`, driven by shared `DecodeParams`):
+
+- **Left↔right consistency**: match L→R and R→L, keep only mutually consistent
+  disparities (`|dispL − dispR| ≤ lrMaxDiff`). Kills wrong-fringe matches.
+- **Uniqueness**: additive margin **and** a ratio test against the best rival at
+  a *different* fringe period.
+- **3×3 disparity median** + **5×5 local-support speckle removal** before the
+  disparity→depth conversion.
+- **Foreground isolation**: RANSAC removal of the dominant *fronto-parallel*
+  plane (`isolateForegroundObject`) before nearest-cluster selection, so the
+  object relief stands out of the slab. Guarded so it never empties the cloud
+  and only fires on large, near-perpendicular planes.
+
+Source label stays `ApproximatePop4FullField` (no factory-accuracy claims).
+
+Tuning env knobs (all optional; sensible defaults on):
+
+```sh
+ALL3DSCAN_POP4_LRCHECK=1      # left-right consistency (default on)
+ALL3DSCAN_POP4_UNIQ=0.75      # best < UNIQ*rival ratio test
+ALL3DSCAN_POP4_MARGIN=0.03    # additive cost margin
+ALL3DSCAN_POP4_MEDIAN=1       # 3x3 disparity median
+ALL3DSCAN_POP4_SPECKLE=1      # local-support speckle removal
+ALL3DSCAN_POP4_SPECKLE_SUPPORT=6
+ALL3DSCAN_POP4_MAXCOST=0.15   # phase-agreement gate
+ALL3DSCAN_POP4_DEBUG=1        # stderr disparity/valid% histogram (every 15 frames)
+```
+
+Existing knobs (`ALL3DSCAN_POP4_CUDA`, `_SWAP_LR`, `_STEREO_BAND`,
+`_BASELINE_MM`) are unchanged. If a scan is still blobby, first try
+`ALL3DSCAN_POP4_DEBUG=1` to inspect disparity spread; a near-zero std means the
+phase is still collapsing (raise `_UNIQ` toward 0.5, raise `_MARGIN`), while too
+few valid points means over-filtering (lower `_SPECKLE_SUPPORT`, or set
+`_LRCHECK=0`).
+
+## Packed phase-stream milestone (2026-07-19)
+
+Live captures of every advertised Y16 size corrected the earlier assumption
+that `640x512` was a useful complete scan frame:
+
+- `640x512` was partial/sparse in the tested state (nonzero data only in rows
+  0-255).
+- `640x1024` populated one 640x512 half in the tested state.
+- `640x2560` produced five complete 640x512 temporal planes.
+- Each 640x512 plane contains two 320x512 views side-by-side. The scene is
+  visibly duplicated once per stereo camera.
+
+ARM64 analysis of APK `libRPASpeckleStereo.so` confirms the matching decoder:
+
+1. Split the first four temporal planes into left and right image vectors.
+2. For each camera compute `x = I0-I2`, `y = I1-I3`, and wrapped phase
+   `atan2(y,x)`; reject modulation below 3.
+3. Rectify both phase maps with per-device stereo calibration.
+4. Match phase along epipolar rows with subpixel refinement to obtain uint16
+   disparity.
+5. Map disparity through a 65,536-entry LUT derived from the OpenCV stereo
+   `Q` matrix and the SDK depth scale.
+
+The fifth temporal plane is auxiliary intensity/confidence data; its exact
+role is not yet confirmed. `tools/re_probe/pop4_y16_analyze.py` implements
+the confirmed splitting and four-step wrapped-phase stage. A physical fixture
+produced valid phase for roughly 61% of the combined stereo pixels.
+
+**Native status (2026-07-19):** `RevopointPop4Protocol` + `Pop4DepthDecoder`
+now implement steps 1–2 and an approximate stand-in for 4–5 (FOV-based
+intrinsics, ~55 mm baseline, `Z = fx·B / disparity`, clamped 210–500 mm).
+Step 3 (factory rectification / `camparam`) remains open. Do not treat
+approximate mm as factory-accurate until Q/`0x0918` are recovered from the
+device.
+
+APK static analysis (2026-07-19) resolved the depth-scale **property ID** to
+`0x0918` (`PROPERTY_EXT_DEPTH_SCALE`) and confirmed a POP4 SDK fallback of
+`0.01f` when that read fails. The XU framing that carries `0x0918` is still
+unknown — see [`APK_REVOSCAN_6.0.2.4.md`](APK_REVOSCAN_6.0.2.4.md). Do not send
+`0x0918` as a raw control selector.
+
+## TSDF live-fusion Complete path (2026-07-19)
+
+`Complete` now prefers **volumetric TSDF reconstruction** over a single Poisson
+pass on the fused point cloud — this is closer to how RevoScan builds its live
+model (frame-to-model tracking + volumetric integration) than accumulating a
+cloud and Poisson-meshing it once.
+
+Data flow:
+
+1. `ScannerController` retains the full metric depth map + intrinsics of each
+   metric frame (`lastMetricDepth()` / `lastIntrinsics()`), not just the
+   isolated cloud.
+2. `MainWindow::onMetricFrame` forwards these via
+   `ScanPipeline::submitMetricFrame`.
+3. The pipeline's ICP worker recovers each frame's camera→world pose (unchanged
+   live path) and, subject to a motion gate (≥8 mm or ≥~3°, capped at 160
+   frames), snapshots a `DepthKeyframe` `{depthMm, intrinsics, pose}`.
+4. On `Complete`, if ≥4 keyframes exist, the pipeline writes raw uint16 depth
+   bins + a JSON manifest to a temp dir and calls the new `tsdf` worker command.
+   `mesh_worker.py::tsdf_reconstruct` integrates each frame into an Open3D
+   `ScalableTSDFVolume` (`extrinsic = inv(pose)`, depth cropped to the current
+   working-distance band, `depth_scale = 1000`) and extracts a watertight mesh.
+   The mesh is written as **ASCII PLY** so the lightweight C++ parser can read
+   it (Poisson/smooth writes are now ASCII too).
+5. Any TSDF failure (no Open3D, empty volume, too few keyframes) falls back to
+   the previous Poisson path; the TSDF reason is surfaced in the error string.
+
+Caveats until factory rectification lands: keyframe poses come from approximate
+metric depth, so the TSDF surface inherits the same scale uncertainty as the
+decoder. Integration uses the full depth map (not the isolated cloud) cropped to
+the isolation band, so background inside the band can leak in — crop after
+Complete if needed.
+
+## Registered IR-albedo texture (2026-07-19)
+
+The live model and TSDF mesh are now **textured** instead of untextured/gray.
+The four-step phase planes carry, per left-view pixel, a DC term
+`A = (I0+I1+I2+I3)/4` — the surface's IR albedo under the projected pattern.
+Because it comes from the *same* left camera pixels as the decoded depth, it is
+inherently registered with zero depth↔RGB extrinsics:
+
+- `Pop4DepthDecoder::decode` fills `RawFrame.rgb` (320×512×3) with this DC term
+  as grayscale (mild gain `kTextureGain`). `pointcloud::fromDepthFrame` already
+  maps `rgb` onto point colors, so the live cloud is shaded immediately.
+- `ScanPipeline` retains the texture per `DepthKeyframe` and writes a `.rgb`
+  companion per keyframe; `mesh_worker.py::tsdf_reconstruct` loads it as the
+  Open3D color image so `extract_triangle_mesh` returns a colored surface
+  (ASCII-PLY colors parsed back into `TriangleMesh`).
+
+This is **grayscale IR texture**, not the POP4 RGB camera. True color from the
+separate visible-light sensor is a larger follow-up: it needs (a) capturing the
+RGB UVC node on Linux and (b) a depth→RGB extrinsic + intrinsics to project
+depth points into the color image. Both are still open (no factory `camparam`).
+
+## Live tracking / fusion improvements (2026-07-19)
+
+Real-time scanning was tightened to feel closer to RevoScan's live model:
+
+- **ICP recovery**: tight pass → wide correspondence (~50 mm) around the last
+  pose → identity relocalization when the user returns to a known view.
+- **Reject noisy poses**: fitness floor + RMSE gate so bad frames never corrupt
+  the model; `lastPose_` is preserved across Lost frames as a prediction.
+- **Denser live model**: ICP on a 5 mm cloud for speed; fuse a 2.5 mm downsample
+  of the full frame into the document.
+- **Coverage tint**: well-aligned frames tint newly fused voxels green (newest
+  sample wins in the voxel grid) so freshly covered surface pops like RevoScan.
+- **HUD**: tracking label shows fitness %, model point count, and TSDF keyframe
+  count (`KF`).
+
+Still open for live feel: async Complete with ETA, and factory calibration
+for less noisy depth.
+
+## Live shaded mesh preview (2026-07-19)
+
+During scanning with **Live Fusion** + **Live Mesh** (default on), the Scan
+viewport shows a growing **shaded triangle mesh** instead of only points:
+
+1. Each tracked metric depth frame is converted to an organized depth mesh
+   (`geometry::meshFromOrganizedDepth`, stride 2, discontinuity reject).
+2. Vertices are transformed by the live ICP pose and voxel-welded into an
+   accumulating preview (`mergeMeshVoxel`, ~4 mm, capped ~180k verts).
+3. Updates are throttled (~8 Hz) and rendered with the existing mesh shader
+   (clay when Color is off, IR texture when on).
+
+This is a fast preview surface — Complete still runs TSDF/Poisson for the
+final Model mesh. Toggle **Live Mesh** off to fall back to the point cloud.
+
+## Model stage tabs (2026-07-19)
+
+The Edit/Model page now mirrors Revo Scan's post-scan workspace with
+`Raw / Point Clouds / Meshed / Textured` stage tabs over one viewport:
+
+- **Raw** — fused metric cloud, color off (plain geometry).
+- **Point Clouds** — fused cloud with IR-albedo color.
+- **Meshed** — the TSDF/Poisson surface as a shaded clay mesh.
+- **Textured** — the same surface with its per-vertex IR texture.
+
+`PointCloudView` gained a triangle-mesh renderer (indexed draw, per-vertex
+normals, camera-headlight shading) alongside the point renderer; selection
+editing stays on the two cloud stages. `Complete` lands on the richest available
+stage (Textured if the mesh has colors, else Meshed). Not yet matched from the
+reference screen: an async "Processing… (ETA)" dialog (Complete still runs
+synchronously) and a separate re-run "Fusion" action.
+
+## POP4 “AI-powered” parity (host vs device)
+
+Marketing for POP4 as an **AI-powered scanner** refers almost entirely to
+**host-side RevoScan / Revo AI features**, not to a neural net inside the
+USB depth path. The sensor still delivers structured-light / stereo phase
+data; AI layers improve registration, isolation, and mesh cleanup after
+(or beside) metric depth.
+
+| Layer | Where it runs | RevoScan role | All3DScan today | Native candidate |
+| --- | --- | --- | --- | --- |
+| Four-step phase → disparity → depth | Device + host decoder | Core depth | `Pop4DepthDecoder` (approx mm) | Factory `camparam` / Q / `0x0918` |
+| Marker-free tracking | Host | Revo AI tracking | ICP live fusion (`ScanPipeline` / `Registration`) | Learned registration / loop closure |
+| Volumetric fusion | Host | Live model integration | TSDF on Complete (`mesh_worker tsdf`), Poisson fallback | Real-time incremental TSDF |
+| Surface texture | Host | RGB-camera color | Registered IR-albedo grayscale (decoder DC term) | RGB UVC capture + depth→RGB extrinsic |
+| Object vs background | Host | AI segmentation | Heuristic `isolateForegroundObject` | Lightweight segmentation model |
+| Mesh cleanup / hole-fill | Host post | AI mesh tools | Mesh worker + Edit panel | Learned denoise / hole-fill pass |
+
+**Implications for this project:**
+
+1. Closing the **depth accuracy** gap (factory stereo calib + true depth
+   scale) remains the priority for exportable millimetres.
+2. Closing the **AI UX** gap is optional and separable: ship geometric
+   equivalents first, then swap in learned models without changing USB
+   arming or the packed Y16 layout.
+3. Do **not** ship proprietary Revo AI model weights or `lib3DCamera.so`.
+   Any learned parity must use open weights or models we train/license
+   ourselves.
+
+**Suggested order if we pursue AI parity later:**
+
+1. Learned **segmentation** (biggest visible win vs table/background).
+2. Learned **frame registration / loop closure** (less drift on flat /
+   featureless objects).
+3. Learned **mesh denoise / hole-fill** after Complete.
+
+Gaussian splat / full Revo AI reconstruction stay out of scope until
+metric depth and basic AI parity are solid.
+
+## Capture-backed protocol import (2026-07-19)
+
+Official Revo Scan 6 control sequences (mode, lighting, blue laser, calibration
+reads, emitter-off) are **not yet confirmed by USBPcap**. Until captures land:
+
+- Linux arming remains the empirical CS10 + CS7 sequence above.
+- Metric decode, lighting UI, and blue-laser mode stay disabled / raw-preview.
+- Do **not** invent selector names or off commands here.
+
+Capture procedure and import pipeline:
+
+- Checklist: [`USBCAP_CHECKLIST.md`](USBCAP_CHECKLIST.md)
+- Windows PCAPNG → TShark JSON → `tools/re_probe/pcapng_import.py`
+- Dry-run / live replay: `tools/re_probe/xu_probe.py --sequence … [--dry-run]`
+
+Only capture-backed CS payloads and a verified projector/laser-off sequence
+may be promoted into `RevopointPop4Protocol` and this notes file.
+
 ## Background reading (not POP4-specific, but relevant context)
 
 - `frostworx/revopoint-pop2-linux-info` (GitHub): the POP2 runs an embedded
@@ -18,6 +323,19 @@ bottom of this doc).
   app built against their proprietary "3DCamera" SDK. It doesn't include
   POP4 support and its SDK is closed-source, but its structure is a useful
   reference for how they structure Qt + camera-control apps.
+- PlusToolkit `PlusLib` has a `Revopoint3DCamera` device
+  (<https://pluslib.readthedocs.io/en/latest/devices/DeviceRevopointSurface.html>)
+  that also runs on Linux (Ubuntu ≥18.04) **only via the closed Revopoint
+  3D Camera SDK** (tested SDK 2.4.0). Not a clean-room decoder, but it
+  corroborates several facts: the SDK exposes both `DEPTH` and `PCL`
+  (x-y-z point cloud) frame types (depth→cloud is host/SDK-side, matching
+  our `fromDepthFrame`); an example stream config uses `FrameWidth=1920`,
+  `FrameRate=8` — consistent with the advertised **`1920×512`** mode
+  alongside our packed `640×2560`; and the SDK-wide default `DepthRange` is
+  `5 500` mm (generic default, not POP4-specific — our 210–500 clamp still
+  matches POP4's working band). It also references a udev-rules repo
+  (`latimagine/PlusHelpers`) worth comparing to
+  `resources/99-all3dscan-scanners.rules` if permission gaps appear.
 - No public reverse-engineering of POP4's USB protocol was found as of
   2026-07-11.
 

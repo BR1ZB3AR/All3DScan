@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT}/build-release}"
 DIST_DIR="${DIST_DIR:-${ROOT}/dist}"
 TARGET="${1:-all}"
-VERSION="0.1.0"
+VERSION="Alpha-v20260802-1033"
 
 case "${TARGET}" in
   all|deb|appimage) ;;

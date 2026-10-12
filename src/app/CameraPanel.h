@@ -18,6 +18,9 @@ public:
 
     explicit CameraPanel(const QString& title, Kind kind, QWidget* parent = nullptr);
 
+    bool showDepthMap() const { return showDepthMap_; }
+    float zoomFactor() const { return zoomFactor_; }
+
 public slots:
     void setPreview(const QImage& image);
     void clearPreview();
@@ -25,11 +28,24 @@ public slots:
 signals:
     void exposureChanged(int value);
     void autoExposureToggled(bool on);
+    void depthModeToggled(bool showDepthMap);
+
+private slots:
+    void onModeToggle();
+    void onZoomSelect();
 
 private:
     Kind kind_;
     QLabel* preview_ = nullptr;
     QToolButton* exposureAuto_ = nullptr;
+
+    // Overlay controls
+    QToolButton* modeToggleBtn_ = nullptr;
+    QWidget* zoomGroupWidget_ = nullptr;
+
+    bool showDepthMap_ = false;
+    float zoomFactor_ = 1.0f;
+    QImage lastImage_;
 };
 
 } // namespace revoscan::app

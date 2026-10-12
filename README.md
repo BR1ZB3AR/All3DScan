@@ -34,14 +34,27 @@ set the real `vendorId` in `resources/devices.json`, and flip `"enabled": true`.
 
 ## Status
 
-**Projector arming works on native Linux** for the Revopoint POP4 via the
-vendor UVC Extension Unit (CS10 enable + CS7 payload). Depth `Y16` nonzero
-count jumps from ~35 (laser off) to thousands when armed — see
-`tools/re_probe/xu_arm_replay.py` and `docs/protocol/RE_NOTES.md`.
+**Native C++ projector arming and raw capture work on Revopoint POP4.** The
+backend issues the vendor UVC Extension Unit CS10 + CS7 sequence through
+libusb, returns control to `uvcvideo`, discovers the correct node without
+assuming `/dev/videoN`, and streams 640×512 Y16 through V4L2 MMAP. A physical
+POP4 smoke test captured 327,680 samples with 14,678 nonzero values.
 
-Still open: structured-light decode of packed `Y16` buffers into metric depth,
-and a real capture protocol wired into the Qt app (today the GUI still uses
-`MockProtocol`).
+The app now includes the **metric reconstruction scaffold**: capture import
+tools (`docs/protocol/USBCAP_CHECKLIST.md`, `tools/re_probe/pcapng_import.py`),
+a POP4 depth decoder that refuses false millimetres until calibration exists,
+async scan fusion / tracking UI, lighting & blue-laser control panel (enabled
+only for capture-backed capabilities — mock backend exercises the full UI),
+post-scan edit tools with undo/redo, and metric-safe PLY/OBJ/STL export.
+
+Still open on real POP4 hardware: packed-Y16 decode, factory calibration /
+`PROPERTY_EXT_DEPTH_SCALE` reads, verified blue-laser mode opcodes, and a
+projector-off command. RevoScan Android APK 6.0.2.4 was mined clean-room for
+presets (`resources/param_pop4.json`) and SDK surface notes
+(`docs/protocol/APK_REVOSCAN_6.0.2.4.md`); exposure / illumination / laser
+sliders now rewrite the known CS7 block using those ranges. Until USBPcap
+fixtures land for the remaining opcodes, POP4 depth stays vendor-raw preview;
+use `ALL3DSCAN_BACKEND=mock` to exercise metric fusion / edit / export.
 
 ## Build (Ubuntu / Debian-based)
 
@@ -53,9 +66,26 @@ cmake -B build -S .
 cmake --build build -j
 ```
 
+`libqt5opengl5-dev` is required for the GPU point-cloud viewport (`QOpenGLWidget`
+on the system GL driver — NVIDIA/AMD/Intel). Without it, CMake will fail at
+configure time looking for `Qt5::OpenGL`.
+
 Run the app:
 ```sh
 ./build/all3dscan
+```
+
+The default backend is the native POP4 backend. Run the synthetic UI backend
+without hardware with:
+
+```sh
+ALL3DSCAN_BACKEND=mock ./build/all3dscan
+```
+
+Run a native, non-GUI POP4 arm/capture smoke test:
+
+```sh
+./build/all3dscan --probe-pop4
 ```
 
 Run tests:

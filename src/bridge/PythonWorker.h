@@ -31,6 +31,10 @@ public:
                                        int poissonDepth = 9,
                                        int timeoutMs = 120000);
 
+    // Convenience: volumetric TSDF reconstruction from a keyframe manifest.
+    std::optional<std::string> reconstructTsdf(const std::string& manifestPath,
+                                               int timeoutMs = 180000);
+
     const std::string& lastError() const { return lastError_; }
 
 private:

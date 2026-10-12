@@ -223,4 +223,21 @@ std::optional<std::string> PythonWorker::meshPly(const std::string& inputPly,
     return response;
 }
 
+std::optional<std::string> PythonWorker::reconstructTsdf(const std::string& manifestPath,
+                                                         int timeoutMs) {
+    const nlohmann::json command = {
+        {"cmd", "tsdf"},
+        {"manifest", manifestPath},
+    };
+    auto response = request(command.dump(), timeoutMs);
+    if (!response) {
+        return std::nullopt;
+    }
+    if (response->find("\"ok\":true") == std::string::npos) {
+        lastError_ = *response;
+        return std::nullopt;
+    }
+    return response;
+}
+
 } // namespace revoscan::bridge

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QElapsedTimer>
 #include <QWidget>
 
 #include <array>
@@ -15,19 +16,36 @@ class DistanceScaleWidget : public QWidget {
 public:
     explicit DistanceScaleWidget(QWidget* parent = nullptr);
 
-    // Feed the current depth distribution (millimeters). Values outside the
+    // Feed the current depth distribution (millimetres). Values outside the
     // gauge range are clamped into the end bands.
     void setDepthSamplesMm(const std::vector<float>& depthsMm);
     void setRangeMm(float minMm, float maxMm);
 
+    // Absolute band edges in mm (param_pop4 histogram1..4 style).
+    void setBandEdgesMm(float tooNearEnd,
+                        float excellentEnd,
+                        float goodEnd,
+                        float farEnd);
+
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    bool event(QEvent* event) override;
 
 private:
-    float minMm_ = 120.0f;
-    float maxMm_ = 300.0f;
+    QPointF depthMmToWidget(float depthMm) const;
+    float depthAtY(int widgetY) const;
+
+    float minMm_ = 210.0f;
+    float maxMm_ = 500.0f;
+    float bandEdgesMm_[4] = {290.0f, 350.0f, 400.0f, 460.0f};
+    float medianMm_ = -1.0f;
+    float animMedianMm_ = -1.0f; // smoothly interpolated median for display
+    QElapsedTimer medianAnimTimer_;
+    float tooltipMm_ = -1.0f;
     static constexpr int kBins = 48;
     std::array<float, kBins> hist_{};
+    std::array<float, kBins> animHist_{}; // smoothed histogram
     float histMax_ = 1.0f;
 };
 

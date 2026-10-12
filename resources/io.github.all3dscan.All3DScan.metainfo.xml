@@ -24,7 +24,7 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-07-18">
+    <release version="Alpha-v20260802-1033" date="2026-08-02">
       <description>
         <p>Revo Scan-style dark UI, multi-vendor device detection, and hybrid Python meshing bridge.</p>
       </description>

@@ -43,12 +43,31 @@ public:
 
     // Scans connected USB devices for the first match against knownIds.
     bool openFirstMatching(const std::vector<DeviceId>& knownIds);
+    bool open(uint16_t vendorId, uint16_t productId);
     void close();
     bool isOpen() const { return handle_ != nullptr; }
 
+    // Kernel-driver operations are needed temporarily for vendor UVC XU
+    // controls. Callers must reattach the driver before opening V4L2.
+    int kernelDriverActive(int interfaceNumber) const;
+    int detachKernelDriver(int interfaceNumber);
+    int attachKernelDriver(int interfaceNumber);
     bool claimInterface(int interfaceNumber);
+    int releaseInterface();
 
-    // Returns bytes actually transferred, or -1 on error.
+    // Soft USB port reset. Invalidates the open handle (caller must reopen).
+    int resetDevice();
+
+    // Returns bytes transferred, or a negative libusb error code.
+    int controlTransfer(uint8_t requestType,
+                        uint8_t request,
+                        uint16_t value,
+                        uint16_t index,
+                        uint8_t* data,
+                        uint16_t length,
+                        unsigned int timeoutMs);
+
+    // Returns bytes transferred, or a negative libusb error code.
     int bulkWrite(uint8_t endpoint, const uint8_t* data, int length, int timeoutMs);
     int bulkRead(uint8_t endpoint, uint8_t* buffer, int length, int timeoutMs);
 
@@ -56,6 +75,7 @@ private:
     libusb_context* ctx_ = nullptr;
     libusb_device_handle* handle_ = nullptr;
     int claimedInterface_ = -1;
+    int detachedInterface_ = -1;
 };
 
 } // namespace revoscan::usb

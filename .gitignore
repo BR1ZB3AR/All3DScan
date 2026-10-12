@@ -1,7 +1,16 @@
 build/
 build-release/
 dist/
+artifacts/
 *.o
 *.pcapng
 compile_commands.json
 .venv/
+__pycache__/
+*.py[cod]
+tools/re_probe/*_log*.csv
+tools/re_probe/*.log
+build-local/
+target/
+.freebuff/
+*.code-workspace

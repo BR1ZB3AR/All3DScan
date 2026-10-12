@@ -21,13 +21,13 @@ Usage:
     python3 xu_probe.py --interface 0 --cs 10 --set 01000000  # SET_CUR (hex bytes)
     python3 xu_probe.py --interface 0 --sequence xu_transactions.json
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
 import time
-
-import usb.core
-import usb.util
+from typing import Optional
 
 VENDOR_ID = 0x2207
 PRODUCT_ID = 0x110C
@@ -40,14 +40,27 @@ GET_CUR, GET_MIN, GET_MAX, GET_RES, GET_LEN, GET_INFO, GET_DEF = (
 SET_CUR = 0x01
 
 
+def _usb():
+    try:
+        import usb.core
+        import usb.util
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyusb is required for live XU access (pip install pyusb)"
+        ) from exc
+    return usb.core, usb.util
+
+
 class XuSession:
     """Claims the interface on enter, detaches/reattaches the kernel driver
     around it so multiple GET/SET calls share one claim (avoids repeated
     detach/reattach cycles, which is what seems to trigger the disconnect)."""
 
     def __init__(self, interface: int):
+        usb_core, usb_util = _usb()
+        self._usb_util = usb_util
         self.interface = interface
-        self.dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+        self.dev = usb_core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
         if self.dev is None:
             raise RuntimeError("POP4 not found (check it's connected)")
         self.detached = False
@@ -56,11 +69,11 @@ class XuSession:
         if self.dev.is_kernel_driver_active(self.interface):
             self.dev.detach_kernel_driver(self.interface)
             self.detached = True
-        usb.util.claim_interface(self.dev, self.interface)
+        self._usb_util.claim_interface(self.dev, self.interface)
         return self
 
     def __exit__(self, *exc):
-        usb.util.release_interface(self.dev, self.interface)
+        self._usb_util.release_interface(self.dev, self.interface)
         if self.detached:
             self.dev.attach_kernel_driver(self.interface)
 
@@ -104,18 +117,58 @@ def load_set_sequence(path: str, interface: int) -> list[dict]:
     return sequence
 
 
-def replay_sequence(xu: XuSession, sequence: list[dict], preserve_timing: bool, max_delay: float) -> None:
+def format_transcript(sequence: list[dict], preserve_timing: bool, max_delay: float) -> list[str]:
+    """Build a human-readable dry-run transcript without touching USB."""
+    lines = []
+    previous_timestamp = None
+    for index, transaction in enumerate(sequence, start=1):
+        timestamp = transaction.get("timestamp_us")
+        delay = 0.0
+        if preserve_timing and previous_timestamp is not None and timestamp is not None:
+            delay = min(max(0.0, (timestamp - previous_timestamp) / 1_000_000), max_delay)
+        selector = int(transaction["selector"])
+        data = bytes.fromhex(transaction["data"])
+        lines.append(
+            f"[{index:03d}/{len(sequence):03d}] wait={delay:.3f}s "
+            f"SET CS={selector} iface={transaction.get('interface')} -> {data.hex()}"
+        )
+        previous_timestamp = timestamp
+    return lines
+
+
+def replay_sequence(
+    xu: Optional[XuSession],
+    sequence: list[dict],
+    preserve_timing: bool,
+    max_delay: float,
+    dry_run: bool = False,
+) -> None:
     previous_timestamp = None
     for index, transaction in enumerate(sequence, start=1):
         timestamp = transaction.get("timestamp_us")
         if preserve_timing and previous_timestamp is not None and timestamp is not None:
             delay = max(0.0, (timestamp - previous_timestamp) / 1_000_000)
-            time.sleep(min(delay, max_delay))
+            if not dry_run:
+                time.sleep(min(delay, max_delay))
         selector = int(transaction["selector"])
         data = bytes.fromhex(transaction["data"])
-        xu.set_cur(selector, data)
-        print(f"[{index:03d}/{len(sequence):03d}] SET CS={selector} -> {data.hex()}")
+        prefix = "DRY" if dry_run else f"{index:03d}/{len(sequence):03d}"
+        print(f"[{prefix}] SET CS={selector} -> {data.hex()}")
+        if not dry_run:
+            assert xu is not None
+            xu.set_cur(selector, data)
         previous_timestamp = timestamp
+
+
+def wait_for_device(timeout_s: float = 10.0) -> bool:
+    """Poll until POP4 reappears after a USB re-enumeration."""
+    usb_core, _ = _usb()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if usb_core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID) is not None:
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def main() -> int:
@@ -127,7 +180,19 @@ def main() -> int:
     ap.add_argument("--set", metavar="HEXBYTES", help="e.g. 01000000")
     ap.add_argument(
         "--sequence", metavar="JSON",
-        help="replay SET_CUR transactions exported by usbmon_parse.py",
+        help="replay SET_CUR transactions exported by usbmon_parse.py / pcapng_import.py",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true",
+        help="print a replay transcript without opening the device or writing XU",
+    )
+    ap.add_argument(
+        "--transcript", metavar="PATH",
+        help="write dry-run / live replay transcript lines to this file",
+    )
+    ap.add_argument(
+        "--wait-reenum", type=float, default=0.0,
+        help="seconds to wait for POP4 reappearance before claiming (0=disabled)",
     )
     ap.add_argument(
         "--preserve-timing", action="store_true",
@@ -140,10 +205,28 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=0.1, help="seconds to sleep after SET before readback")
     args = ap.parse_args()
 
+    if args.sequence and args.dry_run:
+        sequence = load_set_sequence(args.sequence, args.interface)
+        lines = format_transcript(sequence, args.preserve_timing, args.max_delay)
+        for line in lines:
+            print(line)
+        if args.transcript:
+            with open(args.transcript, "w", encoding="utf-8") as out:
+                out.write("\n".join(lines) + "\n")
+        return 0
+
+    if args.wait_reenum > 0 and not wait_for_device(args.wait_reenum):
+        print(f"POP4 did not reappear within {args.wait_reenum:.1f}s", file=sys.stderr)
+        return 2
+
     with XuSession(args.interface) as xu:
         if args.sequence:
             sequence = load_set_sequence(args.sequence, args.interface)
-            replay_sequence(xu, sequence, args.preserve_timing, args.max_delay)
+            if args.transcript:
+                lines = format_transcript(sequence, args.preserve_timing, args.max_delay)
+                with open(args.transcript, "w", encoding="utf-8") as out:
+                    out.write("\n".join(lines) + "\n")
+            replay_sequence(xu, sequence, args.preserve_timing, args.max_delay, dry_run=False)
             return 0
 
         if args.dump:
@@ -152,12 +235,12 @@ def main() -> int:
                     length = xu.get_len(cs)
                     cur = xu.get_cur(cs, length)
                     print(f"CS={cs:2d} len={length:3d} cur={cur.hex()}")
-                except usb.core.USBError as e:
+                except Exception as e:  # noqa: BLE001 — pyusb USBError when available
                     print(f"CS={cs:2d} failed: {e}")
             return 0
 
         if args.cs is None:
-            ap.error("--cs is required unless --dump")
+            ap.error("--cs is required unless --dump / --sequence")
 
         if args.set is not None:
             data = bytes.fromhex(args.set)

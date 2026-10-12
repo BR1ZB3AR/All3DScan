@@ -100,15 +100,56 @@ bool UsbDevice::openFirstMatching(const std::vector<DeviceId>& knownIds) {
     return opened;
 }
 
+bool UsbDevice::open(uint16_t vendorId, uint16_t productId) {
+    if (!ctx_ || handle_) {
+        return false;
+    }
+    handle_ = libusb_open_device_with_vid_pid(ctx_, vendorId, productId);
+    return handle_ != nullptr;
+}
+
 void UsbDevice::close() {
     if (handle_) {
         if (claimedInterface_ >= 0) {
             libusb_release_interface(handle_, claimedInterface_);
             claimedInterface_ = -1;
         }
+        if (detachedInterface_ >= 0) {
+            libusb_attach_kernel_driver(handle_, detachedInterface_);
+            detachedInterface_ = -1;
+        }
         libusb_close(handle_);
         handle_ = nullptr;
     }
+}
+
+int UsbDevice::kernelDriverActive(int interfaceNumber) const {
+    if (!handle_) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    return libusb_kernel_driver_active(handle_, interfaceNumber);
+}
+
+int UsbDevice::detachKernelDriver(int interfaceNumber) {
+    if (!handle_) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    const int rc = libusb_detach_kernel_driver(handle_, interfaceNumber);
+    if (rc == LIBUSB_SUCCESS) {
+        detachedInterface_ = interfaceNumber;
+    }
+    return rc;
+}
+
+int UsbDevice::attachKernelDriver(int interfaceNumber) {
+    if (!handle_) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    const int rc = libusb_attach_kernel_driver(handle_, interfaceNumber);
+    if (rc == LIBUSB_SUCCESS && detachedInterface_ == interfaceNumber) {
+        detachedInterface_ = -1;
+    }
+    return rc;
 }
 
 bool UsbDevice::claimInterface(int interfaceNumber) {
@@ -122,22 +163,64 @@ bool UsbDevice::claimInterface(int interfaceNumber) {
     return true;
 }
 
+int UsbDevice::releaseInterface() {
+    if (!handle_ || claimedInterface_ < 0) {
+        return LIBUSB_SUCCESS;
+    }
+    const int rc = libusb_release_interface(handle_, claimedInterface_);
+    if (rc == LIBUSB_SUCCESS) {
+        claimedInterface_ = -1;
+    }
+    return rc;
+}
+
+int UsbDevice::resetDevice() {
+    if (!handle_) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    // Drop any claim first so reset is allowed.
+    if (claimedInterface_ >= 0) {
+        libusb_release_interface(handle_, claimedInterface_);
+        claimedInterface_ = -1;
+    }
+    const int rc = libusb_reset_device(handle_);
+    // After reset the handle is invalid on many stacks; always close.
+    libusb_close(handle_);
+    handle_ = nullptr;
+    detachedInterface_ = -1;
+    return rc;
+}
+
+int UsbDevice::controlTransfer(uint8_t requestType,
+                               uint8_t request,
+                               uint16_t value,
+                               uint16_t index,
+                               uint8_t* data,
+                               uint16_t length,
+                               unsigned int timeoutMs) {
+    if (!handle_) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    return libusb_control_transfer(
+        handle_, requestType, request, value, index, data, length, timeoutMs);
+}
+
 int UsbDevice::bulkWrite(uint8_t endpoint, const uint8_t* data, int length, int timeoutMs) {
     if (!handle_) {
-        return -1;
+        return LIBUSB_ERROR_NO_DEVICE;
     }
     int transferred = 0;
     int rc = libusb_bulk_transfer(handle_, endpoint, const_cast<uint8_t*>(data), length, &transferred, timeoutMs);
-    return rc == 0 ? transferred : -1;
+    return rc == LIBUSB_SUCCESS ? transferred : rc;
 }
 
 int UsbDevice::bulkRead(uint8_t endpoint, uint8_t* buffer, int length, int timeoutMs) {
     if (!handle_) {
-        return -1;
+        return LIBUSB_ERROR_NO_DEVICE;
     }
     int transferred = 0;
     int rc = libusb_bulk_transfer(handle_, endpoint | LIBUSB_ENDPOINT_IN, buffer, length, &transferred, timeoutMs);
-    return rc == 0 ? transferred : -1;
+    return rc == LIBUSB_SUCCESS ? transferred : rc;
 }
 
 } // namespace revoscan::usb

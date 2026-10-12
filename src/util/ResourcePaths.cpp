@@ -138,4 +138,86 @@ std::optional<std::string> findAppIcon() {
         });
 }
 
+namespace {
+
+std::optional<std::string> findInPath(const std::string& program) {
+    const char* pathEnv = std::getenv("PATH");
+    if (!pathEnv) {
+        return std::nullopt;
+    }
+    std::string paths(pathEnv);
+    size_t start = 0;
+    while (start <= paths.size()) {
+        const size_t end = paths.find(':', start);
+        const std::string dir =
+            paths.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty()) {
+            std::error_code ec;
+            const fs::path candidate = fs::path(dir) / program;
+            if (fs::is_regular_file(candidate, ec) &&
+                ::access(candidate.c_str(), X_OK) == 0) {
+                return candidate.string();
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return std::nullopt;
+}
+
+bool flatpakAppInstalled(const std::string& appId) {
+    const std::vector<fs::path> exportBins = {
+        fs::path("/var/lib/flatpak/exports/bin") / appId,
+    };
+    for (const auto& p : exportBins) {
+        std::error_code ec;
+        if (fs::exists(p, ec)) {
+            return true;
+        }
+    }
+    if (const char* home = std::getenv("HOME")) {
+        std::error_code ec;
+        const fs::path userBin =
+            fs::path(home) / ".local/share/flatpak/exports/bin" / appId;
+        if (fs::exists(userBin, ec)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::optional<std::vector<std::string>> findSlicerCommand() {
+    if (const char* overrideCmd = std::getenv("ALL3DSCAN_SLICER")) {
+        if (overrideCmd[0] != '\0') {
+            return std::vector<std::string>{std::string(overrideCmd)};
+        }
+    }
+
+    // Native binaries first (avoid GNOME "orca" screen reader, which is not a
+    // slicer, by only matching slicer-specific names).
+    for (const char* program :
+         {"orca-slicer", "OrcaSlicer", "orcaslicer", "prusa-slicer",
+          "PrusaSlicer", "bambu-studio", "BambuStudio"}) {
+        if (auto found = findInPath(program)) {
+            return std::vector<std::string>{*found};
+        }
+    }
+
+    if (findInPath("flatpak")) {
+        for (const char* appId :
+             {"com.orcaslicer.OrcaSlicer", "io.github.softfever.OrcaSlicer",
+              "com.prusa3d.PrusaSlicer", "com.bambulab.BambuStudio"}) {
+            if (flatpakAppInstalled(appId)) {
+                return std::vector<std::string>{"flatpak", "run", appId};
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
 } // namespace revoscan::util
