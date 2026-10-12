@@ -1,7 +1,8 @@
 # All3DScan — Open-Source Native Linux 3D Scanning App
+[Project Still Under-Development]
 
-A clean-room, open-source **native** Linux scanning application with a Revo
-Scan 6-style dark interface, targeting consumer structured-light 3D scanners
+A clean-room, open-source **native** Linux scanning application with a dark
+interface, targeting consumer structured-light 3D scanners
 from **Revopoint, Creality, and Einstar**. This is **not** a Wine wrapper:
 day-to-day scanning uses Ubuntu's own USB (`uvcvideo`/`hidraw`) and GPU stacks.
 Wine often fails to expose these scanners and cannot drive their Direct3D/CUDA
