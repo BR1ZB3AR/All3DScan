@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
+#include <unordered_set>
 
 namespace revoscan::geometry {
 namespace {
@@ -245,6 +247,97 @@ TriangleMesh reconstructTsdf(const std::vector<TsdfFrame>& frames,
                          f.cameraToWorld);
     }
     return volume.extractMesh();
+}
+
+size_t cleanMesh(TriangleMesh& mesh,
+                 const pointcloud::PointCloud& keep,
+                 float nearM,
+                 float minComponentShare) {
+    const size_t trisBefore = mesh.triangleCount();
+    if (mesh.empty()) {
+        return 0;
+    }
+    std::vector<uint8_t> alive(mesh.vertices.size(), 1);
+
+    // 1. Base removal: vertices with no tracked-model point nearby.
+    if (!keep.points.empty() && nearM > 0.0f) {
+        auto key = [nearM](float x, float y, float z) {
+            const auto ix = static_cast<int64_t>(std::floor(x / nearM));
+            const auto iy = static_cast<int64_t>(std::floor(y / nearM));
+            const auto iz = static_cast<int64_t>(std::floor(z / nearM));
+            return (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+        };
+        std::unordered_set<int64_t> occupied;
+        occupied.reserve(keep.points.size());
+        for (const auto& p : keep.points) {
+            occupied.insert(key(p.x, p.y, p.z));
+        }
+        for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+            const auto& v = mesh.vertices[i];
+            bool found = false;
+            for (int dz = -1; dz <= 1 && !found; ++dz) {
+                for (int dy = -1; dy <= 1 && !found; ++dy) {
+                    for (int dx = -1; dx <= 1 && !found; ++dx) {
+                        found = occupied.count(key(v.x + dx * nearM, v.y + dy * nearM,
+                                                   v.z + dz * nearM)) > 0;
+                    }
+                }
+            }
+            alive[i] = found;
+        }
+    }
+
+    // 2. Connected components over surviving triangles (union-find on vertices).
+    std::vector<uint32_t> parent(mesh.vertices.size());
+    std::iota(parent.begin(), parent.end(), 0u);
+    auto find = [&](uint32_t a) {
+        while (parent[a] != a) {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        return a;
+    };
+    auto triAlive = [&](size_t t) {
+        return alive[mesh.indices[t]] && alive[mesh.indices[t + 1]] && alive[mesh.indices[t + 2]];
+    };
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        if (!triAlive(t)) {
+            continue;
+        }
+        const uint32_t a = find(mesh.indices[t]);
+        parent[find(mesh.indices[t + 1])] = a;
+        parent[find(mesh.indices[t + 2])] = a;
+    }
+    std::vector<size_t> compTris(mesh.vertices.size(), 0);
+    size_t largest = 0;
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        if (triAlive(t)) {
+            largest = std::max(largest, ++compTris[find(mesh.indices[t])]);
+        }
+    }
+    const auto minTris = static_cast<size_t>(minComponentShare * static_cast<float>(largest));
+
+    // 3. Rebuild with compacted vertices.
+    std::vector<int64_t> remap(mesh.vertices.size(), -1);
+    TriangleMesh out;
+    out.metric = mesh.metric;
+    out.hasColors = mesh.hasColors;
+    out.hasNormals = mesh.hasNormals;
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        if (!triAlive(t) || compTris[find(mesh.indices[t])] < std::max<size_t>(minTris, 1)) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t v = mesh.indices[t + k];
+            if (remap[v] < 0) {
+                remap[v] = static_cast<int64_t>(out.vertices.size());
+                out.vertices.push_back(mesh.vertices[v]);
+            }
+            out.indices.push_back(static_cast<uint32_t>(remap[v]));
+        }
+    }
+    mesh = std::move(out);
+    return trisBefore - mesh.triangleCount();
 }
 
 } // namespace revoscan::geometry

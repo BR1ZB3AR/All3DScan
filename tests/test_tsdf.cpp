@@ -112,3 +112,43 @@ TEST_CASE("TSDF + Surface Nets reconstructs a closed sphere from six views") {
     REQUIRE(mesh.hasColors);
     REQUIRE(mesh.vertices[0].r == 200);
 }
+
+TEST_CASE("cleanMesh removes surface away from the model and small fragments") {
+    // Two separate quads: one near the "model" cloud, one far away; plus a
+    // tiny fragment near the model that is far smaller than the main part.
+    geometry::TriangleMesh mesh;
+    auto addQuadGrid = [&](float x0, float z, int n, float step) {
+        const auto base = static_cast<uint32_t>(mesh.vertices.size());
+        for (int j = 0; j <= n; ++j) {
+            for (int i = 0; i <= n; ++i) {
+                mesh.vertices.push_back({x0 + i * step, j * step, z});
+            }
+        }
+        for (int j = 0; j < n; ++j) {
+            for (int i = 0; i < n; ++i) {
+                const uint32_t a = base + j * (n + 1) + i;
+                for (uint32_t v : {a, a + 1, a + n + 2, a, a + n + 2, a + n + 1}) {
+                    mesh.indices.push_back(v);
+                }
+            }
+        }
+    };
+    addQuadGrid(0.0f, 0.3f, 20, 0.002f);   // object surface (400 cells)
+    addQuadGrid(0.2f, 0.3f, 20, 0.002f);   // desk patch far from the model
+    addQuadGrid(0.0f, 0.36f, 1, 0.002f);   // speck within reach of the model
+    pointcloud::PointCloud model;
+    for (int j = 0; j <= 20; ++j) {
+        for (int i = 0; i <= 20; ++i) {
+            model.points.push_back({i * 0.002f, j * 0.002f, 0.3f});
+        }
+    }
+    model.points.push_back({0.0f, 0.0f, 0.36f});
+    const size_t total = mesh.triangleCount();
+    const size_t removed = geometry::cleanMesh(mesh, model, 0.004f, 0.02f);
+    REQUIRE(mesh.triangleCount() == 800);
+    REQUIRE(removed == total - 800);
+    for (const auto& v : mesh.vertices) {
+        REQUIRE(v.x < 0.05f);
+        REQUIRE(v.z < 0.31f);
+    }
+}

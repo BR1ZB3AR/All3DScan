@@ -777,6 +777,9 @@ bool ScanPipeline::completeAndMesh(const std::string& workerScript,
         params.maxDepthM = depthClipFarM_.load();
         geometry::TriangleMesh mesh =
             geometry::reconstructTsdf(frames, document_->cloud(), 0.01f, params);
+        // Base removal + floating-fragment cleanup against the tracked model.
+        geometry::cleanMesh(mesh, document_->cloud(),
+                            std::max(0.004f, 3.0f * params.voxelM));
         if (!mesh.empty()) {
             document_->setMesh(std::move(mesh), true, "tsdf");
             return true;

@@ -78,4 +78,13 @@ TriangleMesh reconstructTsdf(const std::vector<TsdfFrame>& frames,
                              float padM = 0.02f,
                              const TsdfParams& params = {});
 
+// Post-process a reconstructed mesh like a scanner's "base removal": keep only
+// vertices within `nearM` of `keep` (the tracked object model, which already
+// excludes the desk), then drop connected components smaller than
+// `minComponentShare` of the largest. Returns the number of removed triangles.
+size_t cleanMesh(TriangleMesh& mesh,
+                 const pointcloud::PointCloud& keep,
+                 float nearM = 0.004f,
+                 float minComponentShare = 0.02f);
+
 } // namespace revoscan::geometry
