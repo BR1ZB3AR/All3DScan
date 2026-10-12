@@ -14,3 +14,4 @@ build-local/
 target/
 .freebuff/
 *.code-workspace
+build-test/

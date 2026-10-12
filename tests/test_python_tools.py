@@ -15,6 +15,11 @@ def _open3d_available() -> bool:
     return importlib.util.find_spec("open3d") is not None
 
 
+def _cv2_available() -> bool:
+    return (importlib.util.find_spec("cv2") is not None
+            and importlib.util.find_spec("numpy") is not None)
+
+
 def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -268,6 +273,31 @@ class XuProbeDryRunTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("SET CS=10", completed.stdout)
         self.assertIn("SET CS=7", completed.stdout)
+
+
+@unittest.skipUnless(_cv2_available(), "numpy/opencv not installed")
+class Pop4RectifyFitTests(unittest.TestCase):
+    def test_recovers_planted_row_warp(self):
+        import cv2
+        import numpy as np
+
+        fit = load_module("pop4_rectify_fit", ROOT / "tools" / "re_probe" / "pop4_rectify_fit.py")
+        rng = np.random.default_rng(7)
+        H, W = fit.H, fit.W
+        left = np.where(rng.random((H, W + 40)) < 0.16, 200.0, 20.0).astype(np.float32)
+        left = cv2.GaussianBlur(left, (0, 0), 1.0)
+        truth = np.array([0.002, -0.02, 1.0, -0.01, 0.12, -0.005])
+        # right(xR, yR) = left(xR + 35, yL(xR, yR)): a 35 px disparity plane
+        ys, xs = np.mgrid[0:H, 0:W].astype(np.float64)
+        rows = fit.mapped_row(truth, xs, ys).astype(np.float32)
+        right = cv2.remap(left, (xs + 35).astype(np.float32), rows, cv2.INTER_LINEAR)
+        coeffs, rms, kept = fit.fit(left[:, :W].copy(), right, fit.DEFAULT_COEFFS.copy(),
+                                    iterations=3, verbose=False)
+        self.assertLess(rms, 0.3)
+        self.assertGreater(kept, 100)
+        # Compare mapped rows, not raw coefficients (well-conditioned check).
+        err = np.abs(fit.mapped_row(coeffs, xs, ys) - fit.mapped_row(truth, xs, ys))
+        self.assertLess(float(np.percentile(err[20:-20, 20:-20], 95)), 0.5)
 
 
 if __name__ == "__main__":

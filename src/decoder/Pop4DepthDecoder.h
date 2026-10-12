@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -9,28 +10,44 @@
 
 namespace revoscan::decoder {
 
-// Approximate POP4 full-field stereo calibration from published FOV
-// (46°×37°) and working band (250–500 mm). Not factory camparam — source is
-// marked ApproximatePop4FullField.
+// Approximate POP4 stereo calibration (FOV-derived focal length, provisional
+// baseline). Not factory camparam — source is marked ApproximatePop4FullField.
 protocol::ScannerCalibration makeApproximatePop4FullFieldCalibration();
 
-// Converts packed POP4 vendor-raw Y16 (640×2560 = 5×640×512 planes) into
-// metric millimetre depth for the top-left 320×256 IR view via four-step phase
-// and approximate stereo Q.
+// Right-camera row alignment for the POP4 speckle pair. The device does NOT
+// deliver row-aligned stereo: the right image is rolled a few degrees with
+// strong keystone (row offset swings about ±10 px across the frame). This
+// quadratic maps raw right-image coords to left-image rows:
+//
+//   u = (xR - 160) / 160,  v = (yR - 256) / 256
+//   yL = 256 + 256 * (c0 + c1 u + c2 v + c3 u² + c4 u v + c5 v²)
+//
+// Fitted from live captures with tools/re_probe/pop4_rectify_fit.py. Units
+// differ, so ALL3DSCAN_POP4_RECT="c0,c1,c2,c3,c4,c5" overrides the default.
+using RowRectification = std::array<double, 6>;
+RowRectification defaultPop4RowRectification();
+constexpr RowRectification kIdentityRowRectification{{0, 0, 1, 0, 0, 0}};
+
+// Converts packed POP4 vendor-raw Y16 into metric millimetre depth.
+//
+// The 640×2560 buffer is ten 320×512 images (row stride 320, not 640):
+// images 0–4 come from the right camera and 5–9 from the left. In each group
+// the first four are ambient/flood exposures and the fifth carries the
+// projected IR speckle. Depth = census + semi-global matching between the two
+// speckle images (left = image 9, right = image 4) after row alignment.
 class Pop4DepthDecoder {
 public:
-    void setCalibration(const protocol::ScannerCalibration& calibration);
+    Pop4DepthDecoder();
 
-    // Working-distance band (millimetres) the decoder should search. The
-    // disparity search range [dispMin, dispMax] and the final depth clamp are
-    // both derived from this each decode() call via the stereo Q matrix, so
-    // close-range presets (e.g. 120-219mm) can actually find near-surface
-    // disparities instead of always searching the ~220-650mm default band.
-    // Clamped to a sane [50, 2000] mm span; min must stay below max.
+    void setCalibration(const protocol::ScannerCalibration& calibration);
+    void setRowRectification(const RowRectification& coeffs);
+
+    // Working-distance band (millimetres). The disparity search range and the
+    // final depth clamp are both derived from it via the stereo Q matrix.
+    // Clamped to [50, 2000] mm; min must stay below max.
     void setDepthRange(float minMm, float maxMm);
 
-    // Returns a MetricMillimeters RawFrame on success (320×256 left view).
-    // Prefers CUDA stereo when built/available; falls back to CPU.
+    // Returns a MetricMillimeters RawFrame (320×512, left camera) on success.
     std::optional<protocol::RawFrame> decode(const protocol::RawFrame& rawY16);
 
     const std::string& lastError() const { return lastError_; }
@@ -39,7 +56,9 @@ public:
     // of success/failure so the UI can show why a frame was rejected).
     const protocol::DepthDecodeStats& lastStats() const { return lastStats_; }
 
-    // "CUDA" or "CPU" for the active decode path preference.
+    // Last decode's disparity map (320×512, <0 = invalid) for diagnostics.
+    const std::vector<float>& lastDisparity() const { return lastDisparity_; }
+
     static std::string backendName();
 
     // Test helper: interpret already-metric uint16 buffers using calibration
@@ -50,7 +69,12 @@ public:
         std::string* errorOut = nullptr);
 
 private:
+    void rebuildRectificationMap();
+
     protocol::ScannerCalibration calibration_;
+    RowRectification rect_{};
+    std::vector<float> rectMapY_; // per output pixel: source row in raw right image
+    std::vector<float> lastDisparity_;
     std::string lastError_;
     protocol::DepthDecodeStats lastStats_;
     float depthMinMm_ = 200.0f;

@@ -6,6 +6,71 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Packed frame is speckle stereo, not four-step phase (2026-10-12)
+
+**This supersedes the frame-layout and decoding claims in the 2026-07-18,
+2026-07-19 and 2026-07-21 sections below.** Those sections are kept for
+history; the CUDA phase path (`Pop4StereoCuda.cu`) and the phase knobs
+(`_MAXCOST`, `_MARGIN`, `_LRCHECK`, `_SPECKLE_SUPPORT`, `_STEREO_BAND`,
+`_CUDA`) are no longer used by the decoder.
+
+Evidence: 12 raw frames dumped from a live POP4 (box ~300 mm away,
+`ALL3DSCAN_POP4_DUMP_DIR`), analysed offline.
+
+- **Layout.** The 640×2560 Y16 buffer is **ten 320×512 images** with row
+  stride 320, not five 640×512 planes. Autocorrelation of the flat buffer
+  peaks at a 320-sample period (0.853, with no peak at 640). Reading it as
+  640-wide puts image row 2k in the "left half" and row 2k+1 in the "right
+  half", which is why the old "L|R" halves matched at zero disparity.
+- **Cameras.** Images 0–4 come from the right IR camera and 5–9 from the left.
+- **Content.** In each group, images 0–3 (5–8) are ambient/flood exposures
+  (mean ≈17/255) with **no fringe modulation**: the four-step phase computed
+  from them is uniform noise. Image 4 (9) carries the projected **IR speckle**
+  (mean ≈54 / 38). The layout was stable across all frames.
+- **Not row-aligned.** A dense block-match field between the two speckle
+  images shows the vertical offset sweeping from −10 px (left edge) to +10 px
+  (right edge). The right camera is rolled and keystoned, so plain row-wise
+  stereo only matches in a narrow central strip. A quadratic row map (6
+  coefficients) fits it with 0.15–0.17 px residual over ~400 correspondences;
+  see `tools/re_probe/pop4_rectify_fit.py`.
+- **Disparity.** After alignment, the flat box face reads 33–38 px, stable
+  frame to frame.
+
+Decoder (`Pop4DepthDecoder`, CPU + OpenMP, ~63 ms per frame here):
+
+1. Left = image 9, right = image 4 (`ALL3DSCAN_POP4_SWAP_LR=1` swaps them).
+2. Resample the right image onto left rows with the quadratic row map
+   (`ALL3DSCAN_POP4_RECT=c0,…,c5` overrides the built-in fit).
+3. [1 4 6 4 1] blur, 7×7 census, Hamming cost.
+4. 4-direction semi-global aggregation (`_P1`=16, `_P2`=120).
+5. Winner-take-all with a uniqueness gate (`_UNIQ`=0.05), parabolic sub-pixel
+   refinement, left-right check (`_LRDIFF`=1), and a texture gate on the left
+   speckle (`_TEXTURE`=1.5).
+6. 3×3 median, then speckle-region removal (`_SPECKLE_REGION`=80,
+   `_SPECKLE_DIFF`=1).
+7. Output 320×512 depth plus grey texture taken from the left ambient images.
+
+On the dumped frames this gives about 50k valid depth samples per frame
+(31% of the image, and most of the speckle-lit box face). The textureless
+floor is rejected rather than filled with noise. The old decoder produced
+about 5k samples per frame, and they were noise.
+
+Calibration is still approximate: fx comes from a 46° FOV across 320 px, and
+the **provisional baseline is 28 mm**, chosen so the measured ~35 px maps to
+roughly 300 mm. Verify it with a ruler and correct it with
+`ALL3DSCAN_POP4_BASELINE_MM` (Z ∝ B). Each unit likely needs its own row-map
+fit:
+
+```sh
+ALL3DSCAN_POP4_DUMP_DIR=/tmp/pop4 all3dscan --probe-pop4   # dumps ~30 frames
+python3 tools/re_probe/pop4_rectify_fit.py /tmp/pop4       # prints ALL3DSCAN_POP4_RECT=…
+all3dscan --decode-dump /tmp/pop4/pop4_640x2560_000.y16 disp.pgm  # offline check
+```
+
+Still open: factory camparam (true fx, baseline, and full rectification
+including the x direction), the role of the four ambient exposures (possibly
+AE or background subtraction), and the blue-laser mode.
+
 ## Native C++ milestone (2026-07-18)
 
 All3DScan now contains a native `RevopointPop4Protocol` backend:

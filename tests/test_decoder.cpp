@@ -5,16 +5,15 @@
 #include <cstdlib>
 
 #include "decoder/Pop4DepthDecoder.h"
-#include "decoder/Pop4StereoCuda.h"
 
 using namespace revoscan;
 
 namespace {
 
-constexpr uint32_t kW = 640;
-constexpr uint32_t kH = 512;
+constexpr uint32_t kImgW = 320;
+constexpr uint32_t kImgH = 512;
+constexpr uint32_t kPackedW = 640;
 constexpr uint32_t kPackedH = 2560;
-constexpr float kTwoPi = 6.28318530718f;
 
 uint16_t y16FromIntensity(float intensity) {
     const float clamped = std::clamp(intensity, 0.0f, 255.0f);
@@ -22,30 +21,32 @@ uint16_t y16FromIntensity(float intensity) {
     return static_cast<uint16_t>((static_cast<uint16_t>(b) << 8) | b);
 }
 
-protocol::RawFrame makeSyntheticPackedFrame(float disparityPx) {
+// Ten 320x512 images back to back: 0-4 right camera, 5-9 left camera, with the
+// projected speckle in images 4 (right) and 9 (left). The right speckle is the
+// left pattern shifted by `disparityPx`, i.e. already row-aligned.
+protocol::RawFrame makeSyntheticSpeckleFrame(int disparityPx) {
+    const uint32_t patternW = kImgW + static_cast<uint32_t>(disparityPx);
+    std::vector<float> pattern(static_cast<size_t>(patternW) * kImgH, 20.0f);
+    uint32_t state = 12345u;
+    for (float& v : pattern) {
+        state = state * 1664525u + 1013904223u;
+        if ((state >> 24) < 40) { // ~16% bright dots
+            v = 200.0f;
+        }
+    }
     protocol::RawFrame raw;
-    raw.width = kW;
+    raw.width = kPackedW;
     raw.height = kPackedH;
     raw.encoding = protocol::DepthEncoding::VendorRawY16;
-    raw.depthMm.assign(static_cast<size_t>(kW) * kPackedH, 0);
-
-    // Stereo lives in the top 320×256 L|R tiles; bottom band left blank.
-    constexpr uint32_t kViewH = 256;
-    const size_t planeSamples = static_cast<size_t>(kW) * kH;
-    for (int p = 0; p < 4; ++p) {
-        const float step = static_cast<float>(p) * (kTwoPi * 0.25f);
-        uint16_t* plane = raw.depthMm.data() + static_cast<size_t>(p) * planeSamples;
-        for (uint32_t y = 0; y < kViewH; ++y) {
-            for (uint32_t x = 0; x < 320; ++x) {
-                const float phaseL = kTwoPi * (static_cast<float>(x) / 320.0f);
-                const float iL = 80.0f + 40.0f * std::cos(phaseL - step);
-                plane[y * kW + x] = y16FromIntensity(iL);
-
-                const float phaseR =
-                    kTwoPi * ((static_cast<float>(x) + disparityPx) / 320.0f);
-                const float iR = 80.0f + 40.0f * std::cos(phaseR - step);
-                plane[y * kW + 320 + x] = y16FromIntensity(iR);
-            }
+    raw.depthMm.assign(static_cast<size_t>(kPackedW) * kPackedH, y16FromIntensity(20.0f));
+    const size_t image = static_cast<size_t>(kImgW) * kImgH;
+    uint16_t* right = raw.depthMm.data() + 4 * image;
+    uint16_t* left = raw.depthMm.data() + 9 * image;
+    for (uint32_t y = 0; y < kImgH; ++y) {
+        for (uint32_t x = 0; x < kImgW; ++x) {
+            left[y * kImgW + x] = y16FromIntensity(pattern[y * patternW + x]);
+            right[y * kImgW + x] =
+                y16FromIntensity(pattern[y * patternW + x + static_cast<uint32_t>(disparityPx)]);
         }
     }
     return raw;
@@ -77,73 +78,61 @@ TEST_CASE("Pop4DepthDecoder refuses non-packed frames") {
     REQUIRE(decoder.lastError().find("640x2560") != std::string::npos);
 }
 
-TEST_CASE("Pop4DepthDecoder recovers metric depth from synthetic four-step stereo") {
+TEST_CASE("Pop4DepthDecoder recovers metric depth from synthetic speckle stereo") {
     decoder::Pop4DepthDecoder decoder;
     const auto cal = decoder::makeApproximatePop4FullFieldCalibration();
     decoder.setCalibration(cal);
+    decoder.setRowRectification(decoder::kIdentityRowRectification);
+    decoder.setDepthRange(200.0f, 650.0f);
+    unsetenv("ALL3DSCAN_POP4_SWAP_LR");
 
-    constexpr float disparity = 50.0f;
-    auto raw = makeSyntheticPackedFrame(disparity);
-    // Force L|R assignment so Auto scoring is deterministic in CI.
-    setenv("ALL3DSCAN_POP4_SWAP_LR", "0", 1);
-    auto metric = decoder.decode(raw);
+    constexpr int disparity = 35;
+    auto metric = decoder.decode(makeSyntheticSpeckleFrame(disparity));
     REQUIRE(metric.has_value());
     REQUIRE(metric->encoding == protocol::DepthEncoding::MetricMillimeters);
     REQUIRE(metric->width == 320);
-    REQUIRE(metric->height == 256);
+    REQUIRE(metric->height == 512);
+    REQUIRE(metric->rgb.size() == 320u * 512u * 3u);
 
-    const auto nonzero = std::count_if(
-        metric->depthMm.begin(), metric->depthMm.end(),
-        [](uint16_t d) { return d != 0; });
-    REQUIRE(nonzero > 400);
-
-    // Expected Z ≈ fx * B / d
+    // Expected Z = fx * B / d
     const double expectedMm = cal.depth.fx * cal.baselineMm / disparity;
+    uint32_t nonzero = 0;
     uint32_t nearExpected = 0;
     for (uint16_t d : metric->depthMm) {
         if (d == 0) {
             continue;
         }
-        if (std::fabs(static_cast<double>(d) - expectedMm) < 25.0) {
+        ++nonzero;
+        if (std::fabs(static_cast<double>(d) - expectedMm) < 5.0) {
             ++nearExpected;
         }
     }
-    REQUIRE(nearExpected > 200);
+    // Every pixel right of the disparity band edge is matchable.
+    REQUIRE(nonzero > 320u * 512u / 2);
+    REQUIRE(nearExpected > nonzero * 95 / 100);
 }
 
-#ifdef ALL3DSCAN_HAS_CUDA
-TEST_CASE("Pop4DepthDecoder CUDA path recovers synthetic stereo depth") {
-    REQUIRE(decoder::cuda_stereo::isBuilt());
-    if (!decoder::cuda_stereo::available()) {
-        SKIP("No CUDA device present");
-    }
-
+TEST_CASE("Pop4DepthDecoder rejects frames without projected speckle") {
     decoder::Pop4DepthDecoder decoder;
-    const auto cal = decoder::makeApproximatePop4FullFieldCalibration();
-    decoder.setCalibration(cal);
+    decoder.setCalibration(decoder::makeApproximatePop4FullFieldCalibration());
+    decoder.setRowRectification(decoder::kIdentityRowRectification);
 
-    constexpr float disparity = 50.0f;
-    auto raw = makeSyntheticPackedFrame(disparity);
-    // Prefer CUDA explicitly for this case.
-    setenv("ALL3DSCAN_POP4_CUDA", "1", 1);
-    auto metric = decoder.decode(raw);
-    REQUIRE(metric.has_value());
-    REQUIRE(metric->width == 320);
-    REQUIRE(metric->height == 256);
+    protocol::RawFrame raw;
+    raw.width = 640;
+    raw.height = 2560;
+    raw.encoding = protocol::DepthEncoding::VendorRawY16;
+    raw.depthMm.assign(640u * 2560u, y16FromIntensity(30.0f));
 
-    const double expectedMm = cal.depth.fx * cal.baselineMm / disparity;
-    uint32_t nearExpected = 0;
-    for (uint16_t d : metric->depthMm) {
-        if (d == 0) {
-            continue;
-        }
-        if (std::fabs(static_cast<double>(d) - expectedMm) < 25.0) {
-            ++nearExpected;
-        }
-    }
-    REQUIRE(nearExpected > 200);
+    REQUIRE_FALSE(decoder.decode(raw).has_value());
+    REQUIRE(decoder.lastStats().validDepth < 200);
 }
-#endif
+
+TEST_CASE("default POP4 row rectification is a mild roll, not identity") {
+    const auto c = decoder::defaultPop4RowRectification();
+    REQUIRE(c[2] > 0.9);
+    REQUIRE(c[2] < 1.1);
+    REQUIRE(std::fabs(c[4]) > 0.01);
+}
 
 TEST_CASE("validateMetricPlane scales and accepts dense metric frames") {
     protocol::ScannerCalibration cal;

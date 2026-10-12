@@ -4,6 +4,44 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261012-2202
+
+### Fixed
+- **POP4 depth decoding rewritten — scans were noise.** The packed 640×2560 Y16
+  frame is ten 320×512 images (images 0–4 from the right camera, 5–9 from the
+  left), not five 640×512 planes with L|R halves. The images the old decoder
+  ran four-step phase on contain no fringes, so it was matching noise, which
+  gave "Depth lock ~6%" and blob-shaped scans. `Pop4DepthDecoder` now matches
+  the two speckle images (9 = left, 4 = right) with census + 4-path SGM, a
+  uniqueness gate, a left-right check, a texture gate, and speckle-region
+  removal. It outputs 320×512 depth with ambient-IR texture. On live frames
+  this gives ~50k valid samples per frame instead of ~5k noisy ones.
+- **Right-camera row alignment.** The speckle pair is not row-aligned (row
+  offset swings ±10 px across the frame). A fitted quadratic row map is
+  applied before matching; override it with `ALL3DSCAN_POP4_RECT`.
+- **L/R flipping between frames.** Calling `setCalibration()` on every frame
+  reset the auto-swap cache, so the left/right choice was re-scored per frame
+  and flipped. Auto-swap is removed; the camera order is now fixed.
+- **Scanner access on Arch/Fedora.** The udev rule is now
+  `70-all3dscan-scanners.rules` with `TAG+="uaccess"` instead of the
+  Debian-only `plugdev` group.
+- **Menu launcher.** The desktop entry gets `Icon=` and `StartupWMClass`, the
+  icon is installed to hicolor, and `Exec` is an absolute path so `~/.local`
+  installs launch from the KDE menu.
+
+### Added
+- `ALL3DSCAN_POP4_DUMP_DIR` dumps raw packed frames (`--probe-pop4` captures a
+  burst of 30).
+- `all3dscan --decode-dump <frame.y16> [disp.pgm]` decodes a dump offline.
+- `tools/re_probe/pop4_rectify_fit.py` fits the per-unit row map.
+- Decoder hot loops use OpenMP (113 → 63 ms per frame).
+
+### Changed
+- Provisional POP4 baseline is 28 mm (was 70 mm), scaled so the measured
+  disparity maps to ~300 mm. Verify with a ruler; Z ∝ `ALL3DSCAN_POP4_BASELINE_MM`.
+- The CUDA phase path is no longer called by the decoder; it needs a rewrite
+  for the speckle pipeline.
+
 ## Alpha-v20260802-1557
 
 ### Fixed

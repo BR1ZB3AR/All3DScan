@@ -84,6 +84,11 @@ endif()
 
 add_library(decoder ${DECODER_SOURCES})
 target_include_directories(decoder PUBLIC src)
+# Speckle SGM runs on the UI poll thread; OpenMP keeps it near frame rate.
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(decoder PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(ALL3DSCAN_CUDA_ENABLED)
     set_target_properties(decoder PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
     target_compile_definitions(decoder PUBLIC ALL3DSCAN_HAS_CUDA=1)

@@ -1,11 +1,17 @@
 #include <QApplication>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <vector>
 #include <string_view>
 
 #include "MainWindow.h"
 #include "bridge/RustBridge.h"
+#include "decoder/Pop4DepthDecoder.h"
 #include "protocol/ScannerProtocol.h"
 
 namespace {
@@ -33,6 +39,12 @@ int probePop4() {
         if (!frame) {
             std::cerr << "Capture attempt " << attempt
                       << "/3: " << scanner->lastError() << '\n';
+        }
+    }
+    if (frame && std::getenv("ALL3DSCAN_POP4_DUMP_DIR")) {
+        // Keep streaming so the protocol dumps a short burst for offline work.
+        for (int i = 1; i < 30; ++i) {
+            (void)scanner->readFrame(5000);
         }
     }
     scanner->stopStream();
@@ -76,6 +88,55 @@ int probePop4() {
     return 0;
 }
 
+// Offline decoder check on frames written by ALL3DSCAN_POP4_DUMP_DIR:
+//   all3dscan --decode-dump frame.y16 [disparity.pgm]
+int decodeDump(const char* path, const char* pgmOut) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.size() != 640ull * 2560ull * 2ull) {
+        std::cerr << path << ": expected a 640x2560 Y16 dump, got " << bytes.size() << " bytes\n";
+        return 2;
+    }
+    revoscan::protocol::RawFrame raw;
+    raw.width = 640;
+    raw.height = 2560;
+    raw.encoding = revoscan::protocol::DepthEncoding::VendorRawY16;
+    raw.depthMm.resize(bytes.size() / 2);
+    for (size_t i = 0; i < raw.depthMm.size(); ++i) {
+        raw.depthMm[i] = static_cast<uint16_t>(static_cast<uint8_t>(bytes[i * 2])) |
+                         static_cast<uint16_t>(static_cast<uint8_t>(bytes[i * 2 + 1]) << 8);
+    }
+    revoscan::decoder::Pop4DepthDecoder decoder;
+    decoder.setCalibration(revoscan::decoder::makeApproximatePop4FullFieldCalibration());
+    decoder.setDepthRange(150.0f, 650.0f);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto metric = decoder.decode(raw);
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto& stats = decoder.lastStats();
+    std::vector<float> valid;
+    for (float d : decoder.lastDisparity()) {
+        if (d >= 0.0f) {
+            valid.push_back(d);
+        }
+    }
+    std::sort(valid.begin(), valid.end());
+    std::cout << "decode " << (metric ? "ok" : "failed") << " in " << ms << " ms: valid="
+              << 100.0 * stats.validFraction() << "% (" << stats.validDepth << ")";
+    if (!valid.empty()) {
+        std::cout << " disparity p10/p50/p90=" << valid[valid.size() / 10] << '/'
+                  << valid[valid.size() / 2] << '/' << valid[valid.size() * 9 / 10];
+    }
+    std::cout << (metric ? "" : " — " + decoder.lastError()) << '\n';
+    if (pgmOut) {
+        std::ofstream pgm(pgmOut, std::ios::binary);
+        pgm << "P5\n320 512\n255\n";
+        for (float d : decoder.lastDisparity()) {
+            pgm.put(static_cast<char>(d < 0.0f ? 0 : std::clamp(static_cast<int>(d * 4.0f), 1, 255)));
+        }
+    }
+    return metric ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -85,11 +146,14 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--probe-pop4") {
             return probePop4();
         }
+        if (std::string_view(argv[i]) == "--decode-dump" && i + 1 < argc) {
+            return decodeDump(argv[i + 1], i + 2 < argc ? argv[i + 2] : nullptr);
+        }
     }
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20260802-1033");
+    QApplication::setApplicationVersion("Alpha-v20261012-2202");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // No window / taskbar logo — plain Qt default decoration.

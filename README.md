@@ -48,14 +48,21 @@ async scan fusion / tracking UI, lighting & blue-laser control panel (enabled
 only for capture-backed capabilities — mock backend exercises the full UI),
 post-scan edit tools with undo/redo, and metric-safe PLY/OBJ/STL export.
 
-Still open on real POP4 hardware: packed-Y16 decode, factory calibration /
+**POP4 depth decoding works (approximate scale).** The packed 640×2560 Y16
+frame turned out to be ten 320×512 images carrying a speckle stereo pair, not
+four-step phase. The decoder row-aligns the two cameras and runs census +
+semi-global matching. Absolute millimetres still rely on a provisional
+baseline until factory calibration is read. See the 2026-10-12 section of
+`docs/protocol/RE_NOTES.md`.
+
+Still open on real POP4 hardware: factory calibration /
 `PROPERTY_EXT_DEPTH_SCALE` reads, verified blue-laser mode opcodes, and a
 projector-off command. RevoScan Android APK 6.0.2.4 was mined clean-room for
 presets (`resources/param_pop4.json`) and SDK surface notes
 (`docs/protocol/APK_REVOSCAN_6.0.2.4.md`); exposure / illumination / laser
 sliders now rewrite the known CS7 block using those ranges. Until USBPcap
-fixtures land for the remaining opcodes, POP4 depth stays vendor-raw preview;
-use `ALL3DSCAN_BACKEND=mock` to exercise metric fusion / edit / export.
+fixtures land for the remaining opcodes, use `ALL3DSCAN_BACKEND=mock` to
+exercise the full UI without hardware.
 
 ## Build (Ubuntu / Debian-based)
 

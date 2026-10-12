@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -72,8 +74,31 @@ public:
         calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
 
         if (!armProjector()) {
-            disconnect();
-            return false;
+            // After a previous session the depth XU can reject CS10 with
+            // LIBUSB_ERROR_IO until the device is reset (seen on every
+            // disconnect → connect without a replug). A port reset makes the
+            // POP4 reboot and re-enumerate (~37 s measured), so wait for it.
+            const std::string firstError = lastError_;
+            usb_.close();
+            bool recovered = false;
+            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
+                usb_.resetDevice();
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                for (int waited = 3; waited < 60 && !recovered; ++waited) {
+                    if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
+                        usb_.close();
+                        std::this_thread::sleep_for(std::chrono::seconds(2)); // udev ACLs
+                        recovered = armProjector();
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+            if (!recovered) {
+                lastError_ = firstError + " (USB reset retry: " + lastError_ + ")";
+                disconnect();
+                return false;
+            }
         }
 
         // Prefer packed 640×2560; fall back to 640×512 if the node rejects it.
@@ -202,6 +227,7 @@ public:
                 static_cast<uint16_t>(sensor->bytes[i * 2]) |
                 (static_cast<uint16_t>(sensor->bytes[i * 2 + 1]) << 8);
         }
+        dumpRawFrame(*sensor, expectedBytes);
 
         decoder_.setCalibration(calibration_);
         if (auto metric = decoder_.decode(frame)) {
@@ -322,6 +348,22 @@ public:
     std::string lastError() const override { return lastError_; }
 
 private:
+    // ALL3DSCAN_POP4_DUMP_DIR=<dir> writes the first 30 packed Y16 frames as
+    // pop4_<w>x<h>_NNN.y16 (little-endian) for offline decoder work.
+    void dumpRawFrame(const usb::V4l2Frame& sensor, size_t bytes) {
+        const char* dir = std::getenv("ALL3DSCAN_POP4_DUMP_DIR");
+        if (!dir || dumpCount_ >= 30) {
+            return;
+        }
+        char name[64];
+        std::snprintf(name, sizeof(name), "/pop4_%ux%u_%03d.y16", captureWidth_,
+                      captureHeight_, dumpCount_++);
+        if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb")) {
+            std::fwrite(sensor.bytes.data(), 1, bytes, f);
+            std::fclose(f);
+        }
+    }
+
     std::array<uint8_t, 60> currentSettingsPayload() const {
         return pop4::makeSettingsPayload(
             1,
@@ -556,6 +598,7 @@ private:
     usb::V4l2Capture rgbCapture_;
     uint32_t captureWidth_ = pop4::kCaptureWidth;
     uint32_t captureHeight_ = 0;
+    int dumpCount_ = 0;
     ScannerParams params_;
     ScannerCalibration calibration_{};
     ScannerControlState controls_{};
