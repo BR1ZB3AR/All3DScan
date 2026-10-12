@@ -127,7 +127,7 @@ Artifacts are written to `dist/`. The AppImage script downloads `linuxdeploy`
 and its Qt plugin on first use. The `.deb` installs the desktop entry,
 AppStream metadata, icon, native executable, Python worker, `devices.json`,
 documentation, and the scanner udev rules. AppImage cannot install host udev
-permissions; copy `usr/share/doc/all3dscan/99-all3dscan-scanners.rules` into
+permissions; copy `usr/share/doc/all3dscan/70-all3dscan-scanners.rules` into
 `/etc/udev/rules.d/` manually after first launch. Open3D remains optional
 because its wheel is large; point-cloud capture and export do not depend on it.
 
@@ -135,7 +135,7 @@ because its wheel is large; point-cloud capture and export do not depend on it.
 
 Install the udev rules so the app can access the scanner without root:
 ```sh
-sudo cp resources/99-all3dscan-scanners.rules /etc/udev/rules.d/
+sudo cp resources/70-all3dscan-scanners.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 

@@ -247,7 +247,7 @@ install(
     DESTINATION ${CMAKE_INSTALL_DATADIR}/all3dscan
 )
 install(
-    FILES resources/99-all3dscan-scanners.rules
+    FILES resources/70-all3dscan-scanners.rules
     DESTINATION lib/udev/rules.d
 )
 install(

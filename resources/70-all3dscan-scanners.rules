@@ -1,0 +1,26 @@
+# Grants non-root USB access to supported consumer 3D scanners so All3DScan
+# can talk to them via libusb/hidraw and V4L2 without running as root.
+#
+# Confirmed IDs:
+#   2207:110c  Revopoint POP4 / POP / POP2 / POP3 / MINI / RANGE (Chishine3d)
+#   2bc5:06da  Creality CR-Scan Otter (Orbbec depth module)
+# Vendor-wide rules also cover newer Revopoint (2207) and Creality (2bc5)
+# models. Add your Einstar/Shining3D VID here once confirmed with `lsusb`.
+#
+# Access is granted to the logged-in seat user via TAG+="uaccess" (systemd
+# logind ACLs), which works on Ubuntu, Fedora and Arch alike — no distro-
+# specific group such as `plugdev` is required. The file must sort before
+# 73-seat-late.rules for the uaccess tag to take effect, hence the 70- prefix.
+#
+# Install / reload with:
+#   sudo cp resources/70-all3dscan-scanners.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug and replug the scanner.
+
+# Revopoint (vendor 2207)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2207", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2207", TAG+="uaccess"
+
+# Creality (vendor 2bc5)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2bc5", TAG+="uaccess"

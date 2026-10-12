@@ -2,8 +2,8 @@
 """Blind HID opcode sweep for the POP4 control interface (interface 4).
 
 Requires /dev/hidraw* access for VID:PID 2207:110c — either run as root, or
-install resources/99-all3dscan-scanners.rules first:
-    sudo cp resources/99-all3dscan-scanners.rules /etc/udev/rules.d/
+install resources/70-all3dscan-scanners.rules first:
+    sudo cp resources/70-all3dscan-scanners.rules /etc/udev/rules.d/
     sudo udevadm control --reload-rules && sudo udevadm trigger
 
 Strategy: send a candidate report, read back whatever the device replies
@@ -70,7 +70,7 @@ def main() -> int:
         h.open(VENDOR_ID, PRODUCT_ID)
     except OSError as e:
         print(f"could not open HID device: {e}", file=sys.stderr)
-        print("check resources/99-all3dscan-scanners.rules is installed, or run as root", file=sys.stderr)
+        print("check resources/70-all3dscan-scanners.rules is installed, or run as root", file=sys.stderr)
         return 1
     h.set_nonblocking(True)
 

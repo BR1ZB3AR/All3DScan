@@ -335,7 +335,7 @@ may be promoted into `RevopointPop4Protocol` and this notes file.
   `5 500` mm (generic default, not POP4-specific — our 210–500 clamp still
   matches POP4's working band). It also references a udev-rules repo
   (`latimagine/PlusHelpers`) worth comparing to
-  `resources/99-all3dscan-scanners.rules` if permission gaps appear.
+  `resources/70-all3dscan-scanners.rules` if permission gaps appear.
 - No public reverse-engineering of POP4's USB protocol was found as of
   2026-07-11.
 
@@ -348,7 +348,7 @@ lsusb -t
 lsusb -v -d <vendor>:<product>   # full descriptor dump, once IDs are known
 ```
 Record vendor ID, product ID, and all interface/endpoint descriptors here.
-Update `resources/devices.json` and `resources/99-all3dscan-scanners.rules`
+Update `resources/devices.json` and `resources/70-all3dscan-scanners.rules`
 with the real values.
 
 ### Findings (2026-07-16)

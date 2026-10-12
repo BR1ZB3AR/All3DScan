@@ -75,8 +75,8 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "appimage" ]]; then
 
   # AppImage cannot install host udev rules. Keep a copy for the user to install.
   mkdir -p "${APPDIR}/usr/share/doc/all3dscan"
-  cp "${ROOT}/resources/99-all3dscan-scanners.rules" \
-    "${APPDIR}/usr/share/doc/all3dscan/99-all3dscan-scanners.rules"
+  cp "${ROOT}/resources/70-all3dscan-scanners.rules" \
+    "${APPDIR}/usr/share/doc/all3dscan/70-all3dscan-scanners.rules"
 
   export PATH="${TOOL_DIR}:${PATH}"
   export APPIMAGE_EXTRACT_AND_RUN=1
