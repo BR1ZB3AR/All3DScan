@@ -84,6 +84,7 @@ TEST_CASE("Pop4DepthDecoder recovers metric depth from synthetic speckle stereo"
     const auto cal = decoder::makeApproximatePop4FullFieldCalibration();
     decoder.setCalibration(cal);
     decoder.setRowRectification(decoder::kIdentityRowRectification);
+    decoder.setDisparityBias(decoder::kZeroDisparityBias);
     decoder.setDepthRange(200.0f, 650.0f);
     unsetenv("ALL3DSCAN_POP4_SWAP_LR");
 
@@ -126,6 +127,37 @@ TEST_CASE("Pop4DepthDecoder rejects frames without projected speckle") {
 
     REQUIRE_FALSE(decoder.decode(raw).has_value());
     REQUIRE(decoder.lastStats().validDepth < 200);
+}
+
+TEST_CASE("disparity bias flattens a bowed plane") {
+    // Synthetic pair whose matched disparity bows like the real POP4:
+    // right image sampled with an extra 24·u² px shift.
+    const auto raw = makeSyntheticSpeckleFrame(35);
+    decoder::Pop4DepthDecoder decoder;
+    decoder.setCalibration(decoder::makeApproximatePop4FullFieldCalibration());
+    decoder.setRowRectification(decoder::kIdentityRowRectification);
+    decoder.setDisparityBias({{0, 0, 0}});
+    decoder.setDepthRange(200.0f, 650.0f);
+    REQUIRE(decoder.decode(raw).has_value());
+    const auto flat = decoder.lastDisparity();
+
+    decoder.setDisparityBias({{10.0, 0, 0}});
+    REQUIRE(decoder.decode(raw).has_value());
+    const auto& corrected = decoder.lastDisparity();
+    // The same matches, minus 10·u² at each pixel.
+    uint32_t checked = 0;
+    for (uint32_t y = 100; y < 400; y += 37) {
+        for (uint32_t x = 120; x < 300; x += 11) {
+            const size_t p = static_cast<size_t>(y) * 320 + x;
+            if (flat[p] < 0.0f || corrected[p] < 0.0f) {
+                continue;
+            }
+            const double u = (static_cast<double>(x) - 160.0) / 160.0;
+            REQUIRE(std::fabs((flat[p] - corrected[p]) - 10.0 * u * u) < 0.6);
+            ++checked;
+        }
+    }
+    REQUIRE(checked > 50);
 }
 
 TEST_CASE("default POP4 row rectification is a mild roll, not identity") {

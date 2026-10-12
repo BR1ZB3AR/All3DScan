@@ -34,6 +34,18 @@ Evidence: 12 raw frames dumped from a live POP4 (box ~300 mm away,
   see `tools/re_probe/pop4_rectify_fit.py`.
 - **Disparity.** After alignment, the flat box face reads 33–38 px, stable
   frame to frame.
+- **Horizontal lens bias.** On flat surfaces the matched disparity bows up
+  toward the left/right edges: + ≈24·u² px, where u = (x−160)/160. Two
+  independent planar scenes (the box face and a carton face, different poses)
+  gave u² = 24.22 and 24.66. Correcting each with the *other's* coefficients
+  dropped the plane-fit residual from 2.9–3.3 px to 0.37–0.39 px. This is a
+  camera property (differential distortion along the baseline), not scene
+  shape. Uncorrected, every flat surface comes out bowl-shaped, fusion smears
+  into streaky fans, and edge pixels fall outside the preset's disparity band.
+  The decoder searches the band widened by the bias range and subtracts
+  `24.44·u² − 0.745·uv + 0.06·v²` (`ALL3DSCAN_POP4_DISPX` overrides; `0,0,0`
+  disables). Linear terms can't be separated from surface tilt and are not
+  modelled.
 
 Decoder (`Pop4DepthDecoder`; CUDA when available, else CPU + OpenMP):
 

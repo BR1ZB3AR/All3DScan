@@ -139,6 +139,39 @@ bool ScannerController::connectDevice() {
     return true;
 }
 
+ScannerController::~ScannerController() {
+    // The worker uses proto_; never let it outlive the controller.
+    if (connectThread_.joinable()) {
+        connectThread_.join();
+    }
+}
+
+void ScannerController::connectDeviceAsync() {
+    if (connecting_) {
+        return;
+    }
+    if (connectThread_.joinable()) {
+        connectThread_.join(); // previous attempt already reported back
+    }
+    connecting_ = true;
+    protocol::IScannerProtocol* proto = proto_.get();
+    connectThread_ = std::thread([this, proto] {
+        const bool ok = proto->connect();
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok] {
+                connecting_ = false;
+                if (ok) {
+                    emit connected();
+                } else {
+                    emit errorOccurred(protocolError(*proto_, tr("Failed to connect to scanner")));
+                }
+                emit connectFinished(ok);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void ScannerController::disconnectDevice() {
     stopScan();
     proto_->emittersOff();
@@ -189,6 +222,9 @@ bool ScannerController::captureSingleFrame() {
 }
 
 void ScannerController::poll() {
+    if (connecting_) {
+        return; // the connect worker owns the protocol until it reports back
+    }
     auto frame = proto_->readFrame(0);
     if (!frame) {
         // Still try a non-blocking RGB preview grab so the panel stays live

@@ -4,6 +4,22 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261012-2310
+
+### Fixed
+- **Flat surfaces decoded as bowls.** The POP4 pair has a horizontal lens bias:
+  matched disparity on flat surfaces rises by ~24 px toward the left/right
+  edges. The decoder now subtracts a fitted quadratic bias and widens the
+  search band to cover it. Plane-fit residual on two real scenes went from
+  ~3.9 px to 0.37 px, which removes the streaky "fan" artefacts in fused
+  scans and the edge drop-outs at the 250–500 mm preset.
+- **Connect froze the window.** Connecting (projector arming, uvcvideo
+  rebinds, and a possible ~40 s reboot after a USB reset) now runs on a
+  worker thread. The button shows "Connecting…" and the UI stays live.
+- **USB reset storms.** The "no video node" fallback reset the scanner and
+  retried after 1.5 s while it was still rebooting. Both reset paths now
+  share one reset-and-wait helper, used at most once per connect.
+
 ## Alpha-v20261012-2229
 
 ### Added

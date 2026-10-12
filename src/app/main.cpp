@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261012-2229");
+    QApplication::setApplicationVersion("Alpha-v20261012-2310");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // No window / taskbar logo — plain Qt default decoration.

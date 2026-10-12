@@ -28,6 +28,20 @@ using RowRectification = std::array<double, 6>;
 RowRectification defaultPop4RowRectification();
 constexpr RowRectification kIdentityRowRectification{{0, 0, 1, 0, 0, 0}};
 
+// Horizontal disparity bias of the POP4 pair: matched disparity on a flat
+// surface bows up by ~24 px at the left/right image edges (differential lens
+// distortion along the baseline). Measured on two different planar scenes
+// with matching curvature (plane-fit residual 3.9 px -> 0.37 px). In left
+// image coords u = (x-160)/160, v = (y-256)/256 the decoder subtracts
+//
+//   bias = k0 u² + k1 u v + k2 v²
+//
+// Linear terms are indistinguishable from surface tilt and are not modelled.
+// ALL3DSCAN_POP4_DISPX="k0,k1,k2" overrides; "0,0,0" disables.
+using DisparityBias = std::array<double, 3>;
+DisparityBias defaultPop4DisparityBias();
+constexpr DisparityBias kZeroDisparityBias{{0, 0, 0}};
+
 // Converts packed POP4 vendor-raw Y16 into metric millimetre depth.
 //
 // The 640×2560 buffer is ten 320×512 images (row stride 320, not 640):
@@ -41,6 +55,7 @@ public:
 
     void setCalibration(const protocol::ScannerCalibration& calibration);
     void setRowRectification(const RowRectification& coeffs);
+    void setDisparityBias(const DisparityBias& coeffs);
 
     // Working-distance band (millimetres). The disparity search range and the
     // final depth clamp are both derived from it via the stereo Q matrix.
@@ -74,6 +89,10 @@ private:
     protocol::ScannerCalibration calibration_;
     RowRectification rect_{};
     std::vector<float> rectMapY_; // per output pixel: source row in raw right image
+    DisparityBias bias_{};
+    std::vector<float> biasMap_;  // per left pixel: disparity bias in px
+    float biasMin_ = 0.0f;
+    float biasMax_ = 0.0f;
     std::vector<float> lastDisparity_;
     std::string lastError_;
     protocol::DepthDecodeStats lastStats_;

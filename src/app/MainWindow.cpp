@@ -1198,12 +1198,11 @@ QWidget* MainWindow::buildStatusBar() {
     connLabel_->setStyleSheet("color:#d95c5c;");
     h->addWidget(connLabel_);
 
-    auto* connectBtn = new QPushButton(tr("Connect"), bar);
-    connect(connectBtn, &QPushButton::clicked, this, [this, connectBtn] {
-        onConnectToggle();
-        connectBtn->setText(connected_ ? tr("Disconnect") : tr("Connect"));
-    });
-    h->addWidget(connectBtn);
+    connectBtn_ = new QPushButton(tr("Connect"), bar);
+    connect(connectBtn_, &QPushButton::clicked, this, &MainWindow::onConnectToggle);
+    connect(controller_.get(), &ScannerController::connectFinished, this,
+            &MainWindow::onConnectFinished);
+    h->addWidget(connectBtn_);
     return bar;
 }
 
@@ -1238,20 +1237,37 @@ void MainWindow::onConnectWifi() {
 }
 
 void MainWindow::onConnectToggle() {
-    if (!connected_) {
-        connected_ = controller_->connectDevice();
-        if (connected_ && scannerControls_) {
-            scannerControls_->bindProtocol(controller_->protocol());
-        }
-        if (connected_) {
-            streaming_ = controller_->startScan();
-        }
-    } else {
-        controller_->disconnectDevice();
-        connected_ = false;
-        streaming_ = false;
-        scanning_ = false;
+    if (controller_->isConnecting()) {
+        return;
     }
+    if (!connected_) {
+        // Arming can take tens of seconds if the scanner needs a reset and
+        // reboot; keep the window responsive and finish in onConnectFinished().
+        connectBtn_->setEnabled(false);
+        connectBtn_->setText(tr("Connecting…"));
+        connLabel_->setText(tr("● Connecting… (up to ~45 s if the scanner has to reboot)"));
+        connLabel_->setStyleSheet("color:#d0a24c;");
+        controller_->connectDeviceAsync();
+        return;
+    }
+    controller_->disconnectDevice();
+    connected_ = false;
+    streaming_ = false;
+    scanning_ = false;
+    connectBtn_->setText(tr("Connect"));
+    connLabel_->setText(tr("● Disconnected"));
+    connLabel_->setStyleSheet("color:#d95c5c;");
+    updateControlStates();
+}
+
+void MainWindow::onConnectFinished(bool ok) {
+    connected_ = ok;
+    if (connected_ && scannerControls_) {
+        scannerControls_->bindProtocol(controller_->protocol());
+    }
+    streaming_ = connected_ && controller_->startScan();
+    connectBtn_->setEnabled(true);
+    connectBtn_->setText(connected_ ? tr("Disconnect") : tr("Connect"));
     if (connected_) {
         connLabel_->setText(tr("● Scanner Connected"));
         connLabel_->setStyleSheet("color:#5bbf5b;");

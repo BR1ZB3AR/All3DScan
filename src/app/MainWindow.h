@@ -40,6 +40,7 @@ protected:
 
 private slots:
     void onConnectToggle();
+    void onConnectFinished(bool ok);
     void onScanToggle();
     void onSingleShot();
     void onComplete();
@@ -108,6 +109,7 @@ private:
     CameraPanel* depthPanel_ = nullptr;
     CameraPanel* rgbPanel_ = nullptr;
     ScannerControlPanel* scannerControls_ = nullptr;
+    QPushButton* connectBtn_ = nullptr;
     QPushButton* scanButton_ = nullptr;
     QPushButton* singleShotButton_ = nullptr;
     QPushButton* completeButton_ = nullptr;

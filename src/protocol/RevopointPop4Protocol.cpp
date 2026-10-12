@@ -73,28 +73,15 @@ public:
         // Re-install approximate calib each connect until factory camparam lands.
         calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
 
+        // At most one USB reset per connect: every reset reboots the POP4,
+        // and stacking them (as the old 1.5 s retry did) caused reset storms.
+        bool resetUsed = false;
         if (!armProjector()) {
             // After a previous session the depth XU can reject CS10 with
-            // LIBUSB_ERROR_IO until the device is reset (seen on every
-            // disconnect → connect without a replug). A port reset makes the
-            // POP4 reboot and re-enumerate (~37 s measured), so wait for it.
+            // LIBUSB_ERROR_IO until the device is reset.
             const std::string firstError = lastError_;
-            usb_.close();
-            bool recovered = false;
-            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
-                usb_.resetDevice();
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                for (int waited = 3; waited < 60 && !recovered; ++waited) {
-                    if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
-                        usb_.close();
-                        std::this_thread::sleep_for(std::chrono::seconds(2)); // udev ACLs
-                        recovered = armProjector();
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-            }
-            if (!recovered) {
+            resetUsed = true;
+            if (!resetAndRearm()) {
                 lastError_ = firstError + " (USB reset retry: " + lastError_ + ")";
                 disconnect();
                 return false;
@@ -111,15 +98,9 @@ public:
             usb::rebindUvcvideoForUsbDevice(pop4::kVendorId, pop4::kProductId);
             node = findDepthCaptureNode();
         }
-        if (!node) {
-            // Last resort: USB port reset, re-arm, then look again.
-            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
-                usb_.resetDevice();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                if (armProjector()) {
-                    node = findDepthCaptureNode();
-                }
-            }
+        if (!node && !resetUsed && resetAndRearm()) {
+            // Last resort: USB port reset (device reboots), re-arm, look again.
+            node = findDepthCaptureNode();
         }
         if (!node || captureHeight_ == 0) {
             lastError_ =
@@ -472,6 +453,28 @@ private:
         }
         usb_.close();
         return rc == static_cast<int>(settings.size());
+    }
+
+    // Port-resets the POP4, waits for it to reboot and re-enumerate (~37 s
+    // measured), lets udev apply access ACLs, then arms again.
+    bool resetAndRearm() {
+        usb_.close();
+        if (!usb_.open(pop4::kVendorId, pop4::kProductId)) {
+            lastError_ = "Revopoint POP4 2207:110c not found or permission denied";
+            return false;
+        }
+        usb_.resetDevice();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        for (int waited = 3; waited < 60; ++waited) {
+            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
+                usb_.close();
+                std::this_thread::sleep_for(std::chrono::seconds(2)); // udev ACLs
+                return armProjector();
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        lastError_ = "POP4 did not come back within 60 s after a USB reset";
+        return false;
     }
 
     bool armProjector() {

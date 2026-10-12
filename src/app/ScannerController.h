@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "pointcloud/PointCloud.h"
@@ -18,8 +19,14 @@ class ScannerController : public QObject {
 public:
     explicit ScannerController(std::unique_ptr<protocol::IScannerProtocol> proto,
                                QObject* parent = nullptr);
+    ~ScannerController() override;
 
     bool connectDevice();
+    // Runs protocol connect() on a worker thread (arming, uvcvideo rebinds and
+    // a possible device reboot can take tens of seconds) and emits
+    // connectFinished() on the GUI thread. No-op while one is in flight.
+    void connectDeviceAsync();
+    bool isConnecting() const { return connecting_; }
     void disconnectDevice();
     bool startScan();
     void stopScan();
@@ -52,6 +59,7 @@ public:
 signals:
     void connected();
     void disconnected();
+    void connectFinished(bool ok);
     void frameReady(const pointcloud::PointCloud& cloud);
     void metricFrameReady(const pointcloud::PointCloud& cloud, quint64 timestampUs);
     void previewFrameReady(const pointcloud::PointCloud& cloud, quint64 timestampUs);
@@ -71,6 +79,8 @@ private:
     void tryEmitRgbPreview();
 
     std::unique_ptr<protocol::IScannerProtocol> proto_;
+    std::thread connectThread_;
+    bool connecting_ = false;
     QTimer pollTimer_;
     pointcloud::PointCloud lastCloud_;
     protocol::RawFrame lastMetricDepth_;

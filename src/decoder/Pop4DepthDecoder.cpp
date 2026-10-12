@@ -611,8 +611,53 @@ protocol::ScannerCalibration makeApproximatePop4FullFieldCalibration() {
     return cal;
 }
 
+DisparityBias defaultPop4DisparityBias() {
+    // Mean of two independent planar fits (box 24.22/-0.64/0.17, carton
+    // 24.66/-0.85/-0.05), 2026-10-12, same POP4 unit as the row map.
+    DisparityBias coeffs{{24.44, -0.745, 0.06}};
+    if (const char* value = std::getenv("ALL3DSCAN_POP4_DISPX")) {
+        DisparityBias parsed{};
+        std::stringstream ss(value);
+        std::string item;
+        size_t n = 0;
+        while (n < parsed.size() && std::getline(ss, item, ',')) {
+            char* end = nullptr;
+            parsed[n] = std::strtod(item.c_str(), &end);
+            if (end == item.c_str() || !std::isfinite(parsed[n]) || std::fabs(parsed[n]) > 80.0) {
+                break;
+            }
+            ++n;
+        }
+        if (n == parsed.size()) {
+            coeffs = parsed;
+        }
+    }
+    return coeffs;
+}
+
 Pop4DepthDecoder::Pop4DepthDecoder() {
     setRowRectification(defaultPop4RowRectification());
+    setDisparityBias(defaultPop4DisparityBias());
+}
+
+void Pop4DepthDecoder::setDisparityBias(const DisparityBias& coeffs) {
+    if (coeffs == bias_ && !biasMap_.empty()) {
+        return;
+    }
+    bias_ = coeffs;
+    biasMap_.resize(kImagePixels);
+    biasMin_ = std::numeric_limits<float>::max();
+    biasMax_ = std::numeric_limits<float>::lowest();
+    for (uint32_t y = 0; y < kH; ++y) {
+        const double v = (static_cast<double>(y) - 256.0) / 256.0;
+        for (uint32_t x = 0; x < kW; ++x) {
+            const double u = (static_cast<double>(x) - 160.0) / 160.0;
+            const auto b = static_cast<float>(coeffs[0] * u * u + coeffs[1] * u * v + coeffs[2] * v * v);
+            biasMap_[static_cast<size_t>(y) * kW + x] = b;
+            biasMin_ = std::min(biasMin_, b);
+            biasMax_ = std::max(biasMax_, b);
+        }
+    }
 }
 
 void Pop4DepthDecoder::setCalibration(const protocol::ScannerCalibration& calibration) {
@@ -697,6 +742,9 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     int dispMin = kFallbackDispMin;
     int dispMax = kFallbackDispMax;
     computeDispRange(calibration_, depthMinMm_, depthMaxMm_, dispMin, dispMax);
+    // Matched disparities carry the lens bias, so search the biased band.
+    dispMin = std::max(kDispSearchFloor, dispMin + static_cast<int>(std::floor(biasMin_)));
+    dispMax = std::min(kDispSearchCeil, dispMax + static_cast<int>(std::ceil(biasMax_)));
     const int numDisp = dispMax - dispMin + 1;
 
     // 1-4. Matching: GPU when built and available, otherwise CPU.
@@ -728,6 +776,14 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     const double matchMs = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - matchStart)
                                .count();
+
+    // Remove the lens bias so flat surfaces come out flat.
+    for (size_t p = 0; p < kImagePixels; ++p) {
+        if (disp[p] >= 0.0f) {
+            const float d = disp[p] - biasMap_[p];
+            disp[p] = d > 0.5f ? d : -1.0f;
+        }
+    }
 
     // 5. Clean-up.
     if (t.doMedian) {
