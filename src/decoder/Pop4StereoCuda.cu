@@ -1,464 +1,383 @@
+// GPU port of Pop4DepthDecoder's matchCpu(): speckle stereo with census +
+// 4-path semi-global matching. Every step mirrors the CPU code (same blur
+// weights, census bit order, integer SGM recurrence and gates) so the two
+// backends produce matching disparity maps; tests compare them directly.
+// Build with --fmad=false (see CMakeLists.txt) to keep float steps bit-equal.
+
 #include "Pop4StereoCuda.h"
 
 #include <cuda_runtime.h>
 
 #include <atomic>
-#include <cmath>
+#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
-#include <string>
 
 namespace revoscan::decoder::cuda_stereo {
 namespace {
 
-constexpr uint32_t kPlaneWidth = 640;
-constexpr uint32_t kPlaneHeight = 512;
-constexpr uint32_t kViewWidth = 320;
-constexpr uint32_t kViewHeight = 256;
-constexpr uint32_t kPackedHeight = 2560;
-constexpr int kPhasePlanes = 4;
-constexpr float kModulationMin = 2.5f;
-constexpr float kTwoPi = 6.283185307179586f;
-constexpr float kTextureGain = 1.8f;
-constexpr float kInvalidDisp = -1.0f;
+constexpr int kW = 320;
+constexpr int kH = 512;
+constexpr int kPixels = kW * kH;
+constexpr int kMaxDisp = 192; // >= CPU kDispSearchCeil (160) band width
+constexpr int kCensusRadius = 3;
+constexpr uint8_t kCensusInvalidCost = 48;
 
-constexpr size_t kPackedSamples =
-    static_cast<size_t>(kPlaneWidth) * static_cast<size_t>(kPackedHeight);
-constexpr size_t kPlaneSamples =
-    static_cast<size_t>(kPlaneWidth) * static_cast<size_t>(kPlaneHeight);
-constexpr size_t kViewSamples =
-    static_cast<size_t>(kViewWidth) * static_cast<size_t>(kViewHeight);
+__constant__ float kBlur[5] = {1 / 16.f, 4 / 16.f, 6 / 16.f, 4 / 16.f, 1 / 16.f};
 
-__device__ __forceinline__ float intensityFromY16(uint16_t sample) {
-    return static_cast<float>(sample) * (1.0f / 257.0f);
+// --- 1. row alignment ------------------------------------------------------
+
+__global__ void prepareKernel(const uint16_t* __restrict__ left,
+                              const uint16_t* __restrict__ right,
+                              const float* __restrict__ mapY,
+                              float* __restrict__ outL,
+                              float* __restrict__ outR) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= kW || y >= kH) {
+        return;
+    }
+    const int p = y * kW + x;
+    outL[p] = static_cast<float>(left[p]) / 257.0f;
+    const float sy = mapY[p];
+    float v = 0.0f;
+    if (!(sy < 0.0f || sy > static_cast<float>(kH - 1))) {
+        const int y0 = static_cast<int>(sy);
+        const int y1 = min(y0 + 1, kH - 1);
+        const float a = sy - static_cast<float>(y0);
+        const float r0 = static_cast<float>(right[y0 * kW + x]) / 257.0f;
+        const float r1 = static_cast<float>(right[y1 * kW + x]) / 257.0f;
+        v = (1.0f - a) * r0 + a * r1;
+    }
+    outR[p] = v;
 }
 
-__device__ __forceinline__ float phaseCircDiff(float a, float b) {
-    float d = fabsf(a - b);
-    const float wrap = kTwoPi - d;
-    if (wrap < d) {
-        d = wrap;
+__global__ void blurRowsKernel(const float* __restrict__ in, float* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= kW || y >= kH) {
+        return;
     }
-    return d;
+    float s = 0.0f;
+    for (int i = -2; i <= 2; ++i) {
+        const int xx = min(max(x + i, 0), kW - 1);
+        s += kBlur[i + 2] * in[y * kW + xx];
+    }
+    out[y * kW + x] = s;
 }
 
-__global__ void computePhaseKernel(const uint16_t* packed,
-                                   uint32_t x0,
-                                   uint32_t y0,
-                                   float* phaseOut,
-                                   uint8_t* validOut,
-                                   float* albedoOut) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
+__global__ void blurColsKernel(const float* __restrict__ in, float* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= kW || y >= kH) {
         return;
     }
-    const size_t dst = static_cast<size_t>(y) * kViewWidth + x;
-    const size_t row = static_cast<size_t>(y0 + y) * kPlaneWidth + x0 + x;
-
-    const float i0 = intensityFromY16(packed[0 * kPlaneSamples + row]);
-    const float i1 = intensityFromY16(packed[1 * kPlaneSamples + row]);
-    const float i2 = intensityFromY16(packed[2 * kPlaneSamples + row]);
-    const float i3 = intensityFromY16(packed[3 * kPlaneSamples + row]);
-    albedoOut[dst] = 0.25f * (i0 + i1 + i2 + i3);
-    const float dx = i0 - i2;
-    const float dy = i1 - i3;
-    const float mod = hypotf(dx, dy);
-    if (mod < kModulationMin) {
-        phaseOut[dst] = 0.0f;
-        validOut[dst] = 0;
-        return;
+    float s = 0.0f;
+    for (int i = -2; i <= 2; ++i) {
+        const int yy = min(max(y + i, 0), kH - 1);
+        s += kBlur[i + 2] * in[yy * kW + x];
     }
-    float phase = atan2f(dy, dx);
-    if (phase < 0.0f) {
-        phase += kTwoPi;
-    }
-    phaseOut[dst] = phase;
-    validOut[dst] = 1;
+    out[y * kW + x] = s;
 }
 
-__global__ void fillAlbedoKernel(const uint16_t* packed,
-                                 uint32_t xLeft,
-                                 uint32_t y0,
-                                 uint8_t* rgbOut) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
-        return;
-    }
-    const size_t row = static_cast<size_t>(y0 + y) * kPlaneWidth + xLeft + x;
-    const float dc = 0.25f * (intensityFromY16(packed[0 * kPlaneSamples + row]) +
-                              intensityFromY16(packed[1 * kPlaneSamples + row]) +
-                              intensityFromY16(packed[2 * kPlaneSamples + row]) +
-                              intensityFromY16(packed[3 * kPlaneSamples + row]));
-    float v = dc * kTextureGain;
-    if (v < 0.0f) {
-        v = 0.0f;
-    }
-    if (v > 255.0f) {
-        v = 255.0f;
-    }
-    const uint8_t b = static_cast<uint8_t>(v);
-    const size_t dst = (static_cast<size_t>(y) * kViewWidth + x) * 3;
-    rgbOut[dst + 0] = b;
-    rgbOut[dst + 1] = b;
-    rgbOut[dst + 2] = b;
-}
+// --- 2. census + cost volume ----------------------------------------------
 
-// Phase-guided disparity search for one direction. dir=-1: source is LEFT view,
-// target pixel = x - d. dir=+1: source is RIGHT view, target pixel = x + d.
-// Writes sub-pixel disparity (>=0) or kInvalidDisp when weak/ambiguous.
-__global__ void matchKernel(const float* phaseSrc,
-                            const uint8_t* validSrc,
-                            const float* albedoSrc,
-                            const float* phaseTgt,
-                            const uint8_t* validTgt,
-                            const float* albedoTgt,
-                            int dir,
-                            int dispMin,
-                            int dispMax,
-                            float maxCost,
-                            float minMargin,
-                            float uniqRatio,
-                            float intensityWeight,
-                            float* dispOut) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
+__global__ void censusKernel(const float* __restrict__ img, unsigned long long* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= kW || y >= kH) {
         return;
     }
-    const size_t si = static_cast<size_t>(y) * kViewWidth + x;
-    dispOut[si] = kInvalidDisp;
-    if (!validSrc[si]) {
-        return;
-    }
-
-    float bestCost = 1.0e30f;
-    float bestPhase = 1.0e30f;
-    int bestD = -1;
-    for (int d = dispMin; d <= dispMax; ++d) {
-        const int xt = static_cast<int>(x) + dir * d;
-        if (xt < 0 || xt >= static_cast<int>(kViewWidth)) {
-            continue;
-        }
-        const size_t ti = static_cast<size_t>(y) * kViewWidth + static_cast<size_t>(xt);
-        if (!validTgt[ti]) {
-            continue;
-        }
-        const float phaseCost = phaseCircDiff(phaseSrc[si], phaseTgt[ti]);
-        const float cost = phaseCost +
-                           intensityWeight * fabsf(albedoSrc[si] - albedoTgt[ti]);
-        if (cost < bestCost) {
-            bestCost = cost;
-            bestPhase = phaseCost;
-            bestD = d;
-        }
-    }
-    // Gate on phase agreement only; intensity ranks / breaks fringe ties.
-    if (bestD < 0 || bestPhase > maxCost) {
-        return;
-    }
-
-    float rivalCost = 1.0e30f;
-    for (int d = dispMin; d <= dispMax; ++d) {
-        if (abs(d - bestD) < 6) {
-            continue;
-        }
-        const int xt = static_cast<int>(x) + dir * d;
-        if (xt < 0 || xt >= static_cast<int>(kViewWidth)) {
-            continue;
-        }
-        const size_t ti = static_cast<size_t>(y) * kViewWidth + static_cast<size_t>(xt);
-        if (!validTgt[ti]) {
-            continue;
-        }
-        const float cost = phaseCircDiff(phaseSrc[si], phaseTgt[ti]) +
-                           intensityWeight * fabsf(albedoSrc[si] - albedoTgt[ti]);
-        if (cost < rivalCost) {
-            rivalCost = cost;
-        }
-    }
-    if (rivalCost < 1.0e30f) {
-        if ((rivalCost - bestCost) < minMargin) {
-            return;
-        }
-        if (bestCost > uniqRatio * rivalCost) {
-            return;
-        }
-    }
-
-    float costPrev = bestCost + 1.0f; // d - 1
-    float costNext = bestCost + 1.0f; // d + 1
-    const int xtPrev = static_cast<int>(x) + dir * (bestD - 1);
-    const int xtNext = static_cast<int>(x) + dir * (bestD + 1);
-    if (xtPrev >= 0 && xtPrev < static_cast<int>(kViewWidth)) {
-        const size_t ti = static_cast<size_t>(y) * kViewWidth + static_cast<size_t>(xtPrev);
-        if (validTgt[ti]) {
-            costPrev = phaseCircDiff(phaseSrc[si], phaseTgt[ti]) +
-                       intensityWeight * fabsf(albedoSrc[si] - albedoTgt[ti]);
-        }
-    }
-    if (xtNext >= 0 && xtNext < static_cast<int>(kViewWidth)) {
-        const size_t ti = static_cast<size_t>(y) * kViewWidth + static_cast<size_t>(xtNext);
-        if (validTgt[ti]) {
-            costNext = phaseCircDiff(phaseSrc[si], phaseTgt[ti]) +
-                       intensityWeight * fabsf(albedoSrc[si] - albedoTgt[ti]);
-        }
-    }
-
-    float disparity = static_cast<float>(bestD);
-    const float denom = costPrev - 2.0f * bestCost + costNext;
-    if (fabsf(denom) > 1e-6f) {
-        const float delta = 0.5f * (costPrev - costNext) / denom;
-        if (fabsf(delta) < 1.0f) {
-            disparity += delta;
-        }
-    }
-    dispOut[si] = disparity;
-}
-
-// Invalidate left disparities that disagree with the right→left match.
-__global__ void lrConsistencyKernel(const float* dispL,
-                                    const float* dispR,
-                                    float lrMaxDiff,
-                                    float* dispOut) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
-        return;
-    }
-    const size_t li = static_cast<size_t>(y) * kViewWidth + x;
-    const float d = dispL[li];
-    dispOut[li] = d;
-    if (d < 0.0f) {
-        return;
-    }
-    const int xr = static_cast<int>(x) - __float2int_rn(d);
-    if (xr < 0 || xr >= static_cast<int>(kViewWidth)) {
-        dispOut[li] = kInvalidDisp;
-        return;
-    }
-    const float dr = dispR[static_cast<size_t>(y) * kViewWidth + static_cast<size_t>(xr)];
-    if (dr < 0.0f || fabsf(dr - d) > lrMaxDiff) {
-        dispOut[li] = kInvalidDisp;
-    }
-}
-
-// 3×3 median of valid disparities (invalid neighbours ignored).
-__global__ void medianKernel(const float* in, float* out) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
-        return;
-    }
-    const size_t ci = static_cast<size_t>(y) * kViewWidth + x;
-    out[ci] = kInvalidDisp;
-    if (in[ci] < 0.0f) {
-        return;
-    }
-    float w[9];
-    int n = 0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        const int yy = static_cast<int>(y) + dy;
-        if (yy < 0 || yy >= static_cast<int>(kViewHeight)) {
-            continue;
-        }
-        for (int dx = -1; dx <= 1; ++dx) {
-            const int xx = static_cast<int>(x) + dx;
-            if (xx < 0 || xx >= static_cast<int>(kViewWidth)) {
-                continue;
-            }
-            const float v = in[static_cast<size_t>(yy) * kViewWidth + static_cast<size_t>(xx)];
-            if (v >= 0.0f) {
-                w[n++] = v;
-            }
-        }
-    }
-    if (n == 0) {
-        return;
-    }
-    for (int i = 1; i < n; ++i) { // insertion sort (n <= 9)
-        const float key = w[i];
-        int j = i - 1;
-        while (j >= 0 && w[j] > key) {
-            w[j + 1] = w[j];
-            --j;
-        }
-        w[j + 1] = key;
-    }
-    out[ci] = w[n / 2];
-}
-
-// Local-support speckle rejection over a 5×5 window.
-__global__ void speckleKernel(const float* in, float* out, float maxDiff,
-                              int minSupport) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
-        return;
-    }
-    const size_t ci = static_cast<size_t>(y) * kViewWidth + x;
-    const float c = in[ci];
-    out[ci] = c;
-    if (c < 0.0f) {
-        return;
-    }
-    int support = 0;
-    for (int dy = -2; dy <= 2; ++dy) {
-        const int yy = static_cast<int>(y) + dy;
-        if (yy < 0 || yy >= static_cast<int>(kViewHeight)) {
-            continue;
-        }
-        for (int dx = -2; dx <= 2; ++dx) {
+    const float c = img[y * kW + x];
+    unsigned long long bits = 0;
+    for (int dy = -kCensusRadius; dy <= kCensusRadius; ++dy) {
+        const int yy = min(max(y + dy, 0), kH - 1);
+        for (int dx = -kCensusRadius; dx <= kCensusRadius; ++dx) {
             if (dx == 0 && dy == 0) {
                 continue;
             }
-            const int xx = static_cast<int>(x) + dx;
-            if (xx < 0 || xx >= static_cast<int>(kViewWidth)) {
-                continue;
-            }
-            const float v = in[static_cast<size_t>(yy) * kViewWidth + static_cast<size_t>(xx)];
-            if (v >= 0.0f && fabsf(v - c) <= maxDiff) {
-                ++support;
-            }
+            const int xx = min(max(x + dx, 0), kW - 1);
+            bits = (bits << 1) | (img[yy * kW + xx] < c ? 1ull : 0ull);
         }
     }
-    if (support < minSupport) {
-        out[ci] = kInvalidDisp;
+    out[y * kW + x] = bits;
+}
+
+// One thread per (pixel, disparity); cost layout [pixel][d - dispMin].
+__global__ void costKernel(const unsigned long long* __restrict__ cL,
+                           const unsigned long long* __restrict__ cR,
+                           int dispMin,
+                           int numDisp,
+                           uint8_t* __restrict__ cost,
+                           uint16_t* __restrict__ sum) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<long long>(kPixels) * numDisp) {
+        return;
+    }
+    const int p = static_cast<int>(i / numDisp);
+    const int di = static_cast<int>(i % numDisp);
+    const int x = p % kW;
+    const int d = dispMin + di;
+    cost[i] = x - d < 0 ? kCensusInvalidCost
+                        : static_cast<uint8_t>(__popcll(cL[p] ^ cR[p - d]));
+    sum[i] = 0;
+}
+
+// --- 3. semi-global aggregation -------------------------------------------
+
+// One warp per scan line; lane l holds disparities [l*K, l*K + K) in registers
+// and swaps edge values with its neighbours by shuffle, so a pixel step needs
+// no block barriers. The integer recurrence is identical to the CPU
+// aggregatePath(), so sums match exactly.
+template <int K>
+__global__ void aggregateKernel(const uint8_t* __restrict__ cost,
+                                uint16_t* __restrict__ sum,
+                                int numDisp,
+                                int lines,
+                                int lineStride,
+                                int first,
+                                int step,
+                                int length,
+                                int p1,
+                                int p2) {
+    constexpr int kBig = 1 << 20;
+    constexpr unsigned kAll = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    const int line = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (line >= lines) {
+        return; // whole warp exits together
+    }
+    const int d0 = lane * K;
+    int prev[K];
+    int minPrev = 0;
+    long long p = static_cast<long long>(first) + static_cast<long long>(line) * lineStride;
+    for (int k = 0; k < length; ++k, p += step) {
+        const long long base = p * numDisp;
+        // Neighbour disparities across lane boundaries (previous step's values).
+        const int fromLeft = __shfl_up_sync(kAll, prev[K - 1], 1);
+        const int fromRight = __shfl_down_sync(kAll, prev[0], 1);
+        int cur[K];
+        int m = kBig;
+#pragma unroll
+        for (int j = 0; j < K; ++j) {
+            const int d = d0 + j;
+            if (d >= numDisp) {
+                cur[j] = kBig;
+                continue;
+            }
+            const int c = cost[base + d];
+            int l;
+            if (k == 0) {
+                l = c;
+            } else {
+                int v = prev[j];
+                if (d > 0) {
+                    v = min(v, (j > 0 ? prev[j - 1] : fromLeft) + p1);
+                }
+                if (d + 1 < numDisp) {
+                    v = min(v, (j + 1 < K ? prev[j + 1] : fromRight) + p1);
+                }
+                v = min(v, minPrev + p2);
+                l = static_cast<uint16_t>(c + v - minPrev);
+            }
+            sum[base + d] = static_cast<uint16_t>(sum[base + d] + l);
+            cur[j] = l;
+            m = min(m, l);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            m = min(m, __shfl_xor_sync(kAll, m, off));
+        }
+#pragma unroll
+        for (int j = 0; j < K; ++j) {
+            prev[j] = cur[j];
+        }
+        minPrev = m;
     }
 }
 
-// Convert the filtered disparity field to metric depth (mm).
-__global__ void depthKernel(const float* disp,
-                            float q23,
-                            float q32,
-                            float q33,
-                            float depthScale,
-                            float depthMinMm,
-                            float depthMaxMm,
-                            uint16_t* depthOut,
-                            unsigned long long* validCount) {
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= kViewWidth || y >= kViewHeight) {
-        return;
-    }
-    const size_t li = static_cast<size_t>(y) * kViewWidth + x;
-    depthOut[li] = 0;
-    const float disparity = disp[li];
-    if (disparity < 0.0f) {
-        return;
-    }
-    const float qDenom = disparity * q32 + q33;
-    if (fabsf(qDenom) < 1e-9f) {
-        return;
-    }
-    float z = (q23 / qDenom) * depthScale;
-    if (!isfinite(z) || z < depthMinMm || z > depthMaxMm) {
-        return;
-    }
-    if (z < 1.0f) {
-        z = 1.0f;
-    }
-    if (z > 65535.0f) {
-        z = 65535.0f;
-    }
-    depthOut[li] = static_cast<uint16_t>(z);
-    atomicAdd(validCount, 1ULL);
+template <int K>
+void launchAggregate(const uint8_t* cost, uint16_t* sum, int numDisp, int lines,
+                     int lineStride, int first, int step, int length, int p1, int p2) {
+    constexpr int kWarpsPerBlock = 4;
+    const int blocks = (lines + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    aggregateKernel<K><<<blocks, 32 * kWarpsPerBlock>>>(cost, sum, numDisp, lines, lineStride,
+                                                        first, step, length, p1, p2);
 }
+
+void aggregate(const uint8_t* cost, uint16_t* sum, int numDisp, int lines, int lineStride,
+               int first, int step, int length, int p1, int p2) {
+    switch ((numDisp + 31) / 32) {
+    case 1: launchAggregate<1>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    case 2: launchAggregate<2>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    case 3: launchAggregate<3>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    case 4: launchAggregate<4>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    case 5: launchAggregate<5>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    default: launchAggregate<6>(cost, sum, numDisp, lines, lineStride, first, step, length, p1, p2); break;
+    }
+}
+
+// --- 4. winner-take-all ----------------------------------------------------
+
+__global__ void rightDisparityKernel(const uint16_t* __restrict__ sum,
+                                     int dispMin,
+                                     int numDisp,
+                                     int* __restrict__ dispRight) {
+    const int xr = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (xr >= kW || y >= kH) {
+        return;
+    }
+    int bestD = -1;
+    unsigned best = 0xffffffffu;
+    for (int di = 0; di < numDisp; ++di) {
+        const int xl = xr + dispMin + di;
+        if (xl >= kW) {
+            break;
+        }
+        const unsigned s = sum[static_cast<long long>(y * kW + xl) * numDisp + di];
+        if (s < best) {
+            best = s;
+            bestD = di;
+        }
+    }
+    dispRight[y * kW + xr] = bestD < 0 ? -1 : dispMin + bestD;
+}
+
+// Local std over a 9×9 window clamped at the borders (CPU: localStd(L, 4)).
+__device__ float localStd9(const float* img, int x, int y) {
+    const int y0 = max(0, y - 4);
+    const int y1 = min(kH, y + 5);
+    const int x0 = max(0, x - 4);
+    const int x1 = min(kW, x + 5);
+    double s1 = 0.0;
+    double s2 = 0.0;
+    for (int yy = y0; yy < y1; ++yy) {
+        for (int xx = x0; xx < x1; ++xx) {
+            const double v = img[yy * kW + xx];
+            s1 += v;
+            s2 += v * v;
+        }
+    }
+    const double n = static_cast<double>((y1 - y0) * (x1 - x0));
+    const double mean = s1 / n;
+    return static_cast<float>(sqrt(fmax(0.0, s2 / n - mean * mean)));
+}
+
+__global__ void winnerKernel(const uint16_t* __restrict__ sum,
+                             const int* __restrict__ dispRight,
+                             const float* __restrict__ blurredL,
+                             SgmParams prm,
+                             float* __restrict__ disp) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= kW || y >= kH) {
+        return;
+    }
+    const int p = y * kW + x;
+    disp[p] = -1.0f;
+    if (x < prm.dispMin || localStd9(blurredL, x, y) < prm.textureMin) {
+        return;
+    }
+    const uint16_t* s = sum + static_cast<long long>(p) * prm.numDisp;
+    const int validDisp = min(prm.numDisp, x - prm.dispMin + 1);
+    int bestD = 0;
+    for (int di = 1; di < validDisp; ++di) {
+        if (s[di] < s[bestD]) {
+            bestD = di;
+        }
+    }
+    unsigned rival = 0xffffffffu;
+    for (int di = 0; di < validDisp; ++di) {
+        if (abs(di - bestD) > 1) {
+            rival = min(rival, static_cast<unsigned>(s[di]));
+        }
+    }
+    if (rival != 0xffffffffu &&
+        static_cast<float>(s[bestD]) * (1.0f + prm.uniqueness) >= static_cast<float>(rival)) {
+        return;
+    }
+    if (!(bestD > 0 && bestD + 1 < validDisp)) {
+        return; // winner at the band edge
+    }
+    float d = static_cast<float>(prm.dispMin + bestD);
+    const float cp = s[bestD - 1];
+    const float cb = s[bestD];
+    const float cn = s[bestD + 1];
+    const float den = cp - 2.0f * cb + cn;
+    if (den > 1e-6f) {
+        d += fminf(fmaxf(0.5f * (cp - cn) / den, -0.5f), 0.5f);
+    }
+    const int xr = x - static_cast<int>(lroundf(d));
+    if (xr < 0) {
+        return;
+    }
+    const int dr = dispRight[y * kW + xr];
+    if (dr < 0 || fabsf(static_cast<float>(dr) - d) > prm.lrMaxDiff + 0.5f) {
+        return;
+    }
+    disp[p] = d;
+}
+
+// --- device state ------------------------------------------------------------
 
 struct DeviceBuffers {
-    uint16_t* packed = nullptr;
-    float* phaseL = nullptr;
-    float* phaseR = nullptr;
-    float* albedoL = nullptr;
-    float* albedoR = nullptr;
-    uint8_t* validL = nullptr;
-    uint8_t* validR = nullptr;
-    float* dispL = nullptr;
-    float* dispR = nullptr;
-    float* dispScratch = nullptr;
-    uint16_t* depth = nullptr;
-    uint8_t* rgb = nullptr;
-    unsigned long long* validCount = nullptr;
+    uint16_t* left = nullptr;
+    uint16_t* right = nullptr;
+    float* mapY = nullptr;
+    float* rawL = nullptr;
+    float* rectR = nullptr;
+    float* tmp = nullptr;
+    float* L = nullptr;
+    float* R = nullptr;
+    unsigned long long* cL = nullptr;
+    unsigned long long* cR = nullptr;
+    uint8_t* cost = nullptr;
+    uint16_t* sum = nullptr;
+    int* dispRight = nullptr;
+    float* disp = nullptr;
     bool ready = false;
 
     bool ensure() {
         if (ready) {
             return true;
         }
-        auto fail = [this]() {
+        const size_t px = kPixels;
+        bool ok = cudaMalloc(&left, px * sizeof(uint16_t)) == cudaSuccess &&
+                  cudaMalloc(&right, px * sizeof(uint16_t)) == cudaSuccess &&
+                  cudaMalloc(&mapY, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&rawL, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&rectR, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&tmp, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&L, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&R, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&cL, px * sizeof(unsigned long long)) == cudaSuccess &&
+                  cudaMalloc(&cR, px * sizeof(unsigned long long)) == cudaSuccess &&
+                  cudaMalloc(&cost, px * kMaxDisp) == cudaSuccess &&
+                  cudaMalloc(&sum, px * kMaxDisp * sizeof(uint16_t)) == cudaSuccess &&
+                  cudaMalloc(&dispRight, px * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&disp, px * sizeof(float)) == cudaSuccess;
+        if (!ok) {
             freeAll();
             return false;
-        };
-        if (cudaMalloc(&packed, kPackedSamples * sizeof(uint16_t)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&phaseL, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&phaseR, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&albedoL, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&albedoR, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&validL, kViewSamples * sizeof(uint8_t)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&validR, kViewSamples * sizeof(uint8_t)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&dispL, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&dispR, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&dispScratch, kViewSamples * sizeof(float)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&depth, kViewSamples * sizeof(uint16_t)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&rgb, kViewSamples * 3 * sizeof(uint8_t)) != cudaSuccess) {
-            return fail();
-        }
-        if (cudaMalloc(&validCount, sizeof(unsigned long long)) != cudaSuccess) {
-            return fail();
         }
         ready = true;
         return true;
     }
 
     void freeAll() {
-        // cudaFree(nullptr) is a no-op; always null after free to avoid double-free.
-        cudaFree(packed);
-        cudaFree(phaseL);
-        cudaFree(phaseR);
-        cudaFree(albedoL);
-        cudaFree(albedoR);
-        cudaFree(validL);
-        cudaFree(validR);
-        cudaFree(dispL);
-        cudaFree(dispR);
-        cudaFree(dispScratch);
-        cudaFree(depth);
-        cudaFree(rgb);
-        cudaFree(validCount);
-        packed = nullptr;
-        phaseL = phaseR = nullptr;
-        albedoL = albedoR = nullptr;
-        validL = validR = nullptr;
-        dispL = dispR = dispScratch = nullptr;
-        depth = nullptr;
-        rgb = nullptr;
-        validCount = nullptr;
-        ready = false;
+        for (void* p : {static_cast<void*>(left), static_cast<void*>(right),
+                        static_cast<void*>(mapY), static_cast<void*>(rawL),
+                        static_cast<void*>(rectR), static_cast<void*>(tmp),
+                        static_cast<void*>(L), static_cast<void*>(R),
+                        static_cast<void*>(cL), static_cast<void*>(cR),
+                        static_cast<void*>(cost), static_cast<void*>(sum),
+                        static_cast<void*>(dispRight), static_cast<void*>(disp)}) {
+            if (p) {
+                cudaFree(p);
+            }
+        }
+        *this = DeviceBuffers{};
     }
 };
 
@@ -485,28 +404,10 @@ std::atomic<int>& availCache() {
     return cache;
 }
 
-std::string cudaErrorString(cudaError_t err) {
-    return std::string("CUDA: ") + cudaGetErrorString(err);
-}
-
-bool paramsInBounds(const DecodeParams& params) {
-    // Stereo tiles are 320×256 within each 640×512 plane.
-    if (params.xLeft > kPlaneWidth - kViewWidth ||
-        params.xRight > kPlaneWidth - kViewWidth) {
-        return false;
-    }
-    if (params.y0 > kPlaneHeight - kViewHeight) {
-        return false;
-    }
-    (void)kPhasePlanes;
-    return true;
-}
-
 void markDeviceBroken() {
     stickyDisabled().store(true, std::memory_order_release);
     availCache().store(static_cast<int>(AvailState::No), std::memory_order_release);
     buffers().freeAll();
-    // Drop sticky CUDA error so later CPU-only runs don't trip on old state.
     (void)cudaGetLastError();
     (void)cudaDeviceSynchronize();
     (void)cudaGetLastError();
@@ -516,41 +417,6 @@ void markDeviceBroken() {
 
 bool isBuilt() {
     return true;
-}
-
-bool available() {
-    if (stickyDisabled().load(std::memory_order_acquire)) {
-        return false;
-    }
-    if (!enabledByEnv()) {
-        return false;
-    }
-    const int cached = availCache().load(std::memory_order_acquire);
-    if (cached == static_cast<int>(AvailState::Yes)) {
-        return true;
-    }
-    if (cached == static_cast<int>(AvailState::No)) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex());
-    if (stickyDisabled().load(std::memory_order_relaxed)) {
-        return false;
-    }
-    const int again = availCache().load(std::memory_order_relaxed);
-    if (again == static_cast<int>(AvailState::Yes)) {
-        return true;
-    }
-    if (again == static_cast<int>(AvailState::No)) {
-        return false;
-    }
-
-    int count = 0;
-    const cudaError_t err = cudaGetDeviceCount(&count);
-    const bool ok = (err == cudaSuccess && count > 0);
-    availCache().store(static_cast<int>(ok ? AvailState::Yes : AvailState::No),
-                       std::memory_order_release);
-    return ok;
 }
 
 bool enabledByEnv() {
@@ -563,182 +429,138 @@ bool enabledByEnv() {
     return true;
 }
 
-uint32_t decodePacked(const uint16_t* packedY16,
-                      const DecodeParams& params,
-                      std::vector<uint16_t>& depthMm,
-                      std::vector<uint8_t>& rgb,
+bool available() {
+    if (stickyDisabled().load(std::memory_order_acquire) || !enabledByEnv()) {
+        return false;
+    }
+    const int cached = availCache().load(std::memory_order_acquire);
+    if (cached != static_cast<int>(AvailState::Unknown)) {
+        return cached == static_cast<int>(AvailState::Yes);
+    }
+    std::lock_guard<std::mutex> lock(mutex());
+    const int again = availCache().load(std::memory_order_relaxed);
+    if (again != static_cast<int>(AvailState::Unknown)) {
+        return again == static_cast<int>(AvailState::Yes);
+    }
+    int count = 0;
+    const bool ok = cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+    availCache().store(static_cast<int>(ok ? AvailState::Yes : AvailState::No),
+                       std::memory_order_release);
+    return ok;
+}
+
+bool computeDisparity(const uint16_t* leftY16,
+                      const uint16_t* rightY16,
+                      const float* rectMapY,
+                      const SgmParams& params,
+                      std::vector<float>& disparity,
                       std::string* errorOut) {
-    auto fail = [&](const std::string& msg) -> uint32_t {
+    auto fail = [&](const std::string& msg) {
         if (errorOut) {
             *errorOut = msg;
         }
-        depthMm.clear();
-        rgb.clear();
-        return 0;
+        disparity.clear();
+        return false;
     };
-
-    if (!packedY16) {
-        return fail("CUDA decode: null packed buffer");
+    if (!leftY16 || !rightY16 || !rectMapY) {
+        return fail("CUDA decode: null input");
     }
-    if (!paramsInBounds(params)) {
-        return fail("CUDA decode: stereo crop out of bounds");
-    }
-    if (stickyDisabled().load(std::memory_order_acquire)) {
-        return fail("CUDA decode: disabled after prior device error");
+    if (params.numDisp < 3 || params.numDisp > kMaxDisp || params.dispMin < 0) {
+        return fail("CUDA decode: disparity band out of range");
     }
     if (!available()) {
-        return fail("CUDA decode: no device");
+        return fail("CUDA decode: no usable device");
     }
 
     std::lock_guard<std::mutex> lock(mutex());
     if (stickyDisabled().load(std::memory_order_relaxed)) {
         return fail("CUDA decode: disabled after prior device error");
     }
-
-    auto& buf = buffers();
-    if (!buf.ensure()) {
+    auto& b = buffers();
+    if (!b.ensure()) {
         markDeviceBroken();
-        return fail("CUDA decode: device buffer alloc failed");
+        return fail("CUDA decode: device buffer allocation failed");
     }
-
-    auto failDevice = [&](cudaError_t err) -> uint32_t {
+    auto check = [&](cudaError_t err) {
+        if (err == cudaSuccess) {
+            return true;
+        }
         markDeviceBroken();
-        return fail(cudaErrorString(err));
+        fail(std::string("CUDA: ") + cudaGetErrorString(err));
+        return false;
     };
-
-    // Clear any stale sticky error from a previous caller before launching work.
     (void)cudaGetLastError();
 
-    cudaError_t err =
-        cudaMemcpy(buf.packed, packedY16, kPackedSamples * sizeof(uint16_t),
-                   cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        return failDevice(err);
+    const size_t px = kPixels;
+    if (!check(cudaMemcpy(b.left, leftY16, px * sizeof(uint16_t), cudaMemcpyHostToDevice)) ||
+        !check(cudaMemcpy(b.right, rightY16, px * sizeof(uint16_t), cudaMemcpyHostToDevice)) ||
+        // 640 KB per frame; cheaper than tracking in-place map edits.
+        !check(cudaMemcpy(b.mapY, rectMapY, px * sizeof(float), cudaMemcpyHostToDevice))) {
+        return false;
     }
 
-    const dim3 block(16, 16);
-    const dim3 grid((kViewWidth + block.x - 1) / block.x,
-                    (kViewHeight + block.y - 1) / block.y);
-
-    computePhaseKernel<<<grid, block>>>(buf.packed, params.xLeft, params.y0,
-                                        buf.phaseL, buf.validL, buf.albedoL);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-    computePhaseKernel<<<grid, block>>>(buf.packed, params.xRight, params.y0,
-                                        buf.phaseR, buf.validR, buf.albedoR);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-    fillAlbedoKernel<<<grid, block>>>(buf.packed, params.xLeft, params.y0, buf.rgb);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-
-    err = cudaMemset(buf.validCount, 0, sizeof(unsigned long long));
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-
-    // Disparity field pipeline: match both directions, enforce L↔R consistency,
-    // median + speckle clean, then convert to depth. Mirrors decodeCpu().
-    matchKernel<<<grid, block>>>(buf.phaseL, buf.validL, buf.albedoL, buf.phaseR,
-                                 buf.validR, buf.albedoR, /*dir=*/-1,
-                                 params.dispMin, params.dispMax,
-                                 params.maxPhaseCost, params.minCostMargin,
-                                 params.uniqRatio, params.intensityWeight,
-                                 buf.dispL);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-
-    float* cur = buf.dispL;
-    float* scratch = buf.dispScratch;
-    if (params.lrCheck) {
-        matchKernel<<<grid, block>>>(buf.phaseR, buf.validR, buf.albedoR, buf.phaseL,
-                                     buf.validL, buf.albedoL, /*dir=*/+1,
-                                     params.dispMin, params.dispMax,
-                                     params.maxPhaseCost, params.minCostMargin,
-                                     params.uniqRatio, params.intensityWeight,
-                                     buf.dispR);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            return failDevice(err);
+    // ALL3DSCAN_POP4_DEBUG=1: per-stage GPU timing via events.
+    const char* dbg = std::getenv("ALL3DSCAN_POP4_DEBUG");
+    const bool timing = dbg && dbg[0] == '1';
+    cudaEvent_t ev[6];
+    if (timing) {
+        for (auto& e : ev) {
+            cudaEventCreate(&e);
         }
-        lrConsistencyKernel<<<grid, block>>>(cur, buf.dispR, params.lrMaxDiff,
-                                             scratch);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            return failDevice(err);
-        }
-        float* t = cur;
-        cur = scratch;
-        scratch = t;
     }
-    if (params.doMedian) {
-        medianKernel<<<grid, block>>>(cur, scratch);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            return failDevice(err);
+    auto mark = [&](int i) {
+        if (timing) {
+            cudaEventRecord(ev[i]);
         }
-        float* t = cur;
-        cur = scratch;
-        scratch = t;
-    }
-    if (params.doSpeckle) {
-        speckleKernel<<<grid, block>>>(cur, scratch, params.speckleMaxDiff,
-                                       params.speckleMinSupport);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            return failDevice(err);
-        }
-        float* t = cur;
-        cur = scratch;
-        scratch = t;
+    };
+    mark(0);
+    const dim3 block(32, 8);
+    const dim3 grid((kW + block.x - 1) / block.x, (kH + block.y - 1) / block.y);
+    prepareKernel<<<grid, block>>>(b.left, b.right, b.mapY, b.rawL, b.rectR);
+    blurRowsKernel<<<grid, block>>>(b.rawL, b.tmp);
+    blurColsKernel<<<grid, block>>>(b.tmp, b.L);
+    blurRowsKernel<<<grid, block>>>(b.rectR, b.tmp);
+    blurColsKernel<<<grid, block>>>(b.tmp, b.R);
+    censusKernel<<<grid, block>>>(b.L, b.cL);
+    censusKernel<<<grid, block>>>(b.R, b.cR);
+    mark(1);
+
+    const long long volume = static_cast<long long>(px) * params.numDisp;
+    costKernel<<<static_cast<unsigned>((volume + 255) / 256), 256>>>(
+        b.cL, b.cR, params.dispMin, params.numDisp, b.cost, b.sum);
+    mark(2);
+
+    // left→right, right→left, top→bottom, bottom→top (same order as CPU).
+    aggregate(b.cost, b.sum, params.numDisp, kH, kW, 0, 1, kW, params.p1, params.p2);
+    aggregate(b.cost, b.sum, params.numDisp, kH, kW, kW - 1, -1, kW, params.p1, params.p2);
+    aggregate(b.cost, b.sum, params.numDisp, kW, 1, 0, kW, kH, params.p1, params.p2);
+    aggregate(b.cost, b.sum, params.numDisp, kW, 1, (kH - 1) * kW, -kW, kH, params.p1, params.p2);
+    mark(3);
+    rightDisparityKernel<<<grid, block>>>(b.sum, params.dispMin, params.numDisp, b.dispRight);
+    winnerKernel<<<grid, block>>>(b.sum, b.dispRight, b.L, params, b.disp);
+    mark(4);
+    if (!check(cudaGetLastError())) {
+        return false;
     }
 
-    depthKernel<<<grid, block>>>(cur, params.q23, params.q32, params.q33,
-                                 params.depthScale, params.depthMinMm,
-                                 params.depthMaxMm, buf.depth, buf.validCount);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return failDevice(err);
+    disparity.resize(px);
+    const bool ok = check(cudaMemcpy(disparity.data(), b.disp, px * sizeof(float),
+                                     cudaMemcpyDeviceToHost));
+    if (timing) {
+        mark(5);
+        cudaEventSynchronize(ev[5]);
+        float t[5];
+        for (int i = 0; i < 5; ++i) {
+            cudaEventElapsedTime(&t[i], ev[i], ev[i + 1]);
+        }
+        std::fprintf(stderr,
+                     "[POP4] CUDA ms: prep+census %.2f cost %.2f sgm %.2f wta %.2f download %.2f\n",
+                     t[0], t[1], t[2], t[3], t[4]);
+        for (auto& e : ev) {
+            cudaEventDestroy(e);
+        }
     }
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        return failDevice(err);
-    }
-
-    depthMm.assign(kViewSamples, 0);
-    rgb.assign(kViewSamples * 3, 0);
-    err = cudaMemcpy(depthMm.data(), buf.depth, kViewSamples * sizeof(uint16_t),
-                     cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        depthMm.clear();
-        rgb.clear();
-        return failDevice(err);
-    }
-    err = cudaMemcpy(rgb.data(), buf.rgb, kViewSamples * 3 * sizeof(uint8_t),
-                     cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        depthMm.clear();
-        rgb.clear();
-        return failDevice(err);
-    }
-
-    unsigned long long valid = 0;
-    err = cudaMemcpy(&valid, buf.validCount, sizeof(unsigned long long),
-                     cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        depthMm.clear();
-        rgb.clear();
-        return failDevice(err);
-    }
-    return static_cast<uint32_t>(valid);
+    return ok;
 }
 
 } // namespace revoscan::decoder::cuda_stereo

@@ -10,9 +10,8 @@ bottom of this doc).
 
 **This supersedes the frame-layout and decoding claims in the 2026-07-18,
 2026-07-19 and 2026-07-21 sections below.** Those sections are kept for
-history; the CUDA phase path (`Pop4StereoCuda.cu`) and the phase knobs
-(`_MAXCOST`, `_MARGIN`, `_LRCHECK`, `_SPECKLE_SUPPORT`, `_STEREO_BAND`,
-`_CUDA`) are no longer used by the decoder.
+history. The phase knobs (`_MAXCOST`, `_MARGIN`, `_LRCHECK`,
+`_SPECKLE_SUPPORT`, `_STEREO_BAND`) are no longer used by the decoder.
 
 Evidence: 12 raw frames dumped from a live POP4 (box ~300 mm away,
 `ALL3DSCAN_POP4_DUMP_DIR`), analysed offline.
@@ -36,7 +35,7 @@ Evidence: 12 raw frames dumped from a live POP4 (box ~300 mm away,
 - **Disparity.** After alignment, the flat box face reads 33–38 px, stable
   frame to frame.
 
-Decoder (`Pop4DepthDecoder`, CPU + OpenMP, ~63 ms per frame here):
+Decoder (`Pop4DepthDecoder`; CUDA when available, else CPU + OpenMP):
 
 1. Left = image 9, right = image 4 (`ALL3DSCAN_POP4_SWAP_LR=1` swaps them).
 2. Resample the right image onto left rows with the quadratic row map
@@ -54,6 +53,21 @@ On the dumped frames this gives about 50k valid depth samples per frame
 (31% of the image, and most of the speckle-lit box face). The textureless
 floor is rejected rather than filled with noise. The old decoder produced
 about 5k samples per frame, and they were noise.
+
+**GPU path.** `Pop4StereoCuda.cu` ports steps 2–5 (alignment through
+winner-take-all) and produces the same disparity as the CPU matcher. It is
+built with `--fmad=false`, uses integer SGM, and puts one warp per scan line
+with no block barriers. A unit test checks GPU output against CPU, and the two
+real dumps were byte-identical. On an RTX 5060 (sm_120, CUDA 13.4) the GPU
+match takes ~2.2 ms (SGM 1.0 ms). The full decode takes ~9 ms, against ~32 ms
+CPU-only; the rest is CPU clean-up (median, speckle regions, texture).
+`ALL3DSCAN_POP4_CUDA=0` forces the CPU path. `ALL3DSCAN_POP4_DEBUG=1` prints
+per-stage GPU timings. A device error falls back to the CPU for the rest of
+the process.
+
+```sh
+cmake -S . -B build -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc   # arch defaults to native
+```
 
 Calibration is still approximate: fx comes from a 46° FOV across 320 px, and
 the **provisional baseline is 28 mm**, chosen so the measured ~35 px maps to

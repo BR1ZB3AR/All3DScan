@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "decoder/Pop4DepthDecoder.h"
+#include "decoder/Pop4StereoCuda.h"
 
 using namespace revoscan;
 
@@ -133,6 +134,39 @@ TEST_CASE("default POP4 row rectification is a mild roll, not identity") {
     REQUIRE(c[2] < 1.1);
     REQUIRE(std::fabs(c[4]) > 0.01);
 }
+
+#ifdef ALL3DSCAN_HAS_CUDA
+TEST_CASE("Pop4DepthDecoder CUDA matcher agrees with CPU") {
+    if (!decoder::cuda_stereo::available()) {
+        SKIP("No CUDA device present");
+    }
+    const auto raw = makeSyntheticSpeckleFrame(35);
+    auto run = [&](const char* cuda) {
+        setenv("ALL3DSCAN_POP4_CUDA", cuda, 1);
+        decoder::Pop4DepthDecoder decoder;
+        decoder.setCalibration(decoder::makeApproximatePop4FullFieldCalibration());
+        decoder.setRowRectification(decoder::defaultPop4RowRectification());
+        decoder.setDepthRange(200.0f, 650.0f);
+        auto metric = decoder.decode(raw);
+        REQUIRE(metric.has_value());
+        return std::make_pair(*metric, decoder.lastStats().backend);
+    };
+    const auto [cpu, cpuBackend] = run("0");
+    const auto [gpu, gpuBackend] = run("1");
+    unsetenv("ALL3DSCAN_POP4_CUDA");
+    REQUIRE(cpuBackend == "CPU");
+    REQUIRE(gpuBackend == "CUDA");
+    REQUIRE(cpu.depthMm.size() == gpu.depthMm.size());
+    size_t same = 0;
+    for (size_t i = 0; i < cpu.depthMm.size(); ++i) {
+        if (cpu.depthMm[i] == gpu.depthMm[i]) {
+            ++same;
+        }
+    }
+    // Only the double-precision texture gate may differ at its threshold.
+    REQUIRE(same > cpu.depthMm.size() * 999 / 1000);
+}
+#endif
 
 TEST_CASE("validateMetricPlane scales and accepts dense metric frames") {
     protocol::ScannerCalibration cal;

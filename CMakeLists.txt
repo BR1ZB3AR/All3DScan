@@ -94,6 +94,8 @@ if(ALL3DSCAN_CUDA_ENABLED)
     target_compile_definitions(decoder PUBLIC ALL3DSCAN_HAS_CUDA=1)
     target_link_libraries(decoder PUBLIC CUDA::cudart)
     set_source_files_properties(src/decoder/Pop4StereoCuda.cu PROPERTIES LANGUAGE CUDA)
+    # No fused multiply-add: keeps the GPU float steps bit-equal to the CPU matcher.
+    target_compile_options(decoder PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 add_library(protocol

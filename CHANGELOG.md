@@ -4,6 +4,20 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261012-2229
+
+### Added
+- **CUDA speckle decoder.** `Pop4StereoCuda.cu` is rewritten for the speckle
+  pipeline: row alignment, blur, census, cost volume, 4-path SGM (one warp
+  per scan line, shuffle exchange, no block barriers) and winner-take-all with
+  the same gates as the CPU. Output matches the CPU path exactly on real
+  frames (built with `--fmad=false`; parity unit test). On an RTX 5060 the
+  full decode takes ~9 ms, against ~32 ms CPU-only. The decoder uses CUDA
+  automatically when available and falls back to the CPU on device errors;
+  `ALL3DSCAN_POP4_CUDA=0` forces the CPU.
+- `ALL3DSCAN_POP4_DEBUG=1` prints the backend, matching time and per-stage
+  CUDA timings. `--decode-dump` reports steady-state and first-call times.
+
 ## Alpha-v20261012-2202
 
 ### Fixed

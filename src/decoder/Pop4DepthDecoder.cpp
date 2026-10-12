@@ -1,6 +1,9 @@
 #include "Pop4DepthDecoder.h"
 
+#include "Pop4StereoCuda.h"
+
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <cmath>
 #include <cstdio>
@@ -389,164 +392,25 @@ void ambientTexture(const protocol::RawFrame& raw, int firstAmbient, std::vector
     }
 }
 
-} // namespace
-
-RowRectification defaultPop4RowRectification() {
-    // Fitted 2026-10-12 on a live POP4 (405 speckle correspondences, residual
-    // 0.15 px) with tools/re_probe/pop4_rectify_fit.py. Roll ≈ −2.6° plus keystone (uv term).
-    RowRectification coeffs{{-0.00437, -0.03004, 1.01091, -0.01107, 0.13940, -0.00572}};
-    if (const char* value = std::getenv("ALL3DSCAN_POP4_RECT")) {
-        RowRectification parsed{};
-        std::stringstream ss(value);
-        std::string item;
-        size_t n = 0;
-        while (n < parsed.size() && std::getline(ss, item, ',')) {
-            char* end = nullptr;
-            parsed[n] = std::strtod(item.c_str(), &end);
-            if (end == item.c_str() || !std::isfinite(parsed[n])) {
-                break;
-            }
-            ++n;
-        }
-        if (n == parsed.size() && std::fabs(parsed[2]) > 0.5) {
-            coeffs = parsed;
-        }
-    }
-    return coeffs;
-}
-
-protocol::ScannerCalibration makeApproximatePop4FullFieldCalibration() {
-    constexpr double kPi = 3.14159265358979323846;
-    // 46° across the 320 px axis; square pixels.
-    const double fx = (static_cast<double>(kW) * 0.5) / std::tan(46.0 * kPi / 360.0);
-    const double fy = fx;
-    const double cx = kW * 0.5;
-    const double cy = kH * 0.5;
-    // Provisional: chosen so the ~35 px disparity of a surface measured at
-    // ~300 mm maps to 300 mm. Replace with a ruler-checked value (Z ∝ B).
-    double baselineMm = 28.0;
-    if (const char* value = std::getenv("ALL3DSCAN_POP4_BASELINE_MM")) {
-        char* end = nullptr;
-        const double parsed = std::strtod(value, &end);
-        if (end != value && parsed >= 5.0 && parsed <= 150.0 && std::isfinite(parsed)) {
-            baselineMm = parsed;
-        }
-    }
-
-    protocol::ScannerCalibration cal;
-    cal.valid = true;
-    cal.source = "ApproximatePop4FullField";
-    cal.depthScale = 1.0;
-    cal.baselineMm = baselineMm;
-    cal.depth = {.fx = fx, .fy = fy, .cx = cx, .cy = cy};
-    cal.depthRight = cal.depth;
-    cal.stereoTranslation = {-baselineMm / 1000.0, 0.0, 0.0};
-    cal.qMatrix = {
-        1, 0, 0, -cx,
-        0, 1, 0, -cy,
-        0, 0, 0, fx * baselineMm,
-        0, 0, 1, 0,
-    };
-    return cal;
-}
-
-Pop4DepthDecoder::Pop4DepthDecoder() {
-    setRowRectification(defaultPop4RowRectification());
-}
-
-void Pop4DepthDecoder::setCalibration(const protocol::ScannerCalibration& calibration) {
-    calibration_ = calibration;
-}
-
-void Pop4DepthDecoder::setRowRectification(const RowRectification& coeffs) {
-    if (coeffs == rect_ && !rectMapY_.empty()) {
-        return;
-    }
-    rect_ = coeffs;
-    rebuildRectificationMap();
-}
-
-void Pop4DepthDecoder::rebuildRectificationMap() {
-    // For each output pixel find the raw right-image row yR whose mapped row
-    // equals the output row (x is unchanged): Newton on yL(x, yR) = y.
-    rectMapY_.resize(kImagePixels);
-    const auto& c = rect_;
-    for (uint32_t y = 0; y < kH; ++y) {
-        for (uint32_t x = 0; x < kW; ++x) {
-            const double u = (static_cast<double>(x) - 160.0) / 160.0;
-            double yR = y;
-            for (int it = 0; it < 8; ++it) {
-                const double v = (yR - 256.0) / 256.0;
-                const double f =
-                    256.0 + 256.0 * (c[0] + c[1] * u + c[2] * v + c[3] * u * u +
-                                     c[4] * u * v + c[5] * v * v);
-                const double df = c[2] + c[4] * u + 2.0 * c[5] * v;
-                if (std::fabs(df) < 1e-6) {
-                    break;
-                }
-                yR -= (f - static_cast<double>(y)) / df;
-            }
-            rectMapY_[static_cast<size_t>(y) * kW + x] = static_cast<float>(yR);
-        }
-    }
-}
-
-void Pop4DepthDecoder::setDepthRange(float minMm, float maxMm) {
-    if (!std::isfinite(minMm) || !std::isfinite(maxMm)) {
-        return;
-    }
-    const float clampedMin = std::clamp(minMm, 50.0f, 2000.0f);
-    const float clampedMax = std::clamp(maxMm, 50.0f, 2000.0f);
-    if (clampedMax <= clampedMin) {
-        return;
-    }
-    depthMinMm_ = clampedMin;
-    depthMaxMm_ = clampedMax;
-}
-
-std::string Pop4DepthDecoder::backendName() {
-    return "CPU";
-}
-
-std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFrame& rawY16) {
-    lastError_.clear();
-    if (rawY16.encoding != protocol::DepthEncoding::VendorRawY16) {
-        lastError_ = "POP4 decoder expects VendorRawY16 input";
-        return std::nullopt;
-    }
-    if (!calibration_.hasStereoCalibration()) {
-        lastError_ = "POP4 metric decode blocked: stereo calibration not loaded";
-        return std::nullopt;
-    }
-    if (rawY16.width != kPackedWidth || rawY16.height != kPackedHeight) {
-        lastError_ = "POP4 decode expects 640x2560 VendorRawY16 (ten 320x512 images)";
-        return std::nullopt;
-    }
-    if (rawY16.depthMm.size() < kImagePixels * 10) {
-        lastError_ = "POP4 packed frame truncated";
-        return std::nullopt;
-    }
-
-    const MatchTuning t = readMatchTuning();
-    const bool swap = swapCameras();
-    const int leftIdx = swap ? kRightSpeckle : kLeftSpeckle;
-    const int rightIdx = swap ? kLeftSpeckle : kRightSpeckle;
-    const int leftAmbient = swap ? kRightAmbientFirst : kLeftAmbientFirst;
-
-    int dispMin = kFallbackDispMin;
-    int dispMax = kFallbackDispMax;
-    computeDispRange(calibration_, depthMinMm_, depthMaxMm_, dispMin, dispMax);
-    const int numDisp = dispMax - dispMin + 1;
-
+// Steps 1-4 on the CPU: row-align, census, 4-path SGM, winner-take-all with
+// uniqueness / sub-pixel / left-right / texture gates. Returns raw disparity
+// (<0 = invalid) before median and speckle clean-up. Pop4StereoCuda.cu mirrors
+// this exactly so both backends feed the same post-processing.
+std::vector<float> matchCpu(const uint16_t* leftRaw,
+                            const uint16_t* rightRaw,
+                            const std::vector<float>& rectMapY,
+                            const MatchTuning& t,
+                            int dispMin,
+                            int numDisp) {
     // 1. Left speckle, and right speckle resampled onto left rows.
     std::vector<float> rawL;
     std::vector<float> rawR;
-    toFloat(imageAt(rawY16, leftIdx), rawL);
-    toFloat(imageAt(rawY16, rightIdx), rawR);
+    toFloat(leftRaw, rawL);
+    toFloat(rightRaw, rawR);
     std::vector<float> rectR(kImagePixels, 0.0f);
     for (uint32_t y = 0; y < kH; ++y) {
         for (uint32_t x = 0; x < kW; ++x) {
-            const float sy = rectMapY_[static_cast<size_t>(y) * kW + x];
+            const float sy = rectMapY[static_cast<size_t>(y) * kW + x];
             if (sy < 0.0f || sy > static_cast<float>(kH - 1)) {
                 continue;
             }
@@ -683,6 +547,187 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
             disp[p] = d;
         }
     }
+    return disp;
+}
+
+} // namespace
+
+RowRectification defaultPop4RowRectification() {
+    // Fitted 2026-10-12 on a live POP4 (405 speckle correspondences, residual
+    // 0.15 px) with tools/re_probe/pop4_rectify_fit.py. Roll ≈ −2.6° plus keystone (uv term).
+    RowRectification coeffs{{-0.00437, -0.03004, 1.01091, -0.01107, 0.13940, -0.00572}};
+    if (const char* value = std::getenv("ALL3DSCAN_POP4_RECT")) {
+        RowRectification parsed{};
+        std::stringstream ss(value);
+        std::string item;
+        size_t n = 0;
+        while (n < parsed.size() && std::getline(ss, item, ',')) {
+            char* end = nullptr;
+            parsed[n] = std::strtod(item.c_str(), &end);
+            if (end == item.c_str() || !std::isfinite(parsed[n])) {
+                break;
+            }
+            ++n;
+        }
+        if (n == parsed.size() && std::fabs(parsed[2]) > 0.5) {
+            coeffs = parsed;
+        }
+    }
+    return coeffs;
+}
+
+protocol::ScannerCalibration makeApproximatePop4FullFieldCalibration() {
+    constexpr double kPi = 3.14159265358979323846;
+    // 46° across the 320 px axis; square pixels.
+    const double fx = (static_cast<double>(kW) * 0.5) / std::tan(46.0 * kPi / 360.0);
+    const double fy = fx;
+    const double cx = kW * 0.5;
+    const double cy = kH * 0.5;
+    // Provisional: chosen so the ~35 px disparity of a surface measured at
+    // ~300 mm maps to 300 mm. Replace with a ruler-checked value (Z ∝ B).
+    double baselineMm = 28.0;
+    if (const char* value = std::getenv("ALL3DSCAN_POP4_BASELINE_MM")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(value, &end);
+        if (end != value && parsed >= 5.0 && parsed <= 150.0 && std::isfinite(parsed)) {
+            baselineMm = parsed;
+        }
+    }
+
+    protocol::ScannerCalibration cal;
+    cal.valid = true;
+    cal.source = "ApproximatePop4FullField";
+    cal.depthScale = 1.0;
+    cal.baselineMm = baselineMm;
+    cal.depth = {.fx = fx, .fy = fy, .cx = cx, .cy = cy};
+    cal.depthRight = cal.depth;
+    cal.stereoTranslation = {-baselineMm / 1000.0, 0.0, 0.0};
+    cal.qMatrix = {
+        1, 0, 0, -cx,
+        0, 1, 0, -cy,
+        0, 0, 0, fx * baselineMm,
+        0, 0, 1, 0,
+    };
+    return cal;
+}
+
+Pop4DepthDecoder::Pop4DepthDecoder() {
+    setRowRectification(defaultPop4RowRectification());
+}
+
+void Pop4DepthDecoder::setCalibration(const protocol::ScannerCalibration& calibration) {
+    calibration_ = calibration;
+}
+
+void Pop4DepthDecoder::setRowRectification(const RowRectification& coeffs) {
+    if (coeffs == rect_ && !rectMapY_.empty()) {
+        return;
+    }
+    rect_ = coeffs;
+    rebuildRectificationMap();
+}
+
+void Pop4DepthDecoder::rebuildRectificationMap() {
+    // For each output pixel find the raw right-image row yR whose mapped row
+    // equals the output row (x is unchanged): Newton on yL(x, yR) = y.
+    rectMapY_.resize(kImagePixels);
+    const auto& c = rect_;
+    for (uint32_t y = 0; y < kH; ++y) {
+        for (uint32_t x = 0; x < kW; ++x) {
+            const double u = (static_cast<double>(x) - 160.0) / 160.0;
+            double yR = y;
+            for (int it = 0; it < 8; ++it) {
+                const double v = (yR - 256.0) / 256.0;
+                const double f =
+                    256.0 + 256.0 * (c[0] + c[1] * u + c[2] * v + c[3] * u * u +
+                                     c[4] * u * v + c[5] * v * v);
+                const double df = c[2] + c[4] * u + 2.0 * c[5] * v;
+                if (std::fabs(df) < 1e-6) {
+                    break;
+                }
+                yR -= (f - static_cast<double>(y)) / df;
+            }
+            rectMapY_[static_cast<size_t>(y) * kW + x] = static_cast<float>(yR);
+        }
+    }
+}
+
+void Pop4DepthDecoder::setDepthRange(float minMm, float maxMm) {
+    if (!std::isfinite(minMm) || !std::isfinite(maxMm)) {
+        return;
+    }
+    const float clampedMin = std::clamp(minMm, 50.0f, 2000.0f);
+    const float clampedMax = std::clamp(maxMm, 50.0f, 2000.0f);
+    if (clampedMax <= clampedMin) {
+        return;
+    }
+    depthMinMm_ = clampedMin;
+    depthMaxMm_ = clampedMax;
+}
+
+std::string Pop4DepthDecoder::backendName() {
+    return cuda_stereo::isBuilt() && cuda_stereo::available() ? "CUDA" : "CPU";
+}
+
+std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFrame& rawY16) {
+    lastError_.clear();
+    if (rawY16.encoding != protocol::DepthEncoding::VendorRawY16) {
+        lastError_ = "POP4 decoder expects VendorRawY16 input";
+        return std::nullopt;
+    }
+    if (!calibration_.hasStereoCalibration()) {
+        lastError_ = "POP4 metric decode blocked: stereo calibration not loaded";
+        return std::nullopt;
+    }
+    if (rawY16.width != kPackedWidth || rawY16.height != kPackedHeight) {
+        lastError_ = "POP4 decode expects 640x2560 VendorRawY16 (ten 320x512 images)";
+        return std::nullopt;
+    }
+    if (rawY16.depthMm.size() < kImagePixels * 10) {
+        lastError_ = "POP4 packed frame truncated";
+        return std::nullopt;
+    }
+
+    const MatchTuning t = readMatchTuning();
+    const bool swap = swapCameras();
+    const int leftIdx = swap ? kRightSpeckle : kLeftSpeckle;
+    const int rightIdx = swap ? kLeftSpeckle : kRightSpeckle;
+    const int leftAmbient = swap ? kRightAmbientFirst : kLeftAmbientFirst;
+
+    int dispMin = kFallbackDispMin;
+    int dispMax = kFallbackDispMax;
+    computeDispRange(calibration_, depthMinMm_, depthMaxMm_, dispMin, dispMax);
+    const int numDisp = dispMax - dispMin + 1;
+
+    // 1-4. Matching: GPU when built and available, otherwise CPU.
+    const auto matchStart = std::chrono::steady_clock::now();
+    std::vector<float> disp;
+    std::string backend = "CPU";
+    if (cuda_stereo::isBuilt() && cuda_stereo::available()) {
+        cuda_stereo::SgmParams params;
+        params.dispMin = dispMin;
+        params.numDisp = numDisp;
+        params.p1 = t.p1;
+        params.p2 = t.p2;
+        params.uniqueness = t.uniqueness;
+        params.lrMaxDiff = t.lrMaxDiff;
+        params.textureMin = t.textureMin;
+        std::string cudaError;
+        if (cuda_stereo::computeDisparity(imageAt(rawY16, leftIdx), imageAt(rawY16, rightIdx),
+                                          rectMapY_.data(), params, disp, &cudaError)) {
+            backend = "CUDA";
+        } else if (t.debug) {
+            std::fprintf(stderr, "[POP4] %s; using CPU\n", cudaError.c_str());
+        }
+    }
+    if (backend != "CUDA") {
+        disp = matchCpu(imageAt(rawY16, leftIdx), imageAt(rawY16, rightIdx), rectMapY_, t,
+                        dispMin, numDisp);
+    }
+
+    const double matchMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - matchStart)
+                               .count();
 
     // 5. Clean-up.
     if (t.doMedian) {
@@ -728,10 +773,10 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     lastStats_.validDepth = validDepth;
     lastStats_.totalPixels = static_cast<uint32_t>(kImagePixels);
     lastStats_.dispStdPx = dispStd;
-    lastStats_.backend = "CPU";
+    lastStats_.backend = backend;
     lastStats_.attempted = true;
     if (t.debug) {
-        std::fprintf(stderr, "[POP4] band d=[%d,%d] valid=%.1f%% (%u) dispStd=%.2f\n", dispMin,
+        std::fprintf(stderr, "[POP4] %s match %.1f ms band d=[%d,%d] valid=%.1f%% (%u) dispStd=%.2f\n", backend.c_str(), matchMs, dispMin,
                      dispMax, 100.0 * validDepth / static_cast<double>(kImagePixels), validDepth,
                      static_cast<double>(dispStd));
     }

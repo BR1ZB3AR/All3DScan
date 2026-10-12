@@ -109,9 +109,18 @@ int decodeDump(const char* path, const char* pgmOut) {
     revoscan::decoder::Pop4DepthDecoder decoder;
     decoder.setCalibration(revoscan::decoder::makeApproximatePop4FullFieldCalibration());
     decoder.setDepthRange(150.0f, 650.0f);
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto metric = decoder.decode(raw);
-    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // Decode several times: the first call pays one-off costs (CUDA context,
+    // allocations); report the best steady-state time.
+    std::optional<revoscan::protocol::RawFrame> metric;
+    double ms = 0.0;
+    double firstMs = 0.0;
+    for (int run = 0; run < 5; ++run) {
+        const auto t0 = std::chrono::steady_clock::now();
+        metric = decoder.decode(raw);
+        const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        firstMs = run == 0 ? t : firstMs;
+        ms = run == 0 ? t : std::min(ms, t);
+    }
     const auto& stats = decoder.lastStats();
     std::vector<float> valid;
     for (float d : decoder.lastDisparity()) {
@@ -120,7 +129,8 @@ int decodeDump(const char* path, const char* pgmOut) {
         }
     }
     std::sort(valid.begin(), valid.end());
-    std::cout << "decode " << (metric ? "ok" : "failed") << " in " << ms << " ms: valid="
+    std::cout << "decode " << (metric ? "ok" : "failed") << " [" << stats.backend << "] in " << ms
+              << " ms (first call " << firstMs << " ms): valid="
               << 100.0 * stats.validFraction() << "% (" << stats.validDepth << ")";
     if (!valid.empty()) {
         std::cout << " disparity p10/p50/p90=" << valid[valid.size() / 10] << '/'
@@ -153,7 +163,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261012-2202");
+    QApplication::setApplicationVersion("Alpha-v20261012-2229");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // No window / taskbar logo — plain Qt default decoration.
