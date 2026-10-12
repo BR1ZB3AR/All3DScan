@@ -38,7 +38,10 @@ constexpr int kDispSearchPad = 6;
 constexpr int kDispSearchFloor = 1;
 constexpr int kDispSearchCeil = 160;
 
-constexpr int kCensusRadius = 3;          // 7×7 window → 48 bits
+// 7×7 window → 48 bits. 9×7 (62 bits) was tried: rougher planes (0.297 →
+// 0.315 px RMS) and lower coverage on real frames at the same P1/P2.
+constexpr int kCensusRadiusX = 3;
+constexpr int kCensusRadiusY = 3;
 constexpr uint8_t kCensusInvalidCost = 48; // no right pixel at this disparity
 
 bool envFlag(const char* name, bool defaultValue) {
@@ -77,6 +80,7 @@ struct MatchTuning {
     int speckleMinRegion = 80;  // drop connected disparity blobs smaller than this
     float speckleMaxDiff = 1.0f;
     bool doMedian = true;
+    bool equiangular = false;   // sub-pixel fit: equiangular (V) vs parabola
     int edgeRadius = 2;         // flying-pixel filter window (0 disables)
     float edgeMaxJump = 1.5f;   // disparity jump (px) that marks a depth edge
     bool debug = false;
@@ -94,6 +98,7 @@ MatchTuning readMatchTuning() {
         "ALL3DSCAN_POP4_SPECKLE_REGION", static_cast<float>(t.speckleMinRegion), 0, 5000));
     t.speckleMaxDiff = envFloat("ALL3DSCAN_POP4_SPECKLE_DIFF", t.speckleMaxDiff, 0.1f, 16.0f);
     t.doMedian = envFlag("ALL3DSCAN_POP4_MEDIAN", t.doMedian);
+    t.equiangular = envFlag("ALL3DSCAN_POP4_SUBPIX_EQUI", t.equiangular);
     t.edgeRadius = static_cast<int>(
         envFloat("ALL3DSCAN_POP4_EDGE_RADIUS", static_cast<float>(t.edgeRadius), 0, 8));
     t.edgeMaxJump = envFloat("ALL3DSCAN_POP4_EDGE_JUMP", t.edgeMaxJump, 0.2f, 20.0f);
@@ -153,10 +158,10 @@ void censusTransform(const std::vector<float>& img, std::vector<uint64_t>& out) 
         for (int x = 0; x < static_cast<int>(kW); ++x) {
             const float c = img[static_cast<size_t>(y) * kW + x];
             uint64_t bits = 0;
-            for (int dy = -kCensusRadius; dy <= kCensusRadius; ++dy) {
+            for (int dy = -kCensusRadiusY; dy <= kCensusRadiusY; ++dy) {
                 const int yy = std::clamp(y + dy, 0, static_cast<int>(kH) - 1);
                 const float* row = img.data() + static_cast<size_t>(yy) * kW;
-                for (int dx = -kCensusRadius; dx <= kCensusRadius; ++dx) {
+                for (int dx = -kCensusRadiusX; dx <= kCensusRadiusX; ++dx) {
                     if (dx == 0 && dy == 0) {
                         continue;
                     }
@@ -202,6 +207,18 @@ void localStd(const std::vector<float>& img, int r, std::vector<float>& out) {
             out[static_cast<size_t>(y) * kW + x] = static_cast<float>(std::sqrt(var));
         }
     }
+}
+
+// Sub-pixel offset of the cost minimum from its two neighbours. Census
+// (Hamming) costs are V-shaped, so the equiangular fit avoids the "pixel
+// locking" a parabola shows on L1-like costs; the parabola stays available.
+float subpixelOffset(float cp, float cb, float cn, bool equiangular) {
+    if (equiangular) {
+        const float rise = std::max(cp, cn) - cb;
+        return rise > 1e-6f ? std::clamp(0.5f * (cp - cn) / rise, -0.5f, 0.5f) : 0.0f;
+    }
+    const float den = cp - 2.0f * cb + cn;
+    return den > 1e-6f ? std::clamp(0.5f * (cp - cn) / den, -0.5f, 0.5f) : 0.0f;
 }
 
 // One SGM scan direction, accumulated into `sum`. `start` is the first pixel
@@ -577,10 +594,7 @@ std::vector<float> matchCpu(const uint16_t* leftRaw,
                 const float cp = s[bestD - 1];
                 const float cb = s[bestD];
                 const float cn = s[bestD + 1];
-                const float den = cp - 2.0f * cb + cn;
-                if (den > 1e-6f) {
-                    d += std::clamp(0.5f * (cp - cn) / den, -0.5f, 0.5f);
-                }
+                d += subpixelOffset(cp, cb, cn, t.equiangular);
             } else {
                 continue; // winner at the band edge: object is outside the preset
             }

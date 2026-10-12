@@ -12,6 +12,7 @@ add_executable(unit_tests
     test_zxcmd.cpp
     test_registration.cpp
     test_depth_mesh.cpp
+    test_tsdf.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     Catch2::Catch2WithMain

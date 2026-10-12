@@ -120,9 +120,14 @@ add_library(document
     src/geometry/TriangleMesh.h
     src/geometry/DepthMesh.h
     src/geometry/DepthMesh.cpp
+    src/geometry/TsdfVolume.h
+    src/geometry/TsdfVolume.cpp
 )
 target_include_directories(document PUBLIC src)
 target_link_libraries(document PUBLIC pointcloud)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(document PRIVATE OpenMP::OpenMP_CXX) # TSDF integration
+endif()
 
 add_library(io
     src/io/PointCloudExport.h

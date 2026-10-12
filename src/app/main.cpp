@@ -17,6 +17,7 @@
 #include "bridge/RustBridge.h"
 #include "decoder/Pop4DepthDecoder.h"
 #include "document/ScanDocument.h"
+#include "io/GeometryExport.h"
 #include "io/PointCloudExport.h"
 #include "pointcloud/PointCloud.h"
 #include "processing/Registration.h"
@@ -146,7 +147,14 @@ int decodeDump(const char* path, const char* pgmOut) {
                   << valid[valid.size() / 2] << '/' << valid[valid.size() * 9 / 10];
     }
     std::cout << (metric ? "" : " — " + decoder.lastError()) << '\n';
-    if (pgmOut) {
+    if (pgmOut && std::string_view(pgmOut).size() > 4 &&
+        std::string_view(pgmOut).substr(std::string_view(pgmOut).size() - 4) == ".f32") {
+        // Raw float32 disparity (320×512, <0 = invalid) for sub-pixel analysis.
+        std::ofstream f32(pgmOut, std::ios::binary);
+        const auto& disp = decoder.lastDisparity();
+        f32.write(reinterpret_cast<const char*>(disp.data()),
+                  static_cast<std::streamsize>(disp.size() * sizeof(float)));
+    } else if (pgmOut) {
         std::ofstream pgm(pgmOut, std::ios::binary);
         pgm << "P5\n320 512\n255\n";
         for (float d : decoder.lastDisparity()) {
@@ -244,7 +252,6 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
                   << " fit=" << fitness << " pts=" << cloud.points.size()
                   << " model=" << modelPoints << '\n';
     }
-    pipeline.stop();
     std::cout << "summary: frames=" << files.size() << " tracked=" << tracked
               << " lost=" << lost << " model=" << document.cloud().points.size();
     if (std::getenv("ALL3DSCAN_REPLAY_ORBIT_DEG")) {
@@ -263,6 +270,21 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
     if (plyOut && !revoscan::io::writePly(plyOut, document.cloud())) {
         std::cerr << "failed to write " << plyOut << '\n';
     }
+    // Same as pressing Complete: volumetric mesh from the tracked keyframes.
+    if (const char* meshOut = std::getenv("ALL3DSCAN_REPLAY_MESH")) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string error;
+        const bool ok = pipeline.completeAndMesh("", "python3", &error);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const auto& mesh = document.mesh();
+        std::cout << "complete: " << (ok ? "ok" : "failed") << " in " << s << " s, "
+                  << mesh.vertices.size() << " vertices, " << mesh.triangleCount()
+                  << " triangles" << (error.empty() ? "" : " (" + error + ")") << '\n';
+        if (ok && !revoscan::io::writePlyMesh(meshOut, mesh).ok) {
+            std::cerr << "failed to write " << meshOut << '\n';
+        }
+    }
+    pipeline.stop(); // after Complete: stopping drops the worker's keyframes
     return 0;
 }
 

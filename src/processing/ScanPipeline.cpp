@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "bridge/PythonWorker.h"
+#include "geometry/TsdfVolume.h"
 #include "geometry/DepthMesh.h"
 #include "io/GeometryExport.h"
 #include "processing/Registration.h"
@@ -127,7 +128,11 @@ pointcloud::PointCloud removeGroundPlaneRansac(const pointcloud::PointCloud& in,
 }
 
 // TSDF keyframe policy: keep the model bounded but multi-view.
-constexpr size_t kMaxKeyframes = 160;
+// When full, every other keyframe is dropped so the whole scan stays covered
+// (the old cap simply stopped, so sides scanned later never reached the mesh).
+constexpr size_t kMaxKeyframes = 300;
+// Also keep every Nth tracked frame while stationary, so TSDF averages noise.
+constexpr int kKeyframeEveryNFrames = 5;
 constexpr double kKeyframeMinTransM = 0.008; // 8 mm of motion
 constexpr double kKeyframeMinRotRad = 0.05;  // ~2.9 degrees
 constexpr size_t kMinTsdfKeyframes = 4;
@@ -252,6 +257,7 @@ public:
         QMutexLocker lock(&kfMutex_);
         keyframes_.clear();
         hasLastKfPose_ = false;
+        framesSinceKf_ = 0;
     }
 
     bool hasLiveMeshSnapshot() {
@@ -398,16 +404,24 @@ private:
             return;
         }
         QMutexLocker lock(&kfMutex_);
+        ++framesSinceKf_;
         if (hasLastKfPose_ && keyframes_.size() >= 1) {
             const RigidTransform delta = pose * invert(lastKfPose_);
             if (delta.translationNorm() < kKeyframeMinTransM &&
-                delta.rotationAngle() < kKeyframeMinRotRad) {
+                delta.rotationAngle() < kKeyframeMinRotRad &&
+                framesSinceKf_ < kKeyframeEveryNFrames) {
                 return; // too close to the previous keyframe
             }
         }
         if (keyframes_.size() >= kMaxKeyframes) {
-            return; // bounded; first sweep is representative enough
+            std::vector<DepthKeyframe> thinned;
+            thinned.reserve(kMaxKeyframes / 2 + 1);
+            for (size_t i = 0; i < keyframes_.size(); i += 2) {
+                thinned.push_back(std::move(keyframes_[i]));
+            }
+            keyframes_.swap(thinned);
         }
+        framesSinceKf_ = 0;
         DepthKeyframe kf;
         kf.depthMm = item.depthMm;
         if (item.rgb.size() ==
@@ -594,6 +608,7 @@ private:
     std::vector<DepthKeyframe> keyframes_;
     RigidTransform lastKfPose_;
     bool hasLastKfPose_ = false;
+    int framesSinceKf_ = 0;
 
     QMutex liveMeshMutex_;
     geometry::TriangleMesh liveMesh_;
@@ -740,6 +755,32 @@ bool ScanPipeline::completeAndMesh(const std::string& workerScript,
     std::vector<DepthKeyframe> keyframes;
     if (worker_) {
         keyframes = worker_->snapshotKeyframes();
+    }
+    // Native C++ TSDF first: no Python/Open3D needed (Open3D has no build for
+    // newer Pythons such as 3.14).
+    if (!keyframes.empty()) {
+        std::vector<geometry::TsdfFrame> frames;
+        frames.reserve(keyframes.size());
+        for (const auto& kf : keyframes) {
+            geometry::TsdfFrame f;
+            f.depthMm = &kf.depthMm;
+            f.rgb = &kf.rgb;
+            f.width = kf.width;
+            f.height = kf.height;
+            f.intrinsics = kf.intrinsics;
+            f.cameraToWorld = kf.pose;
+            frames.push_back(f);
+        }
+        geometry::TsdfParams params;
+        params.voxelM = std::max(0.001f, modelVoxelM_.load());
+        params.minDepthM = depthClipNearM_.load();
+        params.maxDepthM = depthClipFarM_.load();
+        geometry::TriangleMesh mesh =
+            geometry::reconstructTsdf(frames, document_->cloud(), 0.01f, params);
+        if (!mesh.empty()) {
+            document_->setMesh(std::move(mesh), true, "tsdf");
+            return true;
+        }
     }
     if (keyframes.size() >= kMinTsdfKeyframes) {
         std::string tsdfError;
