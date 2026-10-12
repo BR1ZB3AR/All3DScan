@@ -398,11 +398,20 @@ PointCloud isolateForegroundObject(const PointCloud& in,
 
     // 4) Pick the *nearest* qualifying cluster (small objects beat big sheets).
     //    Secondary: prefer clusters near the optical axis (center of FOV).
+    //    A cluster must also hold a minimum share of the largest one, so
+    //    stray edge fragments a few mm nearer can't beat the real object.
+    size_t largest = 0;
+    for (const auto& c : comps) {
+        largest = std::max(largest, c.count);
+    }
+    const size_t minCount = std::max<size_t>(
+        params.minClusterPoints,
+        static_cast<size_t>(params.minClusterShareOfLargest * static_cast<float>(largest)));
     int best = -1;
     double bestScore = 1e30;
     for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
         const auto& c = comps[static_cast<size_t>(i)];
-        if (c.count < params.minClusterPoints) {
+        if (c.count < minCount) {
             continue;
         }
         const double inv = 1.0 / static_cast<double>(c.count);

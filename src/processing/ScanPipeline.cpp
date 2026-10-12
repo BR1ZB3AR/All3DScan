@@ -5,10 +5,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -41,55 +44,86 @@ constexpr auto kUiUpdateMinInterval = std::chrono::milliseconds(66); // ~15 Hz v
 constexpr float kLiveMeshVoxelM = 0.003f;
 constexpr size_t kLiveMeshMaxVerts = 60000;
 
-pointcloud::PointCloud removeGroundPlaneRansac(const pointcloud::PointCloud& in, float distanceThresholdM = 0.012f) {
-    if (in.points.size() < 100) return in;
+// Removes the support surface (desk/turntable) under the object. A plane only
+// counts as ground if (1) it is roughly horizontal in camera space (|ny| large;
+// image rows run top→bottom, so the desk normal is mostly along y) and (2)
+// nearly every off-plane point lies on the camera's side of it — things rest
+// *on* the desk. The object's own faces fail (2): a carton's top has its sides
+// below it, its front has the background behind it. The previous version
+// accepted any plane facing the camera and deleted object faces outright.
+pointcloud::PointCloud removeGroundPlaneRansac(const pointcloud::PointCloud& in,
+                                               float distanceThresholdM = 0.006f) {
+    const size_t n = in.points.size();
+    if (n < 100) {
+        return in;
+    }
+    std::mt19937 rng(0x5eed);
+    std::uniform_int_distribution<size_t> pick(0, n - 1);
 
     size_t bestInliers = 0;
     float bestA = 0, bestB = 0, bestC = 0, bestD = 0;
-    const size_t n = in.points.size();
-
-    for (int iter = 0; iter < 80; ++iter) {
-        const auto& p1 = in.points[rand() % n];
-        const auto& p2 = in.points[rand() % n];
-        const auto& p3 = in.points[rand() % n];
-
+    for (int iter = 0; iter < 120; ++iter) {
+        const auto& p1 = in.points[pick(rng)];
+        const auto& p2 = in.points[pick(rng)];
+        const auto& p3 = in.points[pick(rng)];
         const float v1x = p2.x - p1.x, v1y = p2.y - p1.y, v1z = p2.z - p1.z;
         const float v2x = p3.x - p1.x, v2y = p3.y - p1.y, v2z = p3.z - p1.z;
         float a = v1y * v2z - v1z * v2y;
         float b = v1z * v2x - v1x * v2z;
         float c = v1x * v2y - v1y * v2x;
         const float norm = std::sqrt(a * a + b * b + c * c);
-        if (norm < 1e-6f) continue;
-        a /= norm; b /= norm; c /= norm;
+        if (norm < 1e-9f) {
+            continue;
+        }
+        a /= norm;
+        b /= norm;
+        c /= norm;
+        if (std::abs(b) < 0.5f) {
+            continue; // not horizontal enough to be the support surface
+        }
         const float d = -(a * p1.x + b * p1.y + c * p1.z);
 
-        if (std::abs(c) < 0.40f && std::abs(b) < 0.40f) continue;
-
         size_t inliers = 0;
+        size_t cameraSide = 0;
+        size_t farSide = 0;
         for (size_t i = 0; i < n; i += 4) {
-            const float dist = std::abs(a * in.points[i].x + b * in.points[i].y + c * in.points[i].z + d);
-            if (dist < distanceThresholdM) {
+            const auto& q = in.points[i];
+            const float dist = a * q.x + b * q.y + c * q.z + d;
+            if (std::abs(dist) < distanceThresholdM) {
                 ++inliers;
+            } else if ((dist > 0.0f) == (d > 0.0f)) {
+                ++cameraSide; // camera origin evaluates to d
+            } else {
+                ++farSide;
             }
+        }
+        const size_t off = cameraSide + farSide;
+        if (off > 0 && farSide * 10 > off) {
+            continue; // >10% of the scene beyond it: not what things rest on
         }
         if (inliers > bestInliers) {
             bestInliers = inliers;
-            bestA = a; bestB = b; bestC = c; bestD = d;
+            bestA = a;
+            bestB = b;
+            bestC = c;
+            bestD = d;
         }
     }
 
-    if (bestInliers > n / 6) {
-        pointcloud::PointCloud out;
-        out.points.reserve(n);
-        for (const auto& p : in.points) {
-            const float dist = std::abs(bestA * p.x + bestB * p.y + bestC * p.z + bestD);
-            if (dist >= distanceThresholdM) {
-                out.points.push_back(p);
-            }
-        }
-        return out;
+    if (bestInliers * 4 < n / 10) {
+        return in; // no meaningful support plane in view
     }
-    return in;
+    pointcloud::PointCloud out;
+    out.points.reserve(n);
+    for (const auto& p : in.points) {
+        const float dist = bestA * p.x + bestB * p.y + bestC * p.z + bestD;
+        // Drop the plane and anything just beneath it (camera-side keeps).
+        const bool cameraSide = (dist > 0.0f) == (bestD > 0.0f);
+        if (cameraSide && std::abs(dist) >= distanceThresholdM) {
+            out.points.push_back(p);
+        }
+    }
+    return out.points.size() >= 100 ? out : in;
 }
 
 // TSDF keyframe policy: keep the model bounded but multi-view.
@@ -252,8 +286,11 @@ public slots:
                 queue_.pop_front();
             }
             processFrame(std::move(item));
+            processed_.fetch_add(1, std::memory_order_release);
         }
     }
+
+    uint64_t processedCount() const { return processed_.load(std::memory_order_acquire); }
 
 signals:
     void updated();
@@ -386,6 +423,24 @@ private:
         hasLastKfPose_ = true;
     }
 
+    // Point-to-plane by default (locks onto flat faces); ALL3DSCAN_ICP=point
+    // restores the original point-to-point solver.
+    IcpResult icp(const pointcloud::PointCloud& src, const pointcloud::PointCloud& model,
+                  const RigidTransform& init, const IcpOptions& base) const {
+        if (usePointToPoint()) {
+            return icpPointToPoint(src, model, init, base);
+        }
+        PlaneIcpOptions opts;
+        static_cast<IcpOptions&>(opts) = base;
+        opts.normalRadiusM = std::max(0.004f, 3.0f * icpModelVoxelM());
+        return icpPointToPlane(src, model, init, opts);
+    }
+
+    static bool usePointToPoint() {
+        const char* v = std::getenv("ALL3DSCAN_ICP");
+        return v && (v[0] == 'p' || v[0] == 'P') && std::string_view(v) != "plane";
+    }
+
     IcpResult alignFrame(const pointcloud::PointCloud& src) {
         // ICP against a coarse model copy — full fused cloud can be 100k+ pts.
         const pointcloud::PointCloud model =
@@ -394,7 +449,7 @@ private:
         IcpOptions tight;
         tight.maxCorrespondenceDistM = kMaxCorrDistM;
         tight.maxIterations = lastFitness_ >= kGoodFitness ? 12 : 20;
-        IcpResult best = icpPointToPoint(src, model, lastPose_, tight);
+        IcpResult best = icp(src, model, lastPose_, tight);
 
         // Widen / relocalize only when tracking is weak (skip the expensive
         // recovery passes while we are locked on).
@@ -402,7 +457,7 @@ private:
             IcpOptions wide = tight;
             wide.maxCorrespondenceDistM = kWideCorrDistM;
             wide.maxIterations = 25;
-            const IcpResult r2 = icpPointToPoint(src, model, lastPose_, wide);
+            const IcpResult r2 = icp(src, model, lastPose_, wide);
             if (r2.fitness > best.fitness ||
                 (r2.fitness >= best.fitness && r2.rmseM < best.rmseM)) {
                 best = r2;
@@ -413,8 +468,7 @@ private:
             IcpOptions wide;
             wide.maxCorrespondenceDistM = kWideCorrDistM;
             wide.maxIterations = 30;
-            const IcpResult r3 =
-                icpPointToPoint(src, model, RigidTransform::identity(), wide);
+            const IcpResult r3 = icp(src, model, RigidTransform::identity(), wide);
             if (r3.fitness > best.fitness) {
                 best = r3;
             }
@@ -448,7 +502,7 @@ private:
         }
 
         const IcpResult r = alignFrame(src);
-        if (r.fitness < kMinFitness || r.rmseM > kMaxRmseM) {
+        if (r.fitness < acceptFitness() || r.rmseM > acceptRmseM()) {
             ++lostStreak_;
             emit trackingState(static_cast<int>(TrackingState::Lost));
             emitLiveStats(r.fitness);
@@ -483,6 +537,28 @@ private:
         (void)kMaxLostBeforeIdle;
     }
 
+    // Gate for fusing a tracked frame. A poor alignment fused into the model
+    // corrupts every later alignment, so be strict; overridable for tuning.
+    static double acceptFitness() {
+        static const double v = envDouble("ALL3DSCAN_TRACK_MIN_FITNESS", kMinFitness, 0.0, 1.0);
+        return v;
+    }
+    static double acceptRmseM() {
+        static const double v =
+            envDouble("ALL3DSCAN_TRACK_MAX_RMSE_MM", kMaxRmseM * 1000.0, 0.1, 100.0) / 1000.0;
+        return v;
+    }
+    static double envDouble(const char* name, double def, double lo, double hi) {
+        if (const char* s = std::getenv(name)) {
+            char* end = nullptr;
+            const double v = std::strtod(s, &end);
+            if (end != s && v >= lo && v <= hi) {
+                return v;
+            }
+        }
+        return def;
+    }
+
     static RigidTransform invert(const RigidTransform& t) {
         // Rigid inverse: R^T and -R^T * translation.
         RigidTransform out;
@@ -507,6 +583,7 @@ private:
     QMutex mutex_;
     QWaitCondition wait_;
     std::deque<Item> queue_;
+    std::atomic<uint64_t> processed_{0};
     bool stopping_ = false;
     RigidTransform lastPose_;
     bool hasPose_ = false;
@@ -575,6 +652,10 @@ geometry::TriangleMesh ScanPipeline::liveMesh() const {
         return {};
     }
     return worker_->snapshotLiveMesh();
+}
+
+uint64_t ScanPipeline::framesProcessed() const {
+    return worker_ ? worker_->processedCount() : 0;
 }
 
 bool ScanPipeline::hasLiveMesh() const {

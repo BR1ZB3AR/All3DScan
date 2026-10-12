@@ -80,6 +80,8 @@ public:
     // Empty when fusion is off or no depth frames have been integrated yet.
     geometry::TriangleMesh liveMesh() const;
     bool hasLiveMesh() const;
+    // Frames the worker has finished (for offline replay pacing).
+    uint64_t framesProcessed() const;
 
     // Finalize: TSDF reconstruction from retained keyframes when available,
     // otherwise an Open3D Poisson mesh of the fused cloud.

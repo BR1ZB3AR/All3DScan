@@ -77,6 +77,8 @@ struct MatchTuning {
     int speckleMinRegion = 80;  // drop connected disparity blobs smaller than this
     float speckleMaxDiff = 1.0f;
     bool doMedian = true;
+    int edgeRadius = 2;         // flying-pixel filter window (0 disables)
+    float edgeMaxJump = 1.5f;   // disparity jump (px) that marks a depth edge
     bool debug = false;
 };
 
@@ -92,6 +94,9 @@ MatchTuning readMatchTuning() {
         "ALL3DSCAN_POP4_SPECKLE_REGION", static_cast<float>(t.speckleMinRegion), 0, 5000));
     t.speckleMaxDiff = envFloat("ALL3DSCAN_POP4_SPECKLE_DIFF", t.speckleMaxDiff, 0.1f, 16.0f);
     t.doMedian = envFlag("ALL3DSCAN_POP4_MEDIAN", t.doMedian);
+    t.edgeRadius = static_cast<int>(
+        envFloat("ALL3DSCAN_POP4_EDGE_RADIUS", static_cast<float>(t.edgeRadius), 0, 8));
+    t.edgeMaxJump = envFloat("ALL3DSCAN_POP4_EDGE_JUMP", t.edgeMaxJump, 0.2f, 20.0f);
     t.debug = envFlag("ALL3DSCAN_POP4_DEBUG", false);
     return t;
 }
@@ -271,6 +276,46 @@ void medianFilterDisparity(const std::vector<float>& in, std::vector<float>& out
             }
             std::sort(window, window + n);
             out[ci] = window[n / 2];
+        }
+    }
+}
+
+// Drops "flying pixels": SGM smears depth across object outlines, which
+// back-projects to streaks along the viewing rays. A pixel is removed when any
+// valid pixel within `radius` differs by more than `maxJump` px of disparity.
+void filterDepthEdges(std::vector<float>& disp, int radius, float maxJump) {
+    if (radius <= 0) {
+        return;
+    }
+    const std::vector<float> in = disp;
+    for (int y = 0; y < static_cast<int>(kH); ++y) {
+        for (int x = 0; x < static_cast<int>(kW); ++x) {
+            const size_t p = static_cast<size_t>(y) * kW + x;
+            const float c = in[p];
+            if (c < 0.0f) {
+                continue;
+            }
+            bool edge = false;
+            for (int dy = -radius; dy <= radius && !edge; ++dy) {
+                const int yy = y + dy;
+                if (yy < 0 || yy >= static_cast<int>(kH)) {
+                    continue;
+                }
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    const int xx = x + dx;
+                    if (xx < 0 || xx >= static_cast<int>(kW)) {
+                        continue;
+                    }
+                    const float v = in[static_cast<size_t>(yy) * kW + xx];
+                    if (v >= 0.0f && std::fabs(v - c) > maxJump) {
+                        edge = true;
+                        break;
+                    }
+                }
+            }
+            if (edge) {
+                disp[p] = -1.0f;
+            }
         }
     }
 }
@@ -792,6 +837,7 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
         disp.swap(tmp);
     }
     filterSpeckles(disp, t.speckleMinRegion, t.speckleMaxDiff);
+    filterDepthEdges(disp, t.edgeRadius, t.edgeMaxJump);
 
     // 6. Metric depth + texture.
     protocol::RawFrame out;

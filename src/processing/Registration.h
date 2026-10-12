@@ -58,4 +58,19 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
                           const RigidTransform& init = {},
                           const IcpOptions& opts = {});
 
+// Point-to-plane ICP (Gauss-Newton on n·(Rp + t − q)). Target normals come
+// from a PCA plane fit over neighbours within `normalRadiusM`; points without
+// a well-defined plane are skipped. Locks onto flat faces where point-to-point
+// slides, which matters for box-like objects. Fitness/RMSE are reported with
+// the same point-distance semantics as icpPointToPoint.
+struct PlaneIcpOptions : IcpOptions {
+    float normalRadiusM = 0.006f;
+    std::size_t minNormalNeighbours = 6;
+};
+
+IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
+                          const pointcloud::PointCloud& target,
+                          const RigidTransform& init = {},
+                          const PlaneIcpOptions& opts = {});
+
 } // namespace revoscan::processing

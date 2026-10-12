@@ -329,15 +329,20 @@ public:
     std::string lastError() const override { return lastError_; }
 
 private:
-    // ALL3DSCAN_POP4_DUMP_DIR=<dir> writes the first 30 packed Y16 frames as
-    // pop4_<w>x<h>_NNN.y16 (little-endian) for offline decoder work.
+    // ALL3DSCAN_POP4_DUMP_DIR=<dir> writes the first ALL3DSCAN_POP4_DUMP_MAX
+    // (default 30, max 2000) packed Y16 frames as pop4_<w>x<h>_NNN.y16
+    // (little-endian, 3.2 MB each) for offline decoder / tracking work.
     void dumpRawFrame(const usb::V4l2Frame& sensor, size_t bytes) {
         const char* dir = std::getenv("ALL3DSCAN_POP4_DUMP_DIR");
-        if (!dir || dumpCount_ >= 30) {
+        int maxFrames = 30;
+        if (const char* m = std::getenv("ALL3DSCAN_POP4_DUMP_MAX")) {
+            maxFrames = std::clamp(std::atoi(m), 1, 2000);
+        }
+        if (!dir || dumpCount_ >= maxFrames) {
             return;
         }
         char name[64];
-        std::snprintf(name, sizeof(name), "/pop4_%ux%u_%03d.y16", captureWidth_,
+        std::snprintf(name, sizeof(name), "/pop4_%ux%u_%04d.y16", captureWidth_,
                       captureHeight_, dumpCount_++);
         if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb")) {
             std::fwrite(sensor.bytes.data(), 1, bytes, f);

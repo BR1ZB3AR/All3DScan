@@ -244,6 +244,32 @@ public:
         return best;
     }
 
+    // Indices of all points within `radius` (radius must be <= cell size).
+    void within(double qx, double qy, double qz, double radius, std::vector<int>& out) const {
+        out.clear();
+        const int cx = cellIndex(qx);
+        const int cy = cellIndex(qy);
+        const int cz = cellIndex(qz);
+        const double r2 = radius * radius;
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto it = grid_.find(GridKey{cx + dx, cy + dy, cz + dz});
+                    if (it == grid_.end()) {
+                        continue;
+                    }
+                    for (int idx : it->second) {
+                        const auto& p = pts_->points[static_cast<size_t>(idx)];
+                        const double ex = p.x - qx, ey = p.y - qy, ez = p.z - qz;
+                        if (ex * ex + ey * ey + ez * ez <= r2) {
+                            out.push_back(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 private:
     int cellIndex(double v) const { return static_cast<int>(std::floor(v / cell_)); }
     GridKey keyOf(const pointcloud::Point& p) const {
@@ -254,6 +280,107 @@ private:
     float cell_;
     std::unordered_map<GridKey, std::vector<int>, GridKeyHash> grid_;
 };
+
+
+// Smallest-eigenvalue eigenvector of a symmetric 3×3 matrix (cyclic Jacobi).
+Vec3 smallestEigenvector(double a[3][3], double* smallest, double* largest) {
+    double v[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (int sweep = 0; sweep < 30; ++sweep) {
+        const double off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
+        if (off < 1e-30) {
+            break;
+        }
+        for (int p = 0; p < 2; ++p) {
+            for (int q = p + 1; q < 3; ++q) {
+                if (std::fabs(a[p][q]) < 1e-300) {
+                    continue;
+                }
+                const double theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                const double t = (theta >= 0 ? 1.0 : -1.0) /
+                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0);
+                const double sn = t * c;
+                for (int k = 0; k < 3; ++k) {
+                    const double akp = a[k][p], akq = a[k][q];
+                    a[k][p] = c * akp - sn * akq;
+                    a[k][q] = sn * akp + c * akq;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double apk = a[p][k], aqk = a[q][k];
+                    a[p][k] = c * apk - sn * aqk;
+                    a[q][k] = sn * apk + c * aqk;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double vkp = v[k][p], vkq = v[k][q];
+                    v[k][p] = c * vkp - sn * vkq;
+                    v[k][q] = sn * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    int mi = 0, ma = 0;
+    for (int i = 1; i < 3; ++i) {
+        mi = a[i][i] < a[mi][mi] ? i : mi;
+        ma = a[i][i] > a[ma][ma] ? i : ma;
+    }
+    *smallest = a[mi][mi];
+    *largest = a[ma][ma];
+    return Vec3{v[0][mi], v[1][mi], v[2][mi]};
+}
+
+// Solves the symmetric positive-definite 6×6 system A x = b (Cholesky).
+bool solve6(double A[6][6], const double b[6], double x[6]) {
+    double L[6][6] = {};
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            double sum = A[i][j];
+            for (int k = 0; k < j; ++k) {
+                sum -= L[i][k] * L[j][k];
+            }
+            if (i == j) {
+                if (sum <= 1e-18) {
+                    return false;
+                }
+                L[i][i] = std::sqrt(sum);
+            } else {
+                L[i][j] = sum / L[j][j];
+            }
+        }
+    }
+    double y[6];
+    for (int i = 0; i < 6; ++i) {
+        double sum = b[i];
+        for (int k = 0; k < i; ++k) {
+            sum -= L[i][k] * y[k];
+        }
+        y[i] = sum / L[i][i];
+    }
+    for (int i = 5; i >= 0; --i) {
+        double sum = y[i];
+        for (int k = i + 1; k < 6; ++k) {
+            sum -= L[k][i] * x[k];
+        }
+        x[i] = sum / L[i][i];
+    }
+    return true;
+}
+
+// Rigid transform from a small rotation vector w (Rodrigues) and translation t.
+RigidTransform fromTwist(const double w[3], const double t[3]) {
+    const double th = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    double R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    if (th > 1e-12) {
+        const double kx = w[0] / th, ky = w[1] / th, kz = w[2] / th;
+        const double c = std::cos(th), s = std::sin(th), C = 1.0 - c;
+        R[0][0] = c + kx * kx * C;      R[0][1] = kx * ky * C - kz * s; R[0][2] = kx * kz * C + ky * s;
+        R[1][0] = ky * kx * C + kz * s; R[1][1] = c + ky * ky * C;      R[1][2] = ky * kz * C - kx * s;
+        R[2][0] = kz * kx * C - ky * s; R[2][1] = kz * ky * C + kx * s; R[2][2] = c + kz * kz * C;
+    }
+    RigidTransform out;
+    out.m = {R[0][0], R[0][1], R[0][2], t[0], R[1][0], R[1][1], R[1][2], t[1],
+             R[2][0], R[2][1], R[2][2], t[2], 0.0, 0.0, 0.0, 1.0};
+    return out;
+}
 
 } // namespace
 
@@ -414,6 +541,125 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
         result.rmseM = inliers > 0 ? std::sqrt(sumSq / static_cast<double>(inliers)) : 0.0;
     }
 
+    return result;
+}
+
+IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
+                          const pointcloud::PointCloud& target,
+                          const RigidTransform& init, const PlaneIcpOptions& opts) {
+    IcpResult result;
+    result.transform = init;
+    if (source.points.size() < opts.minCorrespondences ||
+        target.points.size() < opts.minCorrespondences) {
+        return result;
+    }
+
+    // Target normals from local PCA planes.
+    std::vector<Vec3> normals(target.points.size());
+    std::vector<uint8_t> hasNormal(target.points.size(), 0);
+    {
+        const SpatialHash nhash(target, opts.normalRadiusM);
+        std::vector<int> nb;
+        for (size_t i = 0; i < target.points.size(); ++i) {
+            const auto& q = target.points[i];
+            nhash.within(q.x, q.y, q.z, opts.normalRadiusM, nb);
+            if (nb.size() < opts.minNormalNeighbours) {
+                continue;
+            }
+            double mx = 0, my = 0, mz = 0;
+            for (int j : nb) {
+                const auto& p = target.points[static_cast<size_t>(j)];
+                mx += p.x; my += p.y; mz += p.z;
+            }
+            const double inv = 1.0 / static_cast<double>(nb.size());
+            mx *= inv; my *= inv; mz *= inv;
+            double c[3][3] = {};
+            for (int j : nb) {
+                const auto& p = target.points[static_cast<size_t>(j)];
+                const double d[3] = {p.x - mx, p.y - my, p.z - mz};
+                for (int r = 0; r < 3; ++r) {
+                    for (int k = 0; k < 3; ++k) {
+                        c[r][k] += d[r] * d[k];
+                    }
+                }
+            }
+            double lmin = 0, lmax = 0;
+            const Vec3 n = smallestEigenvector(c, &lmin, &lmax);
+            if (lmax <= 0.0 || lmin > 0.2 * lmax) {
+                continue; // no clear plane (edge, corner, noise)
+            }
+            normals[i] = n;
+            hasNormal[i] = 1;
+        }
+    }
+
+    const SpatialHash hash(target, opts.maxCorrespondenceDistM);
+    const double maxDist = opts.maxCorrespondenceDistM;
+    const double huber = std::max(1e-4, maxDist / 4.0);
+    pointcloud::PointCloud working = transformed(source, init);
+
+    for (int iter = 0; iter < opts.maxIterations; ++iter) {
+        double A[6][6] = {};
+        double b[6] = {};
+        size_t used = 0;
+        for (const auto& wp : working.points) {
+            double sq = 0.0;
+            const long idx = hash.nearest(wp.x, wp.y, wp.z, maxDist, &sq);
+            if (idx < 0 || !hasNormal[static_cast<size_t>(idx)]) {
+                continue;
+            }
+            const auto& q = target.points[static_cast<size_t>(idx)];
+            const Vec3& n = normals[static_cast<size_t>(idx)];
+            const double r = n.x * (wp.x - q.x) + n.y * (wp.y - q.y) + n.z * (wp.z - q.z);
+            // J = [p × n, n]
+            const double J[6] = {wp.y * n.z - wp.z * n.y, wp.z * n.x - wp.x * n.z,
+                                 wp.x * n.y - wp.y * n.x, n.x, n.y, n.z};
+            const double w = std::fabs(r) <= huber ? 1.0 : huber / std::fabs(r);
+            for (int i = 0; i < 6; ++i) {
+                b[i] -= w * J[i] * r;
+                for (int j = 0; j <= i; ++j) {
+                    A[i][j] += w * J[i] * J[j];
+                }
+            }
+            ++used;
+        }
+        result.iterations = static_cast<size_t>(iter + 1);
+        result.correspondences = used;
+        if (used < opts.minCorrespondences) {
+            break;
+        }
+        for (int i = 0; i < 6; ++i) {
+            for (int j = i + 1; j < 6; ++j) {
+                A[i][j] = A[j][i];
+            }
+            A[i][i] += 1e-9; // keep degenerate directions solvable
+        }
+        double x[6];
+        if (!solve6(A, b, x)) {
+            break;
+        }
+        const RigidTransform delta = fromTwist(x, x + 3);
+        result.transform = delta * result.transform;
+        working = transformed(source, result.transform);
+        if (delta.translationNorm() < opts.convergenceTransEpsM &&
+            delta.rotationAngle() < opts.convergenceRotEps) {
+            result.converged = true;
+            break;
+        }
+    }
+
+    size_t inliers = 0;
+    double sumSq = 0.0;
+    for (const auto& wp : working.points) {
+        double sq = 0.0;
+        if (hash.nearest(wp.x, wp.y, wp.z, maxDist, &sq) >= 0) {
+            ++inliers;
+            sumSq += sq;
+        }
+    }
+    result.fitness = static_cast<double>(inliers) / static_cast<double>(source.points.size());
+    result.correspondences = inliers;
+    result.rmseM = inliers > 0 ? std::sqrt(sumSq / static_cast<double>(inliers)) : 0.0;
     return result;
 }
 

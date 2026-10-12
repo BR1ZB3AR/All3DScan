@@ -56,14 +56,15 @@ struct ForegroundIsolation {
     float lateralPadM = 0.04f;         // XY pad around chosen cluster bbox
     float centerBiasM = 0.08f;         // prefer clusters near optical axis
     std::size_t minClusterPoints = 40; // ignore tiny detached specks
+    float minClusterShareOfLargest = 0.05f; // ...and fragments < 5% of the largest
     bool keepOnlyBestCluster = true;   // Revo-style: one object at a time
 
-    // Fronto-parallel dominant-plane removal (RANSAC). A collapsed/near-constant
-    // depth frame back-projects to a flat slab that swamps the real object; this
-    // strips the largest wall/slab plane so the object relief stands out. Only
-    // fires when the plane is large *and* roughly perpendicular to the optical
-    // axis, and never when it would empty the cloud.
-    bool removeDominantPlane = true;
+    // Fronto-parallel dominant-plane removal (RANSAC). Written for the old
+    // phase decoder, whose collapsed depth back-projected to a flat slab. With
+    // the speckle decoder, flat surfaces are real — usually the object's own
+    // front face — and removing them left only scraps (replay: ~150 of ~67k
+    // points kept, tracking lost on a static scene). Off by default.
+    bool removeDominantPlane = false;
     float planeThreshM = 0.006f;       // RANSAC inlier band (±6 mm)
     float planeMinFraction = 0.35f;    // only remove if plane ≥ this share of band
     float planeMaxFraction = 0.97f;    // above this it's a pure slab → keep (nothing else)

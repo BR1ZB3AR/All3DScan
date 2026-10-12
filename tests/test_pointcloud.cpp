@@ -149,9 +149,10 @@ revoscan::pointcloud::PointCloud slabPlusObject() {
 }
 } // namespace
 
-TEST_CASE("isolateForegroundObject strips a dominant fronto-parallel slab") {
+TEST_CASE("isolateForegroundObject strips a dominant fronto-parallel slab when enabled") {
     const auto cloud = slabPlusObject();
     ForegroundIsolation params;
+    params.removeDominantPlane = true; // opt-in since the speckle decoder
     params.nearClipM = 0.25f;
     params.farClipM = 0.50f;
     params.nearBandM = 0.15f;
@@ -273,4 +274,22 @@ TEST_CASE("previewFromVendorRawY16 respects depthScale multiplier") {
     REQUIRE(cloud.points.size() == 2);
     REQUIRE(cloud.points[0].z == Catch::Approx(0.200f).margin(0.01f));
     REQUIRE(cloud.points[1].z == Catch::Approx(0.400f).margin(0.01f));
+}
+
+TEST_CASE("isolateForegroundObject keeps a flat object face by default") {
+    // A real flat face (e.g. a carton front) must survive default isolation.
+    const auto cloud = slabPlusObject();
+    ForegroundIsolation params;
+    params.nearClipM = 0.25f;
+    params.farClipM = 0.50f;
+    params.nearBandM = 0.15f;
+    params.clusterVoxelM = 0.02f;
+    params.minClusterPoints = 30;
+    const auto out = isolateForegroundObject(cloud, params);
+    const auto onSlab = std::count_if(
+        out.points.begin(), out.points.end(),
+        [](const revoscan::pointcloud::Point& p) {
+            return std::fabs(p.z - 0.33f) <= 0.002f;
+        });
+    REQUIRE(onSlab > 0);
 }
