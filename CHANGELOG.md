@@ -4,6 +4,21 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261013-2133
+
+### Added
+- Live 3D polygon model while scanning (see the live TSDF commit): Live Mesh
+  is on by default and no longer needs Live Fusion.
+- Opt-in `ALL3DSCAN_POP4_FRINGE=<0..6>` sends the vendor SDK's validated
+  fringe-pattern command over the selector-7 command channel (found by
+  static analysis of the RevoScan Android SDK).
+
+### Changed
+- RE notes: exposures 0–3 / 5–8 do contain four-step fringes after ~1 s of
+  streaming (the earlier "no fringes" claim came from a capture inside the
+  warm-up). They are in a different geometry from the speckle pair, and
+  phase refinement is not working yet.
+
 ## Alpha-v20261012-2310
 
 ### Fixed

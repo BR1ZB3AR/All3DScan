@@ -6,6 +6,66 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Device command channel, fringe exposures and open questions (2026-10-13)
+
+**Corrections to the 2026-10-12 section below.** (1) Exposures 0–3 / 5–8
+*do* carry fringes in normal operation. (2) Selector 7 is a general command
+channel, not only a settings block.
+
+**XU selector 7 = device shell command channel.** Static analysis of the
+RevoScan 6.0.2.4 Android `lib3DCamera.so` (read-only: capstone + pyelftools,
+scripts in the session notes):
+
+- `libuvcExecuteCmd(popVersion, devh, cmd)` at `0x72cdf4` copies an ASCII
+  command (≤60 bytes, NUL-padded) into a 60-byte buffer. When
+  `popVersion > 9` it sends `SET_CUR` (0x21/0x01) with wValue `0x0700`
+  (selector 7), wIndex `0x0400` (unit 4, interface 0), and a 1000 ms
+  timeout. Older units use a vendor request (0x41/0xff, wIndex 0x0300).
+  Success means all 60 bytes were transferred.
+- The commands are shell lines run on the scanner's Linux (Rockchip). For
+  example, `cs::Camera::setFringePattern` (`0x62f36c`) pauses the depth
+  stream, sends `echo s 0xa05 <type> >/dev/rk_preisp` (or to
+  `rk_preisp_1` and then `rk_preisp_2` on dual-ISP device types), then
+  resumes. `<type>` is validated to 0..6. Java enum `FringePatternType`:
+  STANDARD, STANDARD_WHITE_ADDED, MULTI_DEPTH, MULTI_DEPTH_WHITE_ADDED,
+  MULTI_DEPTH_DOUBLE_WHITE_ADDED, 3FREQ4STEP_MULTI, 3FREQ4STEP_MULTI_DEPTH.
+  Many other `echo s 0x… >/dev/rk_preisp` commands exist (laser line mode
+  0x102–0x104, 0x3001, 0x48x, …); they are not used here.
+- Our POP4 accepted `echo s 0xa05 1 >/dev/rk_preisp` (60 bytes). It is
+  available as an opt-in experiment: `ALL3DSCAN_POP4_FRINGE=<0..6>`,
+  `ALL3DSCAN_POP4_PREISP=single|dual|all`. Only the validated fringe
+  command is ever sent. **Do not send other commands blindly**: the SDK
+  also has firmware, remount and `setlaserCalParam` paths that could damage
+  the device's state or calibration.
+- Our binary projector "settings" block is also written to selector 7. How
+  the firmware tells it apart from a text command is unknown.
+
+**Fringe exposures.** From about 17 frames (~1.1 s) after streaming starts,
+exposures 0–3 (right camera) and 5–8 (left camera) show one-frequency
+four-step fringes: vertical stripes, period ≈5.3 px, phase steps −90°
+(measured by FFT). The first capture studied had 12 frames, all inside
+that warm-up, which is why the section below wrongly calls them ambient.
+
+**The speckle and fringe images are not in the same geometry.** On a static
+scene, each block's speckle image is shifted ≈−13 px (left camera) /
++12 px (right camera) horizontally from that block's fringe images, so the
+fringe pair's disparity is ≈ speckle + 25 px (~60 px at 30 cm). The fringe
+period is nearly constant across x in both cameras, which the bowl-shaped
+speckle disparity cannot explain. So the "lens bias" applies to the speckle
+pair, not to the fringe pair.
+
+**Phase refinement has not worked yet.** Matching equal phase near the
+speckle coarse disparity, in speckle geometry and in fringe-native geometry
+(with the offsets above), gave residuals spread over a whole period rather
+than a sharp peak. On a static scene the phase at a fixed pixel also jitters
+±20° (~0.3 px) from frame to frame. Open questions: the exact fringe-pair
+rectification, inter-camera exposure timing, and whether the phase is a
+shared projector code. Until these are answered, depth stays speckle-only.
+
+**Environment note.** A long-running Wine/Proton `winedevice.exe` had the
+scanner's USB node open. Wine's USB layer can interfere with libusb access
+and may explain some stuck-arming episodes.
+
 ## Packed frame is speckle stereo, not four-step phase (2026-10-12)
 
 **This supersedes the frame-layout and decoding claims in the 2026-07-18,

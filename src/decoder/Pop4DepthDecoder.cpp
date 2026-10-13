@@ -18,8 +18,9 @@ namespace {
 // Packed 640×2560 Y16 is really ten 320×512 images back to back (row stride
 // 320). Verified 2026-10 on a live POP4 by autocorrelation (row period 320)
 // and by rendering: images 0–4 = right camera, 5–9 = left camera; images 4
-// and 9 carry the projected speckle, the rest are ambient/flood exposures with
-// no fringe modulation. See docs/protocol/RE_NOTES.md.
+// and 9 carry the projected speckle. Images 0–3 / 5–8 carry four-step fringes
+// once streaming has run ~1 s, but in a different geometry from the speckle
+// images and not yet usable (RE_NOTES 2026-10-13). Depth is speckle-only.
 constexpr uint32_t kPackedWidth = 640;
 constexpr uint32_t kPackedHeight = 2560;
 constexpr uint32_t kW = 320;

@@ -53,7 +53,11 @@ int probePop4() {
     }
     if (frame && std::getenv("ALL3DSCAN_POP4_DUMP_DIR")) {
         // Keep streaming so the protocol dumps a short burst for offline work.
-        for (int i = 1; i < 30; ++i) {
+        int burst = 30;
+        if (const char* m = std::getenv("ALL3DSCAN_POP4_DUMP_MAX")) {
+            burst = std::max(1, std::atoi(m));
+        }
+        for (int i = 1; i < burst; ++i) {
             (void)scanner->readFrame(5000);
         }
     }
@@ -320,7 +324,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261012-2310");
+    QApplication::setApplicationVersion("Alpha-v20261013-2133");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // No window / taskbar logo — plain Qt default decoration.

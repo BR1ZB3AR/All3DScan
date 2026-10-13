@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
+#include <vector>
+#include <string>
 #include <memory>
 #include <thread>
 
@@ -547,12 +550,65 @@ private:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
+        applyFringePatternFromEnv();
+
         if (!finishControlClaim(detached)) {
             return false;
         }
         usb_.close();
         std::this_thread::sleep_for(std::chrono::milliseconds(800));
         return true;
+    }
+
+    // Runs a shell command on the scanner the way the vendor SDK's
+    // libuvcExecuteCmd does: ASCII, NUL-padded to 60 bytes, UVC SET_CUR on
+    // XU unit 4 selector 7 (the same selector as the settings block), 1 s
+    // timeout; success means all 60 bytes were accepted.
+    bool executeDeviceCommand(const std::string& cmd) {
+        std::array<uint8_t, 60> buf{};
+        std::memcpy(buf.data(), cmd.data(), std::min(cmd.size(), buf.size() - 1));
+        const int rc = usb_.controlTransfer(kUvcSetRequestType,
+                                            kUvcSetCur,
+                                            xuValue(pop4::kSettingsSelector),
+                                            xuIndex(pop4::kXuUnitId, pop4::kDepthInterface),
+                                            buf.data(),
+                                            buf.size(),
+                                            1000);
+        return rc == static_cast<int>(buf.size());
+    }
+
+    // EXPERIMENTAL: the SDK's cs::Camera::setFringePattern sends exactly
+    // "echo s 0xa05 <type> >/dev/rk_preisp" (types 0..6, validated), or the
+    // same to rk_preisp_1 then rk_preisp_2 on dual-ISP models. Opt-in via
+    // ALL3DSCAN_POP4_FRINGE=<0..6>; ALL3DSCAN_POP4_PREISP=single|dual|all.
+    void applyFringePatternFromEnv() {
+        const char* fringe = std::getenv("ALL3DSCAN_POP4_FRINGE");
+        if (!fringe) {
+            return;
+        }
+        char* end = nullptr;
+        const long type = std::strtol(fringe, &end, 10);
+        if (end == fringe || type < 0 || type >= 7) {
+            std::fprintf(stderr, "[POP4] ALL3DSCAN_POP4_FRINGE=%s rejected (SDK allows 0..6)\n", fringe);
+            return;
+        }
+        const std::string mode = std::getenv("ALL3DSCAN_POP4_PREISP")
+                                     ? std::getenv("ALL3DSCAN_POP4_PREISP")
+                                     : "single";
+        std::vector<std::string> targets;
+        if (mode == "single" || mode == "all") {
+            targets.push_back("rk_preisp");
+        }
+        if (mode == "dual" || mode == "all") {
+            targets.push_back("rk_preisp_1");
+            targets.push_back("rk_preisp_2");
+        }
+        for (const auto& target : targets) {
+            const std::string cmd = "echo s 0xa05 " + std::to_string(type) + " >/dev/" + target;
+            const bool ok = executeDeviceCommand(cmd);
+            std::fprintf(stderr, "[POP4] device cmd \"%s\" -> %s\n", cmd.c_str(), ok ? "ok" : "FAILED");
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
     }
 
     bool finishControlClaim(bool detached) {
