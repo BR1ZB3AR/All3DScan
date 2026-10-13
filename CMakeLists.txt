@@ -177,6 +177,9 @@ add_library(registration
 )
 target_include_directories(registration PUBLIC src)
 target_link_libraries(registration PUBLIC pointcloud)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(registration PRIVATE OpenMP::OpenMP_CXX) # ICP hot loops
+endif()
 
 add_library(processing
     src/processing/ScanPipeline.h

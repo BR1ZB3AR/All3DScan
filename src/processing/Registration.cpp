@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -282,6 +283,127 @@ private:
 };
 
 
+// Static k-d tree for nearest-neighbour correspondence. The spatial hash used
+// a cell as large as the max correspondence distance (35–120 mm), so every
+// query scanned thousands of model points: 4–9 s per frame on real scans.
+class KdTree {
+public:
+    explicit KdTree(const pointcloud::PointCloud& pts) : pts_(&pts) {
+        idx_.resize(pts.points.size());
+        for (size_t i = 0; i < idx_.size(); ++i) {
+            idx_[i] = static_cast<int>(i);
+        }
+        nodes_.reserve(2 * idx_.size() / kLeaf + 2);
+        if (!idx_.empty()) {
+            build(0, static_cast<int>(idx_.size()));
+        }
+    }
+
+    // Nearest point index within maxDist, or -1. Writes squared distance.
+    long nearest(double qx, double qy, double qz, double maxDist, double* outSq) const {
+        if (nodes_.empty()) {
+            return -1;
+        }
+        const double q[3] = {qx, qy, qz};
+        double bestSq = maxDist * maxDist;
+        long best = -1;
+        int stack[64];
+        int top = 0;
+        stack[top++] = 0;
+        while (top > 0) {
+            const Node& n = nodes_[static_cast<size_t>(stack[--top])];
+            // Box distance prune.
+            double boxSq = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                const double d = q[k] < n.lo[k] ? n.lo[k] - q[k] : (q[k] > n.hi[k] ? q[k] - n.hi[k] : 0.0);
+                boxSq += d * d;
+            }
+            if (boxSq >= bestSq) {
+                continue;
+            }
+            if (n.left < 0) {
+                for (int i = n.begin; i < n.end; ++i) {
+                    const auto& p = pts_->points[static_cast<size_t>(idx_[static_cast<size_t>(i)])];
+                    const double ex = p.x - qx, ey = p.y - qy, ez = p.z - qz;
+                    const double sq = ex * ex + ey * ey + ez * ez;
+                    if (sq < bestSq) {
+                        bestSq = sq;
+                        best = idx_[static_cast<size_t>(i)];
+                    }
+                }
+                continue;
+            }
+            // Visit the nearer child last so it is popped first.
+            const bool goLeft = q[n.axis] < n.split;
+            const int nearChild = goLeft ? n.left : n.right;
+            const int farChild = goLeft ? n.right : n.left;
+            if (top + 2 <= 64) {
+                stack[top++] = farChild;
+                stack[top++] = nearChild;
+            }
+        }
+        if (best >= 0 && outSq) {
+            *outSq = bestSq;
+        }
+        return best;
+    }
+
+private:
+    static constexpr int kLeaf = 12;
+    struct Node {
+        float lo[3], hi[3];
+        int begin = 0, end = 0;
+        int left = -1, right = -1;
+        int axis = 0;
+        float split = 0.0f;
+    };
+
+    float coord(int i, int axis) const {
+        const auto& p = pts_->points[static_cast<size_t>(i)];
+        return axis == 0 ? p.x : axis == 1 ? p.y : p.z;
+    }
+
+    int build(int begin, int end) {
+        const int id = static_cast<int>(nodes_.size());
+        nodes_.push_back(Node{});
+        Node n;
+        n.begin = begin;
+        n.end = end;
+        for (int k = 0; k < 3; ++k) {
+            n.lo[k] = std::numeric_limits<float>::max();
+            n.hi[k] = std::numeric_limits<float>::lowest();
+        }
+        for (int i = begin; i < end; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                const float c = coord(idx_[static_cast<size_t>(i)], k);
+                n.lo[k] = std::min(n.lo[k], c);
+                n.hi[k] = std::max(n.hi[k], c);
+            }
+        }
+        if (end - begin > kLeaf) {
+            int axis = 0;
+            for (int k = 1; k < 3; ++k) {
+                if (n.hi[k] - n.lo[k] > n.hi[axis] - n.lo[axis]) {
+                    axis = k;
+                }
+            }
+            const int mid = (begin + end) / 2;
+            std::nth_element(idx_.begin() + begin, idx_.begin() + mid, idx_.begin() + end,
+                             [&](int a, int b) { return coord(a, axis) < coord(b, axis); });
+            n.axis = axis;
+            n.split = coord(idx_[static_cast<size_t>(mid)], axis);
+            n.left = build(begin, mid);
+            n.right = build(mid, end);
+        }
+        nodes_[static_cast<size_t>(id)] = n;
+        return id;
+    }
+
+    const pointcloud::PointCloud* pts_;
+    std::vector<int> idx_;
+    std::vector<Node> nodes_;
+};
+
 // Smallest-eigenvalue eigenvector of a symmetric 3×3 matrix (cyclic Jacobi).
 Vec3 smallestEigenvector(double a[3][3], double* smallest, double* largest) {
     double v[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
@@ -455,7 +577,7 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
         return result;
     }
 
-    const SpatialHash hash(target, opts.maxCorrespondenceDistM);
+    const KdTree hash(target);
     const double maxDist = opts.maxCorrespondenceDistM;
 
     pointcloud::PointCloud working = transformed(source, init);
@@ -544,95 +666,148 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
     return result;
 }
 
+struct PlaneIcpTarget::Impl {
+    pointcloud::PointCloud cloud;
+    KdTree tree;
+    std::vector<Vec3> normals;
+    std::vector<uint8_t> hasNormal;
+
+    Impl(pointcloud::PointCloud c, float radius, std::size_t minNeighbours)
+        : cloud(std::move(c)), tree(cloud) {
+        normals.resize(cloud.points.size());
+        hasNormal.assign(cloud.points.size(), 0);
+        const SpatialHash nhash(cloud, radius);
+#pragma omp parallel
+        {
+            std::vector<int> nb;
+#pragma omp for schedule(static)
+            for (long i = 0; i < static_cast<long>(cloud.points.size()); ++i) {
+                const auto& q = cloud.points[static_cast<size_t>(i)];
+                nhash.within(q.x, q.y, q.z, radius, nb);
+                if (nb.size() < minNeighbours) {
+                    continue;
+                }
+                double mx = 0, my = 0, mz = 0;
+                for (int j : nb) {
+                    const auto& p = cloud.points[static_cast<size_t>(j)];
+                    mx += p.x;
+                    my += p.y;
+                    mz += p.z;
+                }
+                const double inv = 1.0 / static_cast<double>(nb.size());
+                mx *= inv;
+                my *= inv;
+                mz *= inv;
+                double cov[3][3] = {};
+                for (int j : nb) {
+                    const auto& p = cloud.points[static_cast<size_t>(j)];
+                    const double d[3] = {p.x - mx, p.y - my, p.z - mz};
+                    for (int r = 0; r < 3; ++r) {
+                        for (int k = 0; k < 3; ++k) {
+                            cov[r][k] += d[r] * d[k];
+                        }
+                    }
+                }
+                double lmin = 0, lmax = 0;
+                const Vec3 n = smallestEigenvector(cov, &lmin, &lmax);
+                if (lmax <= 0.0 || lmin > 0.2 * lmax) {
+                    continue; // no clear plane (edge, corner, noise)
+                }
+                normals[static_cast<size_t>(i)] = n;
+                hasNormal[static_cast<size_t>(i)] = 1;
+            }
+        }
+    }
+};
+
+PlaneIcpTarget::PlaneIcpTarget(pointcloud::PointCloud cloud, float normalRadiusM,
+                               std::size_t minNormalNeighbours)
+    : impl_(std::make_unique<Impl>(std::move(cloud), normalRadiusM, minNormalNeighbours)) {}
+
+PlaneIcpTarget::~PlaneIcpTarget() = default;
+
+const pointcloud::PointCloud& PlaneIcpTarget::cloud() const {
+    return impl_->cloud;
+}
+
 IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
                           const pointcloud::PointCloud& target,
                           const RigidTransform& init, const PlaneIcpOptions& opts) {
+    const PlaneIcpTarget prepared(target, opts.normalRadiusM, opts.minNormalNeighbours);
+    return icpPointToPlane(source, prepared, init, opts);
+}
+
+IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
+                          const PlaneIcpTarget& prepared,
+                          const RigidTransform& init, const IcpOptions& opts) {
     IcpResult result;
     result.transform = init;
+    const auto& target = prepared.impl();
     if (source.points.size() < opts.minCorrespondences ||
-        target.points.size() < opts.minCorrespondences) {
+        target.cloud.points.size() < opts.minCorrespondences) {
         return result;
     }
-
-    // Target normals from local PCA planes.
-    std::vector<Vec3> normals(target.points.size());
-    std::vector<uint8_t> hasNormal(target.points.size(), 0);
-    {
-        const SpatialHash nhash(target, opts.normalRadiusM);
-        std::vector<int> nb;
-        for (size_t i = 0; i < target.points.size(); ++i) {
-            const auto& q = target.points[i];
-            nhash.within(q.x, q.y, q.z, opts.normalRadiusM, nb);
-            if (nb.size() < opts.minNormalNeighbours) {
-                continue;
-            }
-            double mx = 0, my = 0, mz = 0;
-            for (int j : nb) {
-                const auto& p = target.points[static_cast<size_t>(j)];
-                mx += p.x; my += p.y; mz += p.z;
-            }
-            const double inv = 1.0 / static_cast<double>(nb.size());
-            mx *= inv; my *= inv; mz *= inv;
-            double c[3][3] = {};
-            for (int j : nb) {
-                const auto& p = target.points[static_cast<size_t>(j)];
-                const double d[3] = {p.x - mx, p.y - my, p.z - mz};
-                for (int r = 0; r < 3; ++r) {
-                    for (int k = 0; k < 3; ++k) {
-                        c[r][k] += d[r] * d[k];
-                    }
-                }
-            }
-            double lmin = 0, lmax = 0;
-            const Vec3 n = smallestEigenvector(c, &lmin, &lmax);
-            if (lmax <= 0.0 || lmin > 0.2 * lmax) {
-                continue; // no clear plane (edge, corner, noise)
-            }
-            normals[i] = n;
-            hasNormal[i] = 1;
-        }
-    }
-
-    const SpatialHash hash(target, opts.maxCorrespondenceDistM);
     const double maxDist = opts.maxCorrespondenceDistM;
     const double huber = std::max(1e-4, maxDist / 4.0);
-    pointcloud::PointCloud working = transformed(source, init);
+    const long n = static_cast<long>(source.points.size());
 
     for (int iter = 0; iter < opts.maxIterations; ++iter) {
+        const auto& m = result.transform.m;
         double A[6][6] = {};
         double b[6] = {};
         size_t used = 0;
-        for (const auto& wp : working.points) {
-            double sq = 0.0;
-            const long idx = hash.nearest(wp.x, wp.y, wp.z, maxDist, &sq);
-            if (idx < 0 || !hasNormal[static_cast<size_t>(idx)]) {
-                continue;
-            }
-            const auto& q = target.points[static_cast<size_t>(idx)];
-            const Vec3& n = normals[static_cast<size_t>(idx)];
-            const double r = n.x * (wp.x - q.x) + n.y * (wp.y - q.y) + n.z * (wp.z - q.z);
-            // J = [p × n, n]
-            const double J[6] = {wp.y * n.z - wp.z * n.y, wp.z * n.x - wp.x * n.z,
-                                 wp.x * n.y - wp.y * n.x, n.x, n.y, n.z};
-            const double w = std::fabs(r) <= huber ? 1.0 : huber / std::fabs(r);
-            for (int i = 0; i < 6; ++i) {
-                b[i] -= w * J[i] * r;
-                for (int j = 0; j <= i; ++j) {
-                    A[i][j] += w * J[i] * J[j];
+#pragma omp parallel
+        {
+            double At[6][6] = {};
+            double bt[6] = {};
+            size_t usedT = 0;
+#pragma omp for schedule(static)
+            for (long i = 0; i < n; ++i) {
+                const auto& sp = source.points[static_cast<size_t>(i)];
+                const double wx = m[0] * sp.x + m[1] * sp.y + m[2] * sp.z + m[3];
+                const double wy = m[4] * sp.x + m[5] * sp.y + m[6] * sp.z + m[7];
+                const double wz = m[8] * sp.x + m[9] * sp.y + m[10] * sp.z + m[11];
+                double sq = 0.0;
+                const long idx = target.tree.nearest(wx, wy, wz, maxDist, &sq);
+                if (idx < 0 || !target.hasNormal[static_cast<size_t>(idx)]) {
+                    continue;
                 }
+                const auto& q = target.cloud.points[static_cast<size_t>(idx)];
+                const Vec3& nr = target.normals[static_cast<size_t>(idx)];
+                const double r = nr.x * (wx - q.x) + nr.y * (wy - q.y) + nr.z * (wz - q.z);
+                // J = [p × n, n]
+                const double J[6] = {wy * nr.z - wz * nr.y, wz * nr.x - wx * nr.z,
+                                     wx * nr.y - wy * nr.x, nr.x, nr.y, nr.z};
+                const double w = std::fabs(r) <= huber ? 1.0 : huber / std::fabs(r);
+                for (int a = 0; a < 6; ++a) {
+                    bt[a] -= w * J[a] * r;
+                    for (int c = 0; c <= a; ++c) {
+                        At[a][c] += w * J[a] * J[c];
+                    }
+                }
+                ++usedT;
             }
-            ++used;
+#pragma omp critical
+            {
+                for (int a = 0; a < 6; ++a) {
+                    b[a] += bt[a];
+                    for (int c = 0; c <= a; ++c) {
+                        A[a][c] += At[a][c];
+                    }
+                }
+                used += usedT;
+            }
         }
         result.iterations = static_cast<size_t>(iter + 1);
         result.correspondences = used;
         if (used < opts.minCorrespondences) {
             break;
         }
-        for (int i = 0; i < 6; ++i) {
-            for (int j = i + 1; j < 6; ++j) {
-                A[i][j] = A[j][i];
+        for (int a = 0; a < 6; ++a) {
+            for (int c = a + 1; c < 6; ++c) {
+                A[a][c] = A[c][a];
             }
-            A[i][i] += 1e-9; // keep degenerate directions solvable
+            A[a][a] += 1e-9; // keep degenerate directions solvable
         }
         double x[6];
         if (!solve6(A, b, x)) {
@@ -640,7 +815,6 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
         }
         const RigidTransform delta = fromTwist(x, x + 3);
         result.transform = delta * result.transform;
-        working = transformed(source, result.transform);
         if (delta.translationNorm() < opts.convergenceTransEpsM &&
             delta.rotationAngle() < opts.convergenceRotEps) {
             result.converged = true;
@@ -648,16 +822,23 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
         }
     }
 
+    // Fitness / RMSE with point-distance semantics (same as point-to-point).
+    const auto& m = result.transform.m;
     size_t inliers = 0;
     double sumSq = 0.0;
-    for (const auto& wp : working.points) {
+#pragma omp parallel for reduction(+ : inliers, sumSq) schedule(static)
+    for (long i = 0; i < n; ++i) {
+        const auto& sp = source.points[static_cast<size_t>(i)];
+        const double wx = m[0] * sp.x + m[1] * sp.y + m[2] * sp.z + m[3];
+        const double wy = m[4] * sp.x + m[5] * sp.y + m[6] * sp.z + m[7];
+        const double wz = m[8] * sp.x + m[9] * sp.y + m[10] * sp.z + m[11];
         double sq = 0.0;
-        if (hash.nearest(wp.x, wp.y, wp.z, maxDist, &sq) >= 0) {
+        if (target.tree.nearest(wx, wy, wz, maxDist, &sq) >= 0) {
             ++inliers;
             sumSq += sq;
         }
     }
-    result.fitness = static_cast<double>(inliers) / static_cast<double>(source.points.size());
+    result.fitness = static_cast<double>(inliers) / static_cast<double>(n);
     result.correspondences = inliers;
     result.rmseM = inliers > 0 ? std::sqrt(sumSq / static_cast<double>(inliers)) : 0.0;
     return result;

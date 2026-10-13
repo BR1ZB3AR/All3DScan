@@ -239,6 +239,7 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
             }
         }
         const uint64_t before = pipeline.framesProcessed();
+        const auto submitted = std::chrono::steady_clock::now();
         state = -1;
         pipeline.submitMetricFrame(cloud, *metric, cal.depth, raw.timestampUs);
         while (pipeline.framesProcessed() == before) {
@@ -250,7 +251,10 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
         std::cout << i << ' '
                   << (state == 1 ? "TRACK" : state == 2 ? "LOST " : "seed ")
                   << " fit=" << fitness << " pts=" << cloud.points.size()
-                  << " model=" << modelPoints << '\n';
+                  << " model=" << modelPoints << " ms="
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - submitted).count()
+                  << std::endl;
     }
     std::cout << "summary: frames=" << files.size() << " tracked=" << tracked
               << " lost=" << lost << " model=" << document.cloud().points.size();

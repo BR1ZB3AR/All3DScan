@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 
 #include "pointcloud/PointCloud.h"
 
@@ -72,5 +73,29 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
                           const pointcloud::PointCloud& target,
                           const RigidTransform& init = {},
                           const PlaneIcpOptions& opts = {});
+
+// A point-to-plane target prepared once — k-d tree plus PCA normals — and
+// reusable across several ICP calls against the same model (tight, wide and
+// relocalisation passes within one frame). Building it is most of the cost.
+class PlaneIcpTarget {
+public:
+    PlaneIcpTarget(pointcloud::PointCloud cloud, float normalRadiusM,
+                   std::size_t minNormalNeighbours = 6);
+    ~PlaneIcpTarget();
+    PlaneIcpTarget(const PlaneIcpTarget&) = delete;
+    PlaneIcpTarget& operator=(const PlaneIcpTarget&) = delete;
+
+    const pointcloud::PointCloud& cloud() const;
+    struct Impl;
+    const Impl& impl() const { return *impl_; }
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
+                          const PlaneIcpTarget& target,
+                          const RigidTransform& init = {},
+                          const IcpOptions& opts = {});
 
 } // namespace revoscan::processing

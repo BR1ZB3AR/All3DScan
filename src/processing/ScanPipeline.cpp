@@ -37,6 +37,8 @@ constexpr size_t kMinSourcePoints = 15;
 constexpr double kMinFitness = 0.10; // below this → try recovery, then Lost
 constexpr double kGoodFitness = 0.25; // above this → coverage tint + keyframe OK
 constexpr float kMaxCorrDistM = 0.035f;
+constexpr int kIcpTargetRefreshFrames = 4;    // rebuild ICP model every N frames
+constexpr size_t kMaxIcpSourcePoints = 8000;  // strided ICP source subset
 constexpr float kWideCorrDistM = 0.120f;
 constexpr float kMaxRmseM = 0.025f; // reject alignments noisier than ~25 mm
 constexpr int kMaxLostBeforeIdle = 15;
@@ -44,6 +46,29 @@ constexpr auto kLiveMeshMinInterval = std::chrono::milliseconds(350);
 constexpr auto kUiUpdateMinInterval = std::chrono::milliseconds(66); // ~15 Hz view
 constexpr float kLiveMeshVoxelM = 0.003f;
 constexpr size_t kLiveMeshMaxVerts = 60000;
+
+// ALL3DSCAN_TRACK_PROFILE=1 prints per-stage timings for each frame.
+struct StageTimer {
+    bool on = false;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::string line;
+    void mark(const char* name) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " %s=%.1f", name,
+                      std::chrono::duration<double, std::milli>(now - last).count());
+        line += buf;
+        last = now;
+    }
+    ~StageTimer() {
+        if (on && !line.empty()) {
+            std::fprintf(stderr, "[TRACK-PROFILE]%s\n", line.c_str());
+        }
+    }
+};
 
 // Removes the support surface (desk/turntable) under the object. A plane only
 // counts as ground if (1) it is roughly horizontal in camera space (|ny| large;
@@ -339,6 +364,7 @@ private:
     }
 
     void seedModel(const pointcloud::PointCloud& src, bool metric) {
+        icpTarget_.reset();
         lastPose_ = RigidTransform::identity();
         hasPose_ = true;
         lostStreak_ = 0;
@@ -439,15 +465,12 @@ private:
 
     // Point-to-plane by default (locks onto flat faces); ALL3DSCAN_ICP=point
     // restores the original point-to-point solver.
-    IcpResult icp(const pointcloud::PointCloud& src, const pointcloud::PointCloud& model,
+    IcpResult icp(const pointcloud::PointCloud& src, const PlaneIcpTarget& model,
                   const RigidTransform& init, const IcpOptions& base) const {
         if (usePointToPoint()) {
-            return icpPointToPoint(src, model, init, base);
+            return icpPointToPoint(src, model.cloud(), init, base);
         }
-        PlaneIcpOptions opts;
-        static_cast<IcpOptions&>(opts) = base;
-        opts.normalRadiusM = std::max(0.004f, 3.0f * icpModelVoxelM());
-        return icpPointToPlane(src, model, init, opts);
+        return icpPointToPlane(src, model, init, base);
     }
 
     static bool usePointToPoint() {
@@ -455,10 +478,32 @@ private:
         return v && (v[0] == 'p' || v[0] == 'P') && std::string_view(v) != "plane";
     }
 
-    IcpResult alignFrame(const pointcloud::PointCloud& src) {
-        // ICP against a coarse model copy — full fused cloud can be 100k+ pts.
-        const pointcloud::PointCloud model =
-            voxelDownsample(document_->cloud(), icpModelVoxelM());
+    IcpResult alignFrame(const pointcloud::PointCloud& fullSrc, StageTimer& timer) {
+        // ICP against a coarse model copy (k-d tree + normals), rebuilt every
+        // few frames: preparing it dominated per-frame cost, and tracking
+        // against a model a few frames old loses nothing measurable.
+        if (!icpTarget_ || ++framesSinceTarget_ >= kIcpTargetRefreshFrames) {
+            icpTarget_ = std::make_unique<PlaneIcpTarget>(
+                voxelDownsample(document_->cloud(), icpModelVoxelM()),
+                std::max(0.004f, 3.0f * icpModelVoxelM()));
+            framesSinceTarget_ = 0;
+        }
+        const PlaneIcpTarget& model = *icpTarget_;
+        timer.mark("modelPrep");
+
+        // An evenly strided subset is plenty to constrain a rigid pose.
+        pointcloud::PointCloud strided;
+        const pointcloud::PointCloud* srcPtr = &fullSrc;
+        if (fullSrc.points.size() > kMaxIcpSourcePoints) {
+            const size_t stride = (fullSrc.points.size() + kMaxIcpSourcePoints - 1) /
+                                  kMaxIcpSourcePoints;
+            strided.points.reserve(fullSrc.points.size() / stride + 1);
+            for (size_t i = 0; i < fullSrc.points.size(); i += stride) {
+                strided.points.push_back(fullSrc.points[i]);
+            }
+            srcPtr = &strided;
+        }
+        const pointcloud::PointCloud& src = *srcPtr;
 
         IcpOptions tight;
         tight.maxCorrespondenceDistM = kMaxCorrDistM;
@@ -492,8 +537,13 @@ private:
     }
 
     void processFrame(Item item) {
+        StageTimer timer;
+        static const bool profile = std::getenv("ALL3DSCAN_TRACK_PROFILE") != nullptr;
+        timer.on = profile;
         item.cloud = removeGroundPlaneRansac(item.cloud);
+        timer.mark("ground");
         pointcloud::PointCloud src = voxelDownsample(item.cloud, sourceVoxelM());
+        timer.mark("srcDown");
         if (src.points.size() < kMinSourcePoints) {
             ++lostStreak_;
             emit trackingState(static_cast<int>(TrackingState::Lost));
@@ -515,7 +565,8 @@ private:
             return;
         }
 
-        const IcpResult r = alignFrame(src);
+        const IcpResult r = alignFrame(src, timer);
+        timer.mark("icp");
         if (r.fitness < acceptFitness() || r.rmseM > acceptRmseM()) {
             ++lostStreak_;
             emit trackingState(static_cast<int>(TrackingState::Lost));
@@ -534,12 +585,16 @@ private:
         if (r.fitness >= kGoodFitness) {
             tintCoverage(dense);
         }
+        timer.mark("denseDown");
         document_->fuseCloud(dense, modelVoxelM(), item.metric,
                              item.metric ? "fused" : "live");
+        timer.mark("fuse");
         maybeCaptureKeyframe(item, r.transform, r.fitness);
+        timer.mark("keyframe");
         updateLiveMesh(item, r.transform,
                        nearClip_ ? nearClip_->load() : 0.15f,
                        farClip_ ? farClip_->load() : 0.60f);
+        timer.mark("liveMesh");
         emit trackingState(static_cast<int>(TrackingState::Tracking));
         emitLiveStats(r.fitness);
         const auto now = std::chrono::steady_clock::now();
@@ -601,6 +656,8 @@ private:
     bool stopping_ = false;
     RigidTransform lastPose_;
     bool hasPose_ = false;
+    std::unique_ptr<PlaneIcpTarget> icpTarget_;
+    int framesSinceTarget_ = 0;
     int lostStreak_ = 0;
     double lastFitness_ = 1.0;
 
