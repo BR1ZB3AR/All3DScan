@@ -99,6 +99,9 @@ signals:
     void statsUpdated(double fitness, int modelPoints, int keyframes);
     // Live shaded mesh preview updated (throttled ~5–8 Hz).
     void liveMeshUpdated();
+    // Tracking was lost and the frame re-aligned to the model from a stored
+    // keyframe pose (automatic relocalization).
+    void relocalized();
     void pipelineError(const QString& message);
 
 private:

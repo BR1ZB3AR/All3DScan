@@ -13,6 +13,10 @@
 #include <sstream>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace revoscan::decoder {
 namespace {
 
@@ -858,6 +862,17 @@ std::string Pop4DepthDecoder::backendName() {
 
 std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFrame& rawY16) {
     lastError_.clear();
+#ifdef _OPENMP
+    // The tracking worker decodes nothing but runs ICP at the same time; two
+    // full-size OpenMP teams on the same cores stall each other's barriers.
+    // Half the logical CPUs each (per-thread setting, see
+    // processing::limitParallelThreadsForCallingThread).
+    thread_local const bool teamLimited = [] {
+        omp_set_num_threads(std::max(1, omp_get_num_procs() / 2));
+        return true;
+    }();
+    (void)teamLimited;
+#endif
     if (rawY16.encoding != protocol::DepthEncoding::VendorRawY16) {
         lastError_ = "POP4 decoder expects VendorRawY16 input";
         return std::nullopt;

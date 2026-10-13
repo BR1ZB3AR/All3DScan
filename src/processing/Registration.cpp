@@ -7,6 +7,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cstdlib>
+#include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace revoscan::processing {
 namespace {
 
@@ -520,6 +526,77 @@ RigidTransform RigidTransform::operator*(const RigidTransform& rhs) const {
     return out;
 }
 
+int limitParallelThreadsForCallingThread(int threads) {
+    if (const char* env = std::getenv("ALL3DSCAN_TRACK_THREADS")) {
+        threads = std::atoi(env);
+    }
+    if (threads <= 0) {
+        threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
+    }
+#ifdef _OPENMP
+    omp_set_num_threads(threads);
+#endif
+    return threads;
+}
+
+RigidTransform inverted(const RigidTransform& t) {
+    const auto& m = t.m;
+    RigidTransform out;
+    out.m = {m[0], m[4], m[8],  0.0, m[1], m[5], m[9], 0.0,
+             m[2], m[6], m[10], 0.0, 0.0,  0.0,  0.0,  1.0};
+    for (int r = 0; r < 3; ++r) {
+        out.m[r * 4 + 3] =
+            -(out.m[r * 4] * m[3] + out.m[r * 4 + 1] * m[7] + out.m[r * 4 + 2] * m[11]);
+    }
+    return out;
+}
+
+RigidTransform orthonormalized(const RigidTransform& t) {
+    const auto& m = t.m;
+    double x[3] = {m[0], m[1], m[2]};
+    double y[3] = {m[4], m[5], m[6]};
+    const double nx = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+    if (nx < 1e-12) {
+        return RigidTransform::identity();
+    }
+    for (double& v : x) {
+        v /= nx;
+    }
+    const double d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    for (int i = 0; i < 3; ++i) {
+        y[i] -= d * x[i];
+    }
+    const double ny = std::sqrt(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+    if (ny < 1e-12) {
+        return RigidTransform::identity();
+    }
+    for (double& v : y) {
+        v /= ny;
+    }
+    const double z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
+                         x[0] * y[1] - x[1] * y[0]};
+    RigidTransform out;
+    out.m = {x[0], x[1], x[2], m[3], y[0], y[1], y[2], m[7],
+             z[0], z[1], z[2], m[11], 0.0, 0.0, 0.0, 1.0};
+    return out;
+}
+
+RigidTransform scaledMotion(const RigidTransform& delta, double s) {
+    const RigidTransform d = orthonormalized(delta);
+    const auto& m = d.m;
+    // Rotation vector (inverse Rodrigues), scaled.
+    const double angle = d.rotationAngle();
+    double w[3] = {0.0, 0.0, 0.0};
+    if (angle > 1e-12 && angle < 3.1) {
+        const double k = s * angle / (2.0 * std::sin(angle));
+        w[0] = k * (m[9] - m[6]);
+        w[1] = k * (m[2] - m[8]);
+        w[2] = k * (m[4] - m[1]);
+    }
+    const double t[3] = {s * m[3], s * m[7], s * m[11]};
+    return fromTwist(w, t);
+}
+
 double RigidTransform::translationNorm() const {
     return std::sqrt(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
 }
@@ -571,7 +648,7 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
                           const pointcloud::PointCloud& target,
                           const RigidTransform& init, const IcpOptions& opts) {
     IcpResult result;
-    result.transform = init;
+    result.transform = orthonormalized(init);
     if (source.points.size() < opts.minCorrespondences ||
         target.points.size() < opts.minCorrespondences) {
         return result;
@@ -630,7 +707,7 @@ IcpResult icpPointToPoint(const pointcloud::PointCloud& source,
         hornRotation(srcCorr, dstCorr, cs, cd, quat);
         const RigidTransform delta = fromQuatTranslation(quat, cs, cd);
 
-        result.transform = delta * result.transform;
+        result.transform = orthonormalized(delta * result.transform);
         working = transformed(source, result.transform);
 
         result.fitness = static_cast<double>(srcCorr.size()) /
@@ -741,7 +818,7 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
                           const PlaneIcpTarget& prepared,
                           const RigidTransform& init, const IcpOptions& opts) {
     IcpResult result;
-    result.transform = init;
+    result.transform = orthonormalized(init);
     const auto& target = prepared.impl();
     if (source.points.size() < opts.minCorrespondences ||
         target.cloud.points.size() < opts.minCorrespondences) {
@@ -814,7 +891,7 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
             break;
         }
         const RigidTransform delta = fromTwist(x, x + 3);
-        result.transform = delta * result.transform;
+        result.transform = orthonormalized(delta * result.transform);
         if (delta.translationNorm() < opts.convergenceTransEpsM &&
             delta.rotationAngle() < opts.convergenceRotEps) {
             result.converged = true;
@@ -842,6 +919,37 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
     result.correspondences = inliers;
     result.rmseM = inliers > 0 ? std::sqrt(sumSq / static_cast<double>(inliers)) : 0.0;
     return result;
+}
+
+AlignmentQuality evaluateAlignment(const pointcloud::PointCloud& source,
+                                   const PlaneIcpTarget& target,
+                                   const RigidTransform& pose,
+                                   double toleranceM) {
+    AlignmentQuality q;
+    const long n = static_cast<long>(source.points.size());
+    if (n == 0 || target.cloud().points.empty()) {
+        return q;
+    }
+    const auto& m = pose.m;
+    const auto& tree = target.impl().tree;
+    size_t inliers = 0;
+    double sumSq = 0.0;
+#pragma omp parallel for reduction(+ : inliers, sumSq) schedule(static)
+    for (long i = 0; i < n; ++i) {
+        const auto& sp = source.points[static_cast<size_t>(i)];
+        const double wx = m[0] * sp.x + m[1] * sp.y + m[2] * sp.z + m[3];
+        const double wy = m[4] * sp.x + m[5] * sp.y + m[6] * sp.z + m[7];
+        const double wz = m[8] * sp.x + m[9] * sp.y + m[10] * sp.z + m[11];
+        double sq = 0.0;
+        if (tree.nearest(wx, wy, wz, toleranceM, &sq) >= 0) {
+            ++inliers;
+            sumSq += sq;
+        }
+    }
+    q.inliers = inliers;
+    q.overlap = static_cast<double>(inliers) / static_cast<double>(n);
+    q.rmseM = inliers > 0 ? std::sqrt(sumSq / static_cast<double>(inliers)) : 0.0;
+    return q;
 }
 
 } // namespace revoscan::processing

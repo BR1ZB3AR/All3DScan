@@ -33,13 +33,21 @@ constexpr size_t kMaxQueue = 6;
 constexpr float kDefaultModelVoxelM = 0.0010f;
 constexpr float kVoxelRatio = 1.8f; // source & ICP-model voxel = model voxel * ratio
 constexpr size_t kMinSourcePoints = 15;
-constexpr double kMinFitness = 0.10; // below this → try recovery, then Lost
+// Tracking acceptance (strict overlap test, see AlignmentQuality).
+constexpr double kMinOverlap = 0.30;        // share of frame on the known surface
+constexpr double kOverlapToleranceMm = 4.0; // "on the surface" distance
+constexpr double kMaxRmseMm = 2.5;          // of those inliers
+constexpr float kFineCorrDistM = 0.008f;    // fine ICP pass search radius
+constexpr size_t kRelocCandidatesPerFrame = 6;
+constexpr double kVelocityDamping = 0.7;          // share of last motion predicted
+constexpr double kMaxPredictStepM = 0.020;        // cap on the predicted step
+constexpr double kMaxPredictStepRad = 6.0 * 3.14159265358979 / 180.0;
 constexpr double kGoodFitness = 0.25; // above this → coverage tint + keyframe OK
 constexpr float kMaxCorrDistM = 0.035f;
 constexpr int kIcpTargetRefreshFrames = 4;    // rebuild ICP model every N frames
 constexpr size_t kMaxIcpSourcePoints = 8000;  // strided ICP source subset
+constexpr size_t kCoarseIcpSourcePoints = 1500; // coarse-pass subset
 constexpr float kWideCorrDistM = 0.120f;
-constexpr float kMaxRmseM = 0.025f; // reject alignments noisier than ~25 mm
 constexpr int kMaxLostBeforeIdle = 15;
 constexpr auto kLiveMeshMinInterval = std::chrono::milliseconds(500);
 constexpr float kLiveVolumeVoxelM = 0.002f;           // live TSDF resolution
@@ -305,6 +313,7 @@ public:
 
 public slots:
     void processLoop() {
+        limitParallelThreadsForCallingThread();
         while (true) {
             Item item;
             {
@@ -330,6 +339,7 @@ signals:
     void updated();
     void trackingState(int state);
     void stats(double fitness, int modelPoints, int keyframes);
+    void relocalized();
     void liveMeshReady();
 
 private:
@@ -472,7 +482,7 @@ private:
         QMutexLocker lock(&kfMutex_);
         ++framesSinceKf_;
         if (hasLastKfPose_ && keyframes_.size() >= 1) {
-            const RigidTransform delta = pose * invert(lastKfPose_);
+            const RigidTransform delta = pose * inverted(lastKfPose_);
             if (delta.translationNorm() < kKeyframeMinTransM &&
                 delta.rotationAngle() < kKeyframeMinRotRad &&
                 framesSinceKf_ < kKeyframeEveryNFrames) {
@@ -518,7 +528,14 @@ private:
         return v && (v[0] == 'p' || v[0] == 'P') && std::string_view(v) != "plane";
     }
 
-    IcpResult alignFrame(const pointcloud::PointCloud& fullSrc, StageTimer& timer) {
+    struct Alignment {
+        IcpResult icp;
+        AlignmentQuality quality;
+        bool ok = false;
+        bool relocalized = false;
+    };
+
+    Alignment alignFrame(const pointcloud::PointCloud& fullSrc, StageTimer& timer) {
         // ICP against a coarse model copy (k-d tree + normals), rebuilt every
         // few frames: preparing it dominated per-frame cost, and tracking
         // against a model a few frames old loses nothing measurable.
@@ -547,35 +564,95 @@ private:
             srcPtr = &strided;
         }
         const pointcloud::PointCloud& src = *srcPtr;
-
-        IcpOptions tight;
-        tight.maxCorrespondenceDistM = kMaxCorrDistM;
-        tight.maxIterations = lastFitness_ >= kGoodFitness ? 12 : 20;
-        IcpResult best = icp(src, model, lastPose_, tight);
-
-        // Widen / relocalize only when tracking is weak (skip the expensive
-        // recovery passes while we are locked on).
-        if (best.fitness < kGoodFitness) {
-            IcpOptions wide = tight;
-            wide.maxCorrespondenceDistM = kWideCorrDistM;
-            wide.maxIterations = 25;
-            const IcpResult r2 = icp(src, model, lastPose_, wide);
-            if (r2.fitness > best.fitness ||
-                (r2.fitness >= best.fitness && r2.rmseM < best.rmseM)) {
-                best = r2;
+        // The coarse pass only has to get within the fine radius: a sparser
+        // subset and a looser stop make it several times cheaper.
+        pointcloud::PointCloud sparse;
+        if (src.points.size() > 2 * kCoarseIcpSourcePoints) {
+            const size_t stride = src.points.size() / kCoarseIcpSourcePoints;
+            sparse.points.reserve(src.points.size() / stride + 1);
+            for (size_t i = 0; i < src.points.size(); i += stride) {
+                sparse.points.push_back(src.points[i]);
             }
         }
+        const pointcloud::PointCloud& coarseSrc = sparse.points.empty() ? src : sparse;
 
-        if (best.fitness < kMinFitness) {
-            IcpOptions wide;
-            wide.maxCorrespondenceDistM = kWideCorrDistM;
-            wide.maxIterations = 30;
-            const IcpResult r3 = icp(src, model, RigidTransform::identity(), wide);
-            if (r3.fitness > best.fitness) {
-                best = r3;
+        // Coarse-to-fine ICP from a pose guess, scored on the strict
+        // surface-overlap test (not ICP's wide search radius).
+        auto attempt = [&](const RigidTransform& init, float coarseM) {
+            Alignment out;
+            IcpOptions coarse;
+            coarse.maxCorrespondenceDistM = coarseM;
+            coarse.maxIterations = 15;
+            coarse.convergenceTransEpsM = 1e-4;
+            coarse.convergenceRotEps = 1e-4;
+            const IcpResult c = icp(coarseSrc, model, init, coarse);
+            IcpOptions fine;
+            fine.maxCorrespondenceDistM = kFineCorrDistM;
+            fine.maxIterations = 10;
+            fine.convergenceTransEpsM = 2e-5;
+            fine.convergenceRotEps = 2e-5;
+            out.icp = icp(src, model, c.transform, fine);
+            out.quality = evaluateAlignment(src, model, out.icp.transform, toleranceM());
+            out.ok = out.quality.overlap >= minOverlap() && out.quality.rmseM <= acceptRmseM();
+            return out;
+        };
+        auto better = [](const Alignment& a, const Alignment& b) {
+            return a.ok != b.ok ? a.ok : a.quality.overlap > b.quality.overlap;
+        };
+
+        // 1. Constant-velocity prediction while tracking; last pose otherwise.
+        //    The last inter-frame motion (in camera coordinates) is damped,
+        //    so motion ICP cannot observe — sliding along a flat face — dies
+        //    out instead of carrying the pose away, and capped.
+        RigidTransform guess = lastPose_;
+        if (lostStreak_ == 0 && hasVelocity_) {
+            RigidTransform step = inverted(prevPose_) * lastPose_;
+            double s = kVelocityDamping;
+            if (step.translationNorm() * s > kMaxPredictStepM) {
+                s = kMaxPredictStepM / step.translationNorm();
+            }
+            if (step.rotationAngle() * s > kMaxPredictStepRad) {
+                s = kMaxPredictStepRad / step.rotationAngle();
+            }
+            guess = orthonormalized(lastPose_ * scaledMotion(step, s));
+        }
+        Alignment best = attempt(guess, kMaxCorrDistM);
+        if (!best.ok && lostStreak_ == 0 && hasVelocity_) {
+            const Alignment noVel = attempt(lastPose_, kMaxCorrDistM);
+            if (better(noVel, best)) {
+                best = noVel;
             }
         }
-        lastFitness_ = best.fitness;
+        // 2. Lost: relocalize. Try a few stored keyframe poses per frame,
+        //    newest first and cycling, with a wide coarse pass, so returning
+        //    to an already-scanned area snaps back in automatically.
+        if (!best.ok) {
+            std::vector<RigidTransform> candidates;
+            {
+                QMutexLocker lock(&kfMutex_);
+                const size_t n = keyframes_.size();
+                for (size_t k = 0; k < std::min<size_t>(n, kRelocCandidatesPerFrame); ++k) {
+                    const size_t idx = n - 1 - ((relocCursor_ + k) % n);
+                    RigidTransform t;
+                    t.m = keyframes_[idx].pose;
+                    candidates.push_back(t);
+                }
+                if (n > 0) {
+                    relocCursor_ = (relocCursor_ + kRelocCandidatesPerFrame) % n;
+                }
+            }
+            for (const auto& c : candidates) {
+                const Alignment r = attempt(c, kWideCorrDistM);
+                if (better(r, best)) {
+                    best = r;
+                    best.relocalized = r.ok;
+                }
+                if (best.ok) {
+                    break;
+                }
+            }
+        }
+        lastFitness_ = best.quality.overlap;
         return best;
     }
 
@@ -606,36 +683,43 @@ private:
             return;
         }
 
-        const IcpResult r = alignFrame(src, timer);
+        const Alignment a = alignFrame(src, timer);
         timer.mark("icp");
-        if (r.fitness < acceptFitness() || r.rmseM > acceptRmseM()) {
+        if (!a.ok) {
+            // Not fused: a poor alignment would corrupt every later one.
             ++lostStreak_;
+            hasVelocity_ = false;
             emit trackingState(static_cast<int>(TrackingState::Lost));
-            emitLiveStats(r.fitness);
-            // Keep lastPose_ — next frame still has a useful prediction.
+            emitLiveStats(a.quality.overlap);
             return;
         }
-
+        const IcpResult& r = a.icp;
+        const double overlap = a.quality.overlap;
+        hasVelocity_ = lostStreak_ == 0 && !a.relocalized;
+        prevPose_ = lastPose_;
         lostStreak_ = 0;
         lastPose_ = r.transform;
+        if (a.relocalized) {
+            emit relocalized();
+        }
 
         // Fuse a finer downsample of the full frame (ICP used a coarser one).
         pointcloud::PointCloud dense =
             voxelDownsample(item.cloud, modelVoxelM());
         transformInPlace(dense, r.transform);
-        if (r.fitness >= kGoodFitness) {
+        if (overlap >= kGoodFitness) {
             tintCoverage(dense);
         }
         timer.mark("denseDown");
         document_->fuseCloud(dense, modelVoxelM(), item.metric,
                              item.metric ? "fused" : "live");
         timer.mark("fuse");
-        maybeCaptureKeyframe(item, r.transform, r.fitness);
+        maybeCaptureKeyframe(item, r.transform, overlap);
         timer.mark("keyframe");
         updateLiveMesh(item, r.transform);
         timer.mark("liveMesh");
         emit trackingState(static_cast<int>(TrackingState::Tracking));
-        emitLiveStats(r.fitness);
+        emitLiveStats(overlap);
         const auto now = std::chrono::steady_clock::now();
         if (lastUiEmit_.time_since_epoch().count() == 0 ||
             now - lastUiEmit_ >= kUiUpdateMinInterval) {
@@ -647,13 +731,20 @@ private:
 
     // Gate for fusing a tracked frame. A poor alignment fused into the model
     // corrupts every later alignment, so be strict; overridable for tuning.
-    static double acceptFitness() {
-        static const double v = envDouble("ALL3DSCAN_TRACK_MIN_FITNESS", kMinFitness, 0.0, 1.0);
+    // Share of the frame that must lie on the known surface to be fused.
+    static double minOverlap() {
+        static const double v = envDouble("ALL3DSCAN_TRACK_MIN_OVERLAP", kMinOverlap, 0.0, 1.0);
+        return v;
+    }
+    // Distance (mm) counted as "on the surface" by the overlap test.
+    static double toleranceM() {
+        static const double v =
+            envDouble("ALL3DSCAN_TRACK_TOLERANCE_MM", kOverlapToleranceMm, 0.5, 50.0) / 1000.0;
         return v;
     }
     static double acceptRmseM() {
         static const double v =
-            envDouble("ALL3DSCAN_TRACK_MAX_RMSE_MM", kMaxRmseM * 1000.0, 0.1, 100.0) / 1000.0;
+            envDouble("ALL3DSCAN_TRACK_MAX_RMSE_MM", kMaxRmseMm, 0.1, 100.0) / 1000.0;
         return v;
     }
     static double envDouble(const char* name, double def, double lo, double hi) {
@@ -667,23 +758,6 @@ private:
         return def;
     }
 
-    static RigidTransform invert(const RigidTransform& t) {
-        // Rigid inverse: R^T and -R^T * translation.
-        RigidTransform out;
-        const auto& m = t.m;
-        // Transpose rotation.
-        out.m[0] = m[0];  out.m[1] = m[4];  out.m[2] = m[8];
-        out.m[4] = m[1];  out.m[5] = m[5];  out.m[6] = m[9];
-        out.m[8] = m[2];  out.m[9] = m[6];  out.m[10] = m[10];
-        const double tx = m[3], ty = m[7], tz = m[11];
-        out.m[3] = -(out.m[0] * tx + out.m[1] * ty + out.m[2] * tz);
-        out.m[7] = -(out.m[4] * tx + out.m[5] * ty + out.m[6] * tz);
-        out.m[11] = -(out.m[8] * tx + out.m[9] * ty + out.m[10] * tz);
-        out.m[12] = out.m[13] = out.m[14] = 0.0;
-        out.m[15] = 1.0;
-        return out;
-    }
-
     document::ScanDocument* document_ = nullptr;
     std::atomic<float>* nearClip_ = nullptr;
     std::atomic<float>* farClip_ = nullptr;
@@ -694,6 +768,9 @@ private:
     std::atomic<uint64_t> processed_{0};
     bool stopping_ = false;
     RigidTransform lastPose_;
+    RigidTransform prevPose_;
+    bool hasVelocity_ = false;
+    size_t relocCursor_ = 0;
     bool hasPose_ = false;
     std::unique_ptr<PlaneIcpTarget> icpTarget_;
     int framesSinceTarget_ = 0;
@@ -736,6 +813,7 @@ void ScanPipeline::start() {
     });
     connect(worker_, &Worker::stats, this, &ScanPipeline::statsUpdated);
     connect(worker_, &Worker::liveMeshReady, this, &ScanPipeline::liveMeshUpdated);
+    connect(worker_, &Worker::relocalized, this, &ScanPipeline::relocalized);
     connect(thread_, &QThread::finished, worker_, &QObject::deleteLater);
     thread_->start();
 }

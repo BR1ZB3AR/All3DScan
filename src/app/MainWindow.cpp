@@ -431,25 +431,33 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                     return;
                 }
                 const int pct = static_cast<int>(std::lround(fitness * 100.0));
+                // `fitness` is the share of the frame lying on the scanned
+                // surface (strict overlap test).
                 if (pipeline_->trackingState() == processing::TrackingState::Lost) {
                     trackLabel_->setText(
-                        tr("Tracking: LOST (%1%)  •  %2 pts  •  %3 KF")
+                        tr("Tracking LOST — move back over a scanned area to auto re-align "
+                           "(%1% overlap)  •  %2 pts  •  %3 KF")
                             .arg(pct)
                             .arg(modelPoints)
                             .arg(keyframes));
                     trackLabel_->setStyleSheet("color:#e0a83e;");
                 } else {
+                    const bool justRealigned = relocalizedAt_.isValid() &&
+                                               relocalizedAt_.elapsed() < 2000;
                     trackLabel_->setText(
-                        tr("Tracking: %1%  •  %2 pts  •  %3 KF")
+                        tr("Tracking: %1%%2  •  %3 pts  •  %4 KF")
                             .arg(pct)
+                            .arg(justRealigned ? tr(" (re-aligned)") : QString())
                             .arg(modelPoints)
                             .arg(keyframes));
                     trackLabel_->setStyleSheet(
-                        pct >= 40 ? "color:#5bbf5b;" : "color:#e0a83e;");
+                        pct >= 50 ? "color:#5bbf5b;" : "color:#e0a83e;");
                 }
             });
     connect(pipeline_.get(), &processing::ScanPipeline::liveMeshUpdated, this,
             [this] { refreshScanView(); });
+    connect(pipeline_.get(), &processing::ScanPipeline::relocalized, this,
+            [this] { relocalizedAt_.start(); });
 
     buildMenus();
 

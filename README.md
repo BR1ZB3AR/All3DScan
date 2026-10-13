@@ -57,6 +57,14 @@ post-scan edit tools with undo/redo, and metric-safe PLY/OBJ/STL export.
 the real lens, rectification and 118.6 mm baseline, so depth is in true
 millimetres. See `docs/protocol/RE_NOTES.md` (2026-10-13).
 
+**Scans align themselves.** Each frame is aligned to the model as you scan,
+from a predicted motion, and fused only if most of it lands on the
+already-scanned surface (within 4 mm). If tracking is lost, move back over an
+area you have already scanned and the scan picks up again by itself. Tuning
+knobs: `ALL3DSCAN_TRACK_MIN_OVERLAP` (default 0.30),
+`ALL3DSCAN_TRACK_TOLERANCE_MM` (4), `ALL3DSCAN_TRACK_MAX_RMSE_MM` (2.5),
+`ALL3DSCAN_TRACK_THREADS` (half the logical CPUs).
+
 **POP4 depth decoding works.** The packed 640×2560 Y16
 frame turned out to be ten 320×512 images carrying a speckle stereo pair, not
 four-step phase. The decoder row-aligns the two cameras and runs census +

@@ -151,3 +151,100 @@ TEST_CASE("point-to-plane ICP recovers motion on a plane-only box corner") {
     }
     REQUIRE(maxErr < 0.0005);
 }
+
+namespace {
+
+double orthonormalityError(const RigidTransform& t) {
+    double worst = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            double d = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                d += t.m[r * 4 + k] * t.m[c * 4 + k];
+            }
+            worst = std::max(worst, std::fabs(d - (r == c ? 1.0 : 0.0)));
+        }
+    }
+    return worst;
+}
+
+RigidTransform rotationAboutZ(double deg, double tx, double ty, double tz) {
+    const double a = deg * 3.14159265358979 / 180.0;
+    RigidTransform t;
+    t.m = {std::cos(a), -std::sin(a), 0, tx, std::sin(a), std::cos(a), 0, ty,
+           0,           0,            1, tz, 0,           0,           0, 1};
+    return t;
+}
+
+} // namespace
+
+TEST_CASE("rigid helpers: inverse, re-orthonormalization, scaled motion") {
+    const RigidTransform t = rotationAboutZ(20.0, 0.01, -0.02, 0.03);
+    const RigidTransform id = inverted(t) * t;
+    for (int i = 0; i < 16; ++i) {
+        REQUIRE_THAT(id.m[static_cast<size_t>(i)],
+                     Catch::Matchers::WithinAbs(RigidTransform::identity().m[static_cast<size_t>(i)], 1e-12));
+    }
+
+    RigidTransform skewed = t;
+    skewed.m[0] *= 1.05; // a stretched, sheared "rotation"
+    skewed.m[1] += 0.02;
+    const RigidTransform fixed = orthonormalized(skewed);
+    REQUIRE(orthonormalityError(fixed) < 1e-12);
+    REQUIRE(fixed.m[3] == t.m[3]);
+    REQUIRE(fixed.rotationAngle() < 0.4); // still close to the 20° rotation
+
+    const RigidTransform half = scaledMotion(t, 0.5);
+    REQUIRE_THAT(half.rotationAngle(), Catch::Matchers::WithinAbs(t.rotationAngle() / 2, 1e-9));
+    REQUIRE_THAT(half.translationNorm(), Catch::Matchers::WithinAbs(t.translationNorm() / 2, 1e-12));
+    const RigidTransform same = scaledMotion(t, 1.0);
+    for (int i = 0; i < 16; ++i) {
+        REQUIRE_THAT(same.m[static_cast<size_t>(i)],
+                     Catch::Matchers::WithinAbs(t.m[static_cast<size_t>(i)], 1e-12));
+    }
+}
+
+TEST_CASE("constant-velocity pose prediction stays rigid over long scans") {
+    // Regression: extrapolating last * prev^-1 * last from transposes let
+    // round-off grow ~2.4x per frame until poses were stretched 2-3x.
+    RigidTransform prev = RigidTransform::identity();
+    RigidTransform last = rotationAboutZ(0.7, 0.001, 0.0005, -0.0002);
+    for (int frame = 0; frame < 500; ++frame) {
+        const RigidTransform step = inverted(prev) * last;
+        const RigidTransform next = orthonormalized(last * scaledMotion(step, 0.7));
+        prev = last;
+        last = next;
+    }
+    REQUIRE(orthonormalityError(last) < 1e-12);
+    REQUIRE(orthonormalityError(inverted(prev) * last) < 1e-12);
+}
+
+TEST_CASE("alignment quality separates a real fit from a near miss or another shape") {
+    const PlaneIcpTarget target(makeBoxCorner(), 0.006f);
+    const double tol = 0.004;
+
+    const AlignmentQuality same =
+        evaluateAlignment(makeBoxCorner(), target, RigidTransform::identity(), tol);
+    REQUIRE(same.overlap > 0.99);
+    REQUIRE(same.rmseM < 0.0005);
+
+    // Off by 1 cm on every axis: every face leaves its plane.
+    const AlignmentQuality shifted =
+        evaluateAlignment(makeBoxCorner(), target, rotationAboutZ(0.0, 0.01, 0.01, -0.01), tol);
+    REQUIRE(shifted.overlap < 0.1);
+
+    // A different object (sphere, r = 3 cm) sitting in the corner.
+    PointCloud sphere;
+    for (int i = 0; i < 40; ++i) {
+        for (int j = 0; j < 80; ++j) {
+            const double th = 3.14159265358979 * (i + 0.5) / 40.0;
+            const double ph = 2.0 * 3.14159265358979 * j / 80.0;
+            sphere.points.push_back(Point{static_cast<float>(0.03 + 0.03 * std::sin(th) * std::cos(ph)),
+                                          static_cast<float>(0.03 + 0.03 * std::sin(th) * std::sin(ph)),
+                                          static_cast<float>(0.27 + 0.03 * std::cos(th))});
+        }
+    }
+    const AlignmentQuality other =
+        evaluateAlignment(sphere, target, RigidTransform::identity(), tol);
+    REQUIRE(other.overlap < 0.3);
+}

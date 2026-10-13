@@ -223,10 +223,24 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
     int state = 0;
     double fitness = 0.0;
     int modelPoints = 0;
+    int signalTracked = 0;
+    int signalLost = 0;
     QObject::connect(&pipeline, &revoscan::processing::ScanPipeline::trackingChanged,
-                     [&](int s) { state = s; });
+                     [&](int s) {
+                         state = s;
+                         signalTracked += s == 1;
+                         signalLost += s == 2;
+                     });
+    // ALL3DSCAN_REPLAY_REALTIME=1: feed frames at the camera rate (~15 fps)
+    // without waiting, as live; the pipeline drops what it cannot keep up with.
+    const bool realtime = std::getenv("ALL3DSCAN_REPLAY_REALTIME") != nullptr;
+    const auto replayStart = std::chrono::steady_clock::now();
     QObject::connect(&pipeline, &revoscan::processing::ScanPipeline::statsUpdated,
                      [&](double f, int pts, int) { fitness = f; modelPoints = pts; });
+    bool relocalized = false;
+    int relocalizations = 0;
+    QObject::connect(&pipeline, &revoscan::processing::ScanPipeline::relocalized,
+                     [&] { relocalized = true; ++relocalizations; });
 
     int tracked = 0;
     int lost = 0;
@@ -257,6 +271,20 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
         // ALL3DSCAN_REPLAY_ORBIT_DEG=<deg/frame>: simulate the scanner orbiting
         // the object (rotation about the vertical axis through the cloud
         // centroid) so tracking can be checked against a known motion.
+        // ALL3DSCAN_REPLAY_BLACKOUT=a,b,r: frames a..b arrive empty (scanner
+        // pointed away); afterwards the orbit resumes r frames back, i.e. the
+        // scanner returns to an area already scanned (relocalization test).
+        int orbitIndex = i;
+        if (const char* blackout = std::getenv("ALL3DSCAN_REPLAY_BLACKOUT")) {
+            int a = -1, b = -1, r = 0;
+            if (std::sscanf(blackout, "%d,%d,%d", &a, &b, &r) == 3) {
+                if (i >= a && i <= b) {
+                    cloud.points.clear();
+                } else if (i > b) {
+                    orbitIndex = i - r;
+                }
+            }
+        }
         if (const char* orbit = std::getenv("ALL3DSCAN_REPLAY_ORBIT_DEG")) {
             static double cx = 0, cz = 0;
             if (i == 0 && !cloud.points.empty()) {
@@ -264,7 +292,7 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
                 cx /= cloud.points.size();
                 cz /= cloud.points.size();
             }
-            const double a = std::atof(orbit) * i * 3.14159265358979 / 180.0;
+            const double a = std::atof(orbit) * orbitIndex * 3.14159265358979 / 180.0;
             const double c = std::cos(a), sn = std::sin(a);
             for (auto& p : cloud.points) {
                 const double x = p.x - cx, z = p.z - cz;
@@ -275,7 +303,15 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
         const uint64_t before = pipeline.framesProcessed();
         const auto submitted = std::chrono::steady_clock::now();
         state = -1;
+        relocalized = false;
         pipeline.submitMetricFrame(cloud, *metric, cal.depth, raw.timestampUs);
+        if (realtime) {
+            const auto due = replayStart + std::chrono::milliseconds(66 * (i + 1));
+            while (std::chrono::steady_clock::now() < due) {
+                app.processEvents(QEventLoop::AllEvents, 2);
+            }
+            continue;
+        }
         while (pipeline.framesProcessed() == before) {
             app.processEvents(QEventLoop::AllEvents, 5);
         }
@@ -283,15 +319,32 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
         tracked += state == static_cast<int>(revoscan::processing::TrackingState::Tracking);
         lost += state == static_cast<int>(revoscan::processing::TrackingState::Lost);
         std::cout << i << ' '
-                  << (state == 1 ? "TRACK" : state == 2 ? "LOST " : "seed ")
+                  << (state == 1 ? (relocalized ? "RELOC" : "TRACK") : state == 2 ? "LOST " : "seed ")
                   << " fit=" << fitness << " pts=" << cloud.points.size()
                   << " model=" << modelPoints << " ms="
                   << std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - submitted).count()
                   << std::endl;
     }
+    if (realtime) {
+        // Drain what is still queued.
+        uint64_t seen = pipeline.framesProcessed();
+        auto quietSince = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - quietSince < std::chrono::milliseconds(500)) {
+            app.processEvents(QEventLoop::AllEvents, 5);
+            if (pipeline.framesProcessed() != seen) {
+                seen = pipeline.framesProcessed();
+                quietSince = std::chrono::steady_clock::now();
+            }
+        }
+        std::cout << "realtime: processed=" << seen << " of " << files.size()
+                  << " tracked=" << signalTracked << " lost=" << signalLost << " | ";
+        tracked = signalTracked;
+        lost = signalLost;
+    }
     std::cout << "summary: frames=" << files.size() << " tracked=" << tracked
-              << " lost=" << lost << " model=" << document.cloud().points.size();
+              << " lost=" << lost << " relocalized=" << relocalizations
+              << " model=" << document.cloud().points.size();
     if (std::getenv("ALL3DSCAN_REPLAY_ORBIT_DEG")) {
         // Every frame is the same surface moved by a known orbit, so a correctly
         // registered model lies on frame 0's surface: score how much of it does.
@@ -382,7 +435,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261013-2242");
+    QApplication::setApplicationVersion("Alpha-v20261013-2327");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme

@@ -4,6 +4,35 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261013-2327
+
+### Added
+- **Automatic alignment while scanning.**
+  - Each frame starts from a predicted pose (the last motion, damped), then
+    runs a coarse alignment and a fine one.
+  - A frame is fused only if at least 30% of it lies within 4 mm of the
+    scanned surface, with an error of 2.5 mm or less. The old check counted
+    anything within 35 mm, so badly placed frames got fused and doubled
+    surfaces.
+  - **Auto re-align:** when tracking is lost, each new frame is tried
+    against the poses of earlier keyframes. Move back over an area you
+    already scanned and the scan continues by itself. Tested with simulated
+    jumps of up to 72°, with no loss of accuracy.
+  - The tracking bar says what to do when tracking is LOST and shows
+    "(re-aligned)" when the scan snaps back in.
+- Replay test options: `ALL3DSCAN_REPLAY_REALTIME=1` (feed frames at camera
+  rate, as live) and `ALL3DSCAN_REPLAY_BLACKOUT=a,b,r` (blank frames a..b,
+  then resume r frames back).
+
+### Fixed
+- **Tracking ran far slower than it should.** The decoder and the tracker
+  each started a full set of CPU threads on the same cores, and the two
+  stalled each other, making alignment about 20× slower. Each now uses half
+  the cores. On a real recording played at camera speed, 367 of 400 frames
+  are processed (167 before).
+- Camera poses could slowly stop being rigid transforms. They are now kept
+  rigid after every step.
+
 ## Alpha-v20261013-2242
 
 ### Added

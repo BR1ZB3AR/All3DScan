@@ -27,6 +27,25 @@ struct RigidTransform {
     double rotationAngle() const;
 };
 
+// OpenMP team size for parallel work started from the calling thread (a
+// per-thread setting; 0 = half the logical CPUs). The decoder and the tracker
+// run at the same time: two full-size teams on the same cores stall each
+// other's barriers, making ICP ~20x slower than with a smaller team.
+// ALL3DSCAN_TRACK_THREADS overrides. Returns the team size used.
+int limitParallelThreadsForCallingThread(int threads = 0);
+
+// Rigid inverse (R^T, -R^T t).
+RigidTransform inverted(const RigidTransform& t);
+
+// Nearest rotation (Gram-Schmidt) with the same translation. Chained pose
+// arithmetic slowly loses orthonormality; R^T stops being the inverse and
+// prediction then amplifies the error, so poses are re-projected.
+RigidTransform orthonormalized(const RigidTransform& t);
+
+// `delta` with its rotation angle and translation scaled by s (s=1: same
+// motion, 0: identity) — for damping a predicted inter-frame motion.
+RigidTransform scaledMotion(const RigidTransform& delta, double s);
+
 void transformInPlace(pointcloud::PointCloud& cloud, const RigidTransform& t);
 pointcloud::PointCloud transformed(const pointcloud::PointCloud& cloud,
                                    const RigidTransform& t);
@@ -97,5 +116,20 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
                           const PlaneIcpTarget& target,
                           const RigidTransform& init = {},
                           const IcpOptions& opts = {});
+
+// How well `source`, moved by `pose`, sits on the target surface: the share
+// of source points within `toleranceM` of a target point, and the RMS
+// distance of those points. Unlike IcpResult::fitness (measured at the ICP
+// search radius, tens of mm) this separates a real fit from a frame that
+// merely lies near a big model.
+struct AlignmentQuality {
+    double overlap = 0.0; // [0,1]
+    double rmseM = 0.0;
+    std::size_t inliers = 0;
+};
+AlignmentQuality evaluateAlignment(const pointcloud::PointCloud& source,
+                                   const PlaneIcpTarget& target,
+                                   const RigidTransform& pose,
+                                   double toleranceM);
 
 } // namespace revoscan::processing

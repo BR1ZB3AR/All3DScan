@@ -123,6 +123,7 @@ private:
     // onCompleteFinished so nothing resets the pipeline mid-build.
     std::thread completeThread_;
     bool completing_ = false;
+    QElapsedTimer relocalizedAt_; // last automatic re-alignment, for the HUD
     QPushButton* cancelButton_ = nullptr;
     QPushButton* newScanButton_ = nullptr;
     QPushButton* colorButton_ = nullptr;
