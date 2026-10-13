@@ -85,7 +85,7 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "appimage" ]]; then
     --appdir "${APPDIR}" \
     --executable "${APPDIR}/usr/bin/all3dscan" \
     --desktop-file "${APPDIR}/usr/share/applications/io.github.all3dscan.All3DScan.desktop" \
-    --icon-file "${APPDIR}/usr/share/icons/hicolor/scalable/apps/io.github.all3dscan.All3DScan.svg" \
+    --icon-file "${APPDIR}/usr/share/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png" \
     --plugin qt \
     --output appimage
 fi

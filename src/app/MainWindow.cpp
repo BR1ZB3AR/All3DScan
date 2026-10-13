@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "ArOverlayView.h"
 
+#include <QApplication>
 #include <QComboBox>
 #include <QDialog>
 #include <QFileDialog>
@@ -474,11 +475,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     fpsTimer_.start();
     updateControlStates();
 
-    // Set a recognizable window icon (use Qt's built-in media-record icon as
-    // a placeholder until a proper icon resource is packaged).
-    setWindowIcon(QIcon::fromTheme(
-        "camera-photo",
-        style()->standardIcon(QStyle::SP_ComputerIcon)));
+    // App logo (set on QApplication in main()).
+    setWindowIcon(QApplication::windowIcon());
 }
 
 MainWindow::~MainWindow() {
@@ -545,14 +543,24 @@ void MainWindow::onAbout() {
     aboutLayout->setContentsMargins(14, 14, 14, 14);
     aboutLayout->setSpacing(10);
 
+    auto* header = new QHBoxLayout();
+    header->setSpacing(14);
+    auto* logoLabel = new QLabel(aboutWidget);
+    logoLabel->setPixmap(QApplication::windowIcon().pixmap(96, 96));
+    logoLabel->setFixedSize(96, 96);
+    header->addWidget(logoLabel, 0, Qt::AlignTop);
+    auto* headerText = new QVBoxLayout();
     auto* titleLabel = new QLabel(
         tr("<h2 style='color:#12b6b0; margin:0;'>All3DScan</h2>"
            "<p style='color:#8b9198; font-size:12px; margin:2px 0 0 0;'>Open-Source Native Linux 3D Scanning Application</p>"),
         aboutWidget);
-    aboutLayout->addWidget(titleLabel);
-
-    auto* verLabel = new QLabel(tr("<b>Version:</b> Alpha-v20260802-1557"), aboutWidget);
-    aboutLayout->addWidget(verLabel);
+    headerText->addWidget(titleLabel);
+    auto* verLabel = new QLabel(
+        tr("<b>Version:</b> %1").arg(QApplication::applicationVersion()), aboutWidget);
+    headerText->addWidget(verLabel);
+    headerText->addStretch(1);
+    header->addLayout(headerText, 1);
+    aboutLayout->addLayout(header);
 
     auto* descText = new QTextBrowser(aboutWidget);
     descText->setOpenExternalLinks(true);

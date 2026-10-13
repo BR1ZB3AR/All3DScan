@@ -4,6 +4,19 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261013-2159
+
+### Changed
+- **New app logo.** It is used for the menu entry, the taskbar and window
+  icon, the About dialog (with the live version number instead of a stale
+  hard-coded one) and the README. It is installed as hicolor PNG icons
+  (16-512 px), with a 1024 px master in `resources/branding/`. The old
+  placeholder SVG and the generic "camera-photo" window icon are gone.
+
+### Fixed
+- Complete builds the mesh in the background instead of freezing the window.
+- Data race between scan fusion and the UI that crashed the 3D view.
+
 ## Alpha-v20261013-2133
 
 ### Added

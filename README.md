@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/branding/all3dscan-logo.jpg" alt="All3DScan logo" width="320">
+</p>
+
 # All3DScan — Open-Source Native Linux 3D Scanning App
 [Project Still Under-Development]
 

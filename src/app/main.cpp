@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
+#include <QIcon>
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include "pointcloud/PointCloud.h"
 #include "processing/Registration.h"
 #include "processing/ScanPipeline.h"
+#include "util/ResourcePaths.h"
 #include "protocol/ScannerProtocol.h"
 
 namespace {
@@ -324,10 +326,22 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261013-2133");
+    QApplication::setApplicationVersion("Alpha-v20261013-2159");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
-    // No window / taskbar logo — plain Qt default decoration.
+    // App logo for windows, dialogs and the taskbar: the installed icon theme
+    // entry when present, else the PNG shipped next to the binary/sources.
+    {
+        QIcon icon = QIcon::fromTheme(QStringLiteral("io.github.all3dscan.All3DScan"));
+        if (icon.isNull()) {
+            if (const auto path = revoscan::util::findAppIcon()) {
+                icon = QIcon(QString::fromStdString(*path));
+            }
+        }
+        if (!icon.isNull()) {
+            QApplication::setWindowIcon(icon);
+        }
+    }
 
     revoscan::app::MainWindow window;
     window.show();

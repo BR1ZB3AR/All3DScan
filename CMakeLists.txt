@@ -249,9 +249,10 @@ install(
     FILES ${CMAKE_BINARY_DIR}/io.github.all3dscan.All3DScan.desktop
     DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
 )
+# App logo in the standard hicolor sizes (16-512 px PNG).
 install(
-    FILES resources/io.github.all3dscan.All3DScan.svg
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
+    DIRECTORY resources/icons/hicolor
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons
 )
 install(
     FILES resources/io.github.all3dscan.All3DScan.metainfo.xml

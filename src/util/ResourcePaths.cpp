@@ -130,11 +130,11 @@ std::optional<std::string> findMeshWorkerScript() {
 
 std::optional<std::string> findAppIcon() {
     return findDataFile(
-        "icons/hicolor/scalable/apps/io.github.all3dscan.All3DScan.svg",
+        "icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png",
         {
-            "resources/io.github.all3dscan.All3DScan.svg",
-            "../resources/io.github.all3dscan.All3DScan.svg",
-            "/usr/share/icons/hicolor/scalable/apps/io.github.all3dscan.All3DScan.svg",
+            "resources/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png",
+            "../resources/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png",
+            "/usr/share/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png",
         });
 }
 
