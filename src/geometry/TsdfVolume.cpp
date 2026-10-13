@@ -101,12 +101,35 @@ void TsdfVolume::integrate(const std::vector<uint16_t>& depthMm,
 TriangleMesh TsdfVolume::extractMesh() const {
     TriangleMesh mesh;
     mesh.metric = true;
-    const int cx = nx_ - 1, cy = ny_ - 1, cz = nz_ - 1; // cells between voxel centres
-    auto cellIndex = [&](int x, int y, int z) {
-        return (static_cast<size_t>(z) * cy + y) * cx + x;
-    };
-    std::vector<int32_t> cellVertex(static_cast<size_t>(cx) * cy * cz, -1);
     auto observed = [&](const Voxel& v) { return v.weight >= params_.minWeight; };
+
+    // Only the observed sub-box can hold surface: during a live scan most of
+    // the volume is still empty, so this keeps periodic extraction cheap.
+    int lo[3] = {nx_, ny_, nz_};
+    int hi[3] = {-1, -1, -1};
+    for (int z = 0; z < nz_; ++z) {
+        for (int y = 0; y < ny_; ++y) {
+            for (int x = 0; x < nx_; ++x) {
+                if (observed(voxels_[index(x, y, z)])) {
+                    lo[0] = std::min(lo[0], x);
+                    lo[1] = std::min(lo[1], y);
+                    lo[2] = std::min(lo[2], z);
+                    hi[0] = std::max(hi[0], x);
+                    hi[1] = std::max(hi[1], y);
+                    hi[2] = std::max(hi[2], z);
+                }
+            }
+        }
+    }
+    // Cells span voxel pairs, so cell indices run lo..hi-1 on each axis.
+    const int bx = hi[0] - lo[0], by = hi[1] - lo[1], bz = hi[2] - lo[2];
+    if (bx < 1 || by < 1 || bz < 1) {
+        return mesh;
+    }
+    auto cellIndex = [&](int x, int y, int z) {
+        return (static_cast<size_t>(z - lo[2]) * by + (y - lo[1])) * bx + (x - lo[0]);
+    };
+    std::vector<int32_t> cellVertex(static_cast<size_t>(bx) * by * bz, -1);
 
     // 1. One vertex per cell whose 8 observed corners straddle the surface,
     //    at the mean of its edge zero-crossings.
@@ -114,9 +137,9 @@ TriangleMesh TsdfVolume::extractMesh() const {
                                           {0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}};
     static constexpr int kEdge[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
                                          {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
-    for (int z = 0; z < cz; ++z) {
-        for (int y = 0; y < cy; ++y) {
-            for (int x = 0; x < cx; ++x) {
+    for (int z = lo[2]; z < hi[2]; ++z) {
+        for (int y = lo[1]; y < hi[1]; ++y) {
+            for (int x = lo[0]; x < hi[0]; ++x) {
                 float s[8];
                 const Voxel* c[8];
                 bool ok = true;
@@ -165,9 +188,9 @@ TriangleMesh TsdfVolume::extractMesh() const {
     //    For an edge along axis a, the other axes (b, c) are taken cyclically so
     //    the quad's right-hand normal points along +a; flip when the start
     //    voxel is outside (normals point from inside to outside).
-    for (int z = 0; z < nz_; ++z) {
-        for (int y = 0; y < ny_; ++y) {
-            for (int x = 0; x < nx_; ++x) {
+    for (int z = lo[2]; z <= hi[2]; ++z) {
+        for (int y = lo[1]; y <= hi[1]; ++y) {
+            for (int x = lo[0]; x <= hi[0]; ++x) {
                 const Voxel& v0 = voxels_[index(x, y, z)];
                 if (!observed(v0)) {
                     continue;
@@ -191,8 +214,8 @@ TriangleMesh TsdfVolume::extractMesh() const {
                         int cell[3] = {x, y, z};
                         cell[b] += kOff[i][0];
                         cell[c] += kOff[i][1];
-                        if (cell[0] < 0 || cell[1] < 0 || cell[2] < 0 || cell[0] >= cx ||
-                            cell[1] >= cy || cell[2] >= cz) {
+                        if (cell[0] < lo[0] || cell[1] < lo[1] || cell[2] < lo[2] ||
+                            cell[0] >= hi[0] || cell[1] >= hi[1] || cell[2] >= hi[2]) {
                             ok = false;
                             break;
                         }
@@ -338,6 +361,79 @@ size_t cleanMesh(TriangleMesh& mesh,
     }
     mesh = std::move(out);
     return trisBefore - mesh.triangleCount();
+}
+
+void smoothMeshTaubin(TriangleMesh& mesh, int iterations, float lambda, float mu) {
+    const size_t n = mesh.vertices.size();
+    if (n == 0 || mesh.indices.size() < 3 || iterations <= 0) {
+        return;
+    }
+    // Vertex adjacency (CSR) from triangle edges.
+    std::vector<uint32_t> degree(n, 0);
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        for (int k = 0; k < 3; ++k) {
+            degree[mesh.indices[t + k]] += 2;
+        }
+    }
+    std::vector<size_t> start(n + 1, 0);
+    for (size_t i = 0; i < n; ++i) {
+        start[i + 1] = start[i] + degree[i];
+    }
+    std::vector<uint32_t> nbr(start[n]);
+    std::vector<size_t> fill(start.begin(), start.end() - 1);
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        const uint32_t a = mesh.indices[t], b = mesh.indices[t + 1], c = mesh.indices[t + 2];
+        nbr[fill[a]++] = b;
+        nbr[fill[a]++] = c;
+        nbr[fill[b]++] = a;
+        nbr[fill[b]++] = c;
+        nbr[fill[c]++] = a;
+        nbr[fill[c]++] = b;
+    }
+    std::vector<float> pos(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        pos[i * 3 + 0] = mesh.vertices[i].x;
+        pos[i * 3 + 1] = mesh.vertices[i].y;
+        pos[i * 3 + 2] = mesh.vertices[i].z;
+    }
+    std::vector<float> next(pos.size());
+    auto step = [&](float factor) {
+#pragma omp parallel for schedule(static)
+        for (long i = 0; i < static_cast<long>(n); ++i) {
+            const size_t b = start[static_cast<size_t>(i)], e = start[static_cast<size_t>(i) + 1];
+            float* out = &next[static_cast<size_t>(i) * 3];
+            const float* p = &pos[static_cast<size_t>(i) * 3];
+            if (b == e) {
+                out[0] = p[0];
+                out[1] = p[1];
+                out[2] = p[2];
+                continue;
+            }
+            // Duplicated edges weight shared neighbours twice, which is fine for
+            // a uniform umbrella operator on near-regular Surface Nets meshes.
+            float sx = 0, sy = 0, sz = 0;
+            for (size_t j = b; j < e; ++j) {
+                const float* q = &pos[static_cast<size_t>(nbr[j]) * 3];
+                sx += q[0];
+                sy += q[1];
+                sz += q[2];
+            }
+            const float inv = 1.0f / static_cast<float>(e - b);
+            out[0] = p[0] + factor * (sx * inv - p[0]);
+            out[1] = p[1] + factor * (sy * inv - p[1]);
+            out[2] = p[2] + factor * (sz * inv - p[2]);
+        }
+        pos.swap(next);
+    };
+    for (int it = 0; it < iterations; ++it) {
+        step(lambda);
+        step(mu);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        mesh.vertices[i].x = pos[i * 3 + 0];
+        mesh.vertices[i].y = pos[i * 3 + 1];
+        mesh.vertices[i].z = pos[i * 3 + 2];
+    }
 }
 
 } // namespace revoscan::geometry

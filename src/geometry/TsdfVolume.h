@@ -87,4 +87,10 @@ size_t cleanMesh(TriangleMesh& mesh,
                  float nearM = 0.004f,
                  float minComponentShare = 0.02f);
 
+// Taubin λ|μ smoothing: alternating shrink (λ > 0) and inflate (μ < 0)
+// Laplacian steps remove high-frequency noise without the shrinkage of plain
+// Laplacian smoothing. Edits vertex positions in place.
+void smoothMeshTaubin(TriangleMesh& mesh, int iterations = 8, float lambda = 0.5f,
+                      float mu = -0.53f);
+
 } // namespace revoscan::geometry

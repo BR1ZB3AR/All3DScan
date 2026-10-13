@@ -1135,8 +1135,8 @@ QWidget* MainWindow::buildViewport() {
     liveMeshButton_->setCheckable(true);
     liveMeshButton_->setChecked(liveMeshPreview_);
     liveMeshButton_->setToolTip(
-        tr("Shaded triangle mesh preview built from depth during scanning.\n"
-           "Requires Live Fusion. Off = point-cloud view only."));
+        tr("Live 3D polygon model: tracked frames are fused into a volume and\n"
+           "re-meshed about twice a second. Off = point-cloud view."));
     ch->addWidget(liveMeshButton_);
 
     arOverlayButton_ = new QPushButton(tr("AR Overlay"), controls);
@@ -1710,12 +1710,22 @@ void MainWindow::refreshScanView() {
         (document_.isMetric() || liveFusion_) && !document_.cloud().points.empty();
     const auto& cloud = showFused ? document_.cloud() : controller_->lastCloud();
     view_->setColorEnabled(useColor_);
-    view_->setPointCloud(cloud);
 
-    const bool showLiveMesh =
-        liveFusion_ && liveMeshPreview_ && pipeline_ && pipeline_->hasLiveMesh();
+    // Live polygon model (TSDF) whenever it exists. Metric frames are always
+    // fused, so this no longer depends on the Live Fusion toggle. Only
+    // re-upload when the pipeline published a new mesh or colour changed.
+    const bool showLiveMesh = liveMeshPreview_ && pipeline_ && pipeline_->hasLiveMesh();
     if (showLiveMesh) {
-        view_->setMesh(pipeline_->liveMesh(), useColor_);
+        const uint64_t rev = pipeline_->liveMeshRevision();
+        if (!showingLiveMesh_ || rev != shownLiveMeshRev_ || useColor_ != shownLiveMeshColor_) {
+            view_->setMesh(pipeline_->liveMesh(), useColor_);
+            shownLiveMeshRev_ = rev;
+            shownLiveMeshColor_ = useColor_;
+            showingLiveMesh_ = true;
+        }
+    } else {
+        view_->setPointCloud(cloud);
+        showingLiveMesh_ = false;
     }
 
     const auto& cloudForGauge =

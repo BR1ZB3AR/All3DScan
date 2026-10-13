@@ -152,7 +152,10 @@ private:
     bool scanning_ = false;
     bool useColor_ = true;
     bool liveFusion_ = true;
-    bool liveMeshPreview_ = false;
+    bool liveMeshPreview_ = true; // show the live polygon model by default
+    bool showingLiveMesh_ = false;
+    bool shownLiveMeshColor_ = false;
+    uint64_t shownLiveMeshRev_ = 0;
     bool objectIsolation_ = true;
     bool shortcutOverlayVisible_ = false;
 

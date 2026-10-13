@@ -18,7 +18,6 @@
 
 #include "bridge/PythonWorker.h"
 #include "geometry/TsdfVolume.h"
-#include "geometry/DepthMesh.h"
 #include "io/GeometryExport.h"
 #include "processing/Registration.h"
 
@@ -42,10 +41,13 @@ constexpr size_t kMaxIcpSourcePoints = 8000;  // strided ICP source subset
 constexpr float kWideCorrDistM = 0.120f;
 constexpr float kMaxRmseM = 0.025f; // reject alignments noisier than ~25 mm
 constexpr int kMaxLostBeforeIdle = 15;
-constexpr auto kLiveMeshMinInterval = std::chrono::milliseconds(350);
+constexpr auto kLiveMeshMinInterval = std::chrono::milliseconds(500);
+constexpr float kLiveVolumeVoxelM = 0.002f;           // live TSDF resolution
+// Taubin rounds: per-frame depth noise is ~3 mm RMS at 30 cm (speckle SGM).
+constexpr int kLiveMeshSmoothIterations = 6;
+constexpr int kFinalMeshSmoothIterations = 10;
+constexpr size_t kLiveVolumeMaxVoxels = 8u * 1000u * 1000u; // ~96 MB
 constexpr auto kUiUpdateMinInterval = std::chrono::milliseconds(66); // ~15 Hz view
-constexpr float kLiveMeshVoxelM = 0.003f;
-constexpr size_t kLiveMeshMaxVerts = 60000;
 
 // ALL3DSCAN_TRACK_PROFILE=1 prints per-stage timings for each frame.
 struct StageTimer {
@@ -322,6 +324,7 @@ public slots:
     }
 
     uint64_t processedCount() const { return processed_.load(std::memory_order_acquire); }
+    uint64_t liveMeshRevision() const { return liveMeshRevision_.load(std::memory_order_acquire); }
 
 signals:
     void updated();
@@ -376,46 +379,83 @@ private:
         emit updated();
     }
 
-    void updateLiveMesh(const Item& item, const RigidTransform& pose,
-                        float nearM, float farM) {
-        if (!item.hasDepth || item.depthMm.empty() || item.width < 2 ||
-            item.height < 2) {
+    // Live polygon model: each tracked frame's object pixels are fused into a
+    // TSDF cube around the object, and a Surface Nets mesh is re-extracted at
+    // most every kLiveMeshMinInterval. This replaces a per-frame depth-grid
+    // triangulation welded together, which layered noisy copies of every view
+    // (and the desk) into a triangle soup instead of one surface.
+    void updateLiveMesh(const Item& item, const RigidTransform& pose) {
+        if (!item.hasDepth || item.depthMm.empty() || item.width < 2 || item.height < 2 ||
+            item.intrinsics.fx <= 0.0 || item.intrinsics.fy <= 0.0 ||
+            item.depthMm.size() != static_cast<size_t>(item.width) * item.height) {
             return;
         }
+        // Object-only depth: keep the pixels whose point survived isolation and
+        // ground removal (item.cloud is still in camera coordinates).
+        const auto& k = item.intrinsics;
+        std::vector<uint16_t> masked(item.depthMm.size(), 0);
+        float lo[3] = {1e9f, 1e9f, 1e9f};
+        float hi[3] = {-1e9f, -1e9f, -1e9f};
+        for (const auto& p : item.cloud.points) {
+            if (p.z <= 0.0f) {
+                continue;
+            }
+            const long u = std::lround(k.fx * p.x / p.z + k.cx);
+            const long v = std::lround(k.fy * p.y / p.z + k.cy);
+            if (u < 0 || v < 0 || u >= static_cast<long>(item.width) ||
+                v >= static_cast<long>(item.height)) {
+                continue;
+            }
+            const size_t i = static_cast<size_t>(v) * item.width + static_cast<size_t>(u);
+            masked[i] = item.depthMm[i];
+            lo[0] = std::min(lo[0], p.x);
+            lo[1] = std::min(lo[1], p.y);
+            lo[2] = std::min(lo[2], p.z);
+            hi[0] = std::max(hi[0], p.x);
+            hi[1] = std::max(hi[1], p.y);
+            hi[2] = std::max(hi[2], p.z);
+        }
+        if (!liveVolume_) {
+            if (hi[0] < lo[0]) {
+                return;
+            }
+            // Cube centred on the first view's object, sized to it.
+            const double c[3] = {(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5,
+                                 (lo[2] + hi[2]) * 0.5};
+            const auto& m = pose.m;
+            const double wc[3] = {m[0] * c[0] + m[1] * c[1] + m[2] * c[2] + m[3],
+                                  m[4] * c[0] + m[5] * c[1] + m[6] * c[2] + m[7],
+                                  m[8] * c[0] + m[9] * c[1] + m[10] * c[2] + m[11]};
+            const float extent = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]});
+            const float side = std::clamp(1.6f * extent + 0.08f, 0.20f, 0.50f);
+            geometry::TsdfParams params;
+            params.voxelM = kLiveVolumeVoxelM;
+            params.maxVoxels = kLiveVolumeMaxVoxels;
+            params.minWeight = 2.0f;
+            params.minDepthM = nearClip_ ? nearClip_->load() : 0.10f;
+            params.maxDepthM = farClip_ ? farClip_->load() : 0.80f;
+            const float h = side * 0.5f;
+            liveVolume_ = std::make_unique<geometry::TsdfVolume>(
+                std::array<float, 3>{static_cast<float>(wc[0]) - h, static_cast<float>(wc[1]) - h,
+                                     static_cast<float>(wc[2]) - h},
+                std::array<float, 3>{static_cast<float>(wc[0]) + h, static_cast<float>(wc[1]) + h,
+                                     static_cast<float>(wc[2]) + h},
+                params);
+        }
+        liveVolume_->integrate(masked, item.rgb, item.width, item.height, k, pose.m);
+
         const auto now = std::chrono::steady_clock::now();
         if (lastLiveMeshEmit_.time_since_epoch().count() != 0 &&
             now - lastLiveMeshEmit_ < kLiveMeshMinInterval) {
             return;
         }
-
-        geometry::DepthMeshOptions opts;
-        opts.stride = 2;
-        opts.maxEdgeLengthM = 0.035f;
-        opts.nearM = nearM;
-        opts.farM = farM;
-        const uint8_t* rgbPtr =
-            item.rgb.size() ==
-                    static_cast<size_t>(item.width) * item.height * 3
-                ? item.rgb.data()
-                : nullptr;
-        geometry::TriangleMesh frameMesh = geometry::meshFromOrganizedDepth(
-            item.depthMm.data(), item.width, item.height, item.intrinsics, rgbPtr,
-            item.rgb.size(), opts);
-        if (frameMesh.empty()) {
-            return;
-        }
-        {
-            pointcloud::PointCloud tmp;
-            tmp.points = std::move(frameMesh.vertices);
-            transformInPlace(tmp, pose);
-            frameMesh.vertices = std::move(tmp.points);
-        }
-
+        geometry::TriangleMesh mesh = liveVolume_->extractMesh();
+        geometry::smoothMeshTaubin(mesh, kLiveMeshSmoothIterations);
         {
             QMutexLocker lock(&liveMeshMutex_);
-            geometry::mergeMeshVoxel(liveMesh_, frameMesh, kLiveMeshVoxelM,
-                                     kLiveMeshMaxVerts);
+            liveMesh_ = std::move(mesh);
         }
+        liveMeshRevision_.fetch_add(1, std::memory_order_release);
         lastLiveMeshEmit_ = now;
         emit liveMeshReady();
     }
@@ -559,9 +599,7 @@ private:
                 voxelDownsample(item.cloud, modelVoxelM());
             seedModel(seed, item.metric);
             maybeCaptureKeyframe(item, RigidTransform::identity(), 1.0);
-            updateLiveMesh(item, RigidTransform::identity(),
-                           nearClip_ ? nearClip_->load() : 0.15f,
-                           farClip_ ? farClip_->load() : 0.60f);
+            updateLiveMesh(item, RigidTransform::identity());
             return;
         }
 
@@ -591,9 +629,7 @@ private:
         timer.mark("fuse");
         maybeCaptureKeyframe(item, r.transform, r.fitness);
         timer.mark("keyframe");
-        updateLiveMesh(item, r.transform,
-                       nearClip_ ? nearClip_->load() : 0.15f,
-                       farClip_ ? farClip_->load() : 0.60f);
+        updateLiveMesh(item, r.transform);
         timer.mark("liveMesh");
         emit trackingState(static_cast<int>(TrackingState::Tracking));
         emitLiveStats(r.fitness);
@@ -669,6 +705,8 @@ private:
 
     QMutex liveMeshMutex_;
     geometry::TriangleMesh liveMesh_;
+    std::unique_ptr<geometry::TsdfVolume> liveVolume_;
+    std::atomic<uint64_t> liveMeshRevision_{0};
     std::chrono::steady_clock::time_point lastLiveMeshEmit_{};
     std::chrono::steady_clock::time_point lastUiEmit_{};
 };
@@ -724,6 +762,10 @@ geometry::TriangleMesh ScanPipeline::liveMesh() const {
         return {};
     }
     return worker_->snapshotLiveMesh();
+}
+
+uint64_t ScanPipeline::liveMeshRevision() const {
+    return worker_ ? worker_->liveMeshRevision() : 0;
 }
 
 uint64_t ScanPipeline::framesProcessed() const {
@@ -837,6 +879,7 @@ bool ScanPipeline::completeAndMesh(const std::string& workerScript,
         // Base removal + floating-fragment cleanup against the tracked model.
         geometry::cleanMesh(mesh, document_->cloud(),
                             std::max(0.004f, 3.0f * params.voxelM));
+        geometry::smoothMeshTaubin(mesh, kFinalMeshSmoothIterations);
         if (!mesh.empty()) {
             document_->setMesh(std::move(mesh), true, "tsdf");
             return true;

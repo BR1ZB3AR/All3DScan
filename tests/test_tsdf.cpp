@@ -152,3 +152,46 @@ TEST_CASE("cleanMesh removes surface away from the model and small fragments") {
         REQUIRE(v.z < 0.31f);
     }
 }
+
+TEST_CASE("Taubin smoothing reduces noise without shrinking a sphere") {
+    const double views[6][2] = {{0, 0}, {kPi / 2, 0}, {kPi, 0}, {3 * kPi / 2, 0},
+                                {0, 1.3}, {0, -1.3}};
+    std::vector<std::vector<uint16_t>> depths(6);
+    std::vector<std::vector<uint8_t>> rgbs(6);
+    std::vector<geometry::TsdfFrame> frames;
+    for (int i = 0; i < 6; ++i) {
+        frames.push_back(renderSphere(views[i][0], views[i][1], depths[i], rgbs[i]));
+    }
+    pointcloud::PointCloud bounds;
+    bounds.points.push_back({-kRadius, -kRadius, -kRadius});
+    bounds.points.push_back({kRadius, kRadius, kRadius});
+    geometry::TsdfParams params;
+    params.voxelM = 0.002f;
+    auto mesh = geometry::reconstructTsdf(frames, bounds, 0.015f, params);
+    // Add deterministic radial noise of ±1 mm.
+    uint32_t state = 99;
+    for (auto& v : mesh.vertices) {
+        state = state * 1664525u + 1013904223u;
+        const float n = (static_cast<float>(state >> 8) / static_cast<float>(1u << 24) - 0.5f) * 0.002f;
+        const float r = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        v.x *= (r + n) / r;
+        v.y *= (r + n) / r;
+        v.z *= (r + n) / r;
+    }
+    auto radialStats = [&](double* meanR) {
+        double sum = 0, sum2 = 0;
+        for (const auto& v : mesh.vertices) {
+            const double r = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+            sum += r;
+            sum2 += (r - kRadius) * (r - kRadius);
+        }
+        *meanR = sum / mesh.vertices.size();
+        return std::sqrt(sum2 / mesh.vertices.size());
+    };
+    double meanBefore = 0, meanAfter = 0;
+    const double errBefore = radialStats(&meanBefore);
+    geometry::smoothMeshTaubin(mesh, 10);
+    const double errAfter = radialStats(&meanAfter);
+    REQUIRE(errAfter < errBefore * 0.6);
+    REQUIRE(std::fabs(meanAfter - kRadius) < 0.0005); // no shrinkage
+}

@@ -80,6 +80,9 @@ public:
     // Empty when fusion is off or no depth frames have been integrated yet.
     geometry::TriangleMesh liveMesh() const;
     bool hasLiveMesh() const;
+    // Bumped each time a new live mesh is published (lets the view skip
+    // re-uploading an unchanged mesh).
+    uint64_t liveMeshRevision() const;
     // Frames the worker has finished (for offline replay pacing).
     uint64_t framesProcessed() const;
 

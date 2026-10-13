@@ -274,6 +274,15 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
     if (plyOut && !revoscan::io::writePly(plyOut, document.cloud())) {
         std::cerr << "failed to write " << plyOut << '\n';
     }
+    // What the scan view shows with Live Mesh on.
+    if (const char* liveOut = std::getenv("ALL3DSCAN_REPLAY_LIVEMESH")) {
+        const auto live = pipeline.liveMesh();
+        std::cout << "live mesh: " << live.vertices.size() << " vertices, "
+                  << live.triangleCount() << " triangles\n";
+        if (!live.empty() && !revoscan::io::writePlyMesh(liveOut, live).ok) {
+            std::cerr << "failed to write " << liveOut << '\n';
+        }
+    }
     // Same as pressing Complete: volumetric mesh from the tracked keyframes.
     if (const char* meshOut = std::getenv("ALL3DSCAN_REPLAY_MESH")) {
         const auto t0 = std::chrono::steady_clock::now();
