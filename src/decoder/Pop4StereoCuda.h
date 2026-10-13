@@ -27,15 +27,19 @@ struct SgmParams {
     float textureMin = 1.5f;
 };
 
-// GPU port of Pop4DepthDecoder's matchCpu(): row-align the right speckle image
-// with `rectMapY` (320×512 source rows), blur, 7×7 census, 4-path SGM and
+// GPU port of Pop4DepthDecoder's matchCpu(): resample both speckle images
+// through their rectification maps (320×512 source x/y per output pixel),
+// blur, 7×7 census, 4-path SGM and
 // winner-take-all with uniqueness / sub-pixel / left-right / texture gates.
 // `leftY16` / `rightY16` are raw 320×512 Y16 images. Fills `disparity`
 // (320×512, <0 = invalid) and returns true; on failure returns false and sets
 // errorOut (device errors also disable CUDA for the process).
 bool computeDisparity(const uint16_t* leftY16,
                       const uint16_t* rightY16,
-                      const float* rectMapY,
+                      const float* mapLx,
+                      const float* mapLy,
+                      const float* mapRx,
+                      const float* mapRy,
                       const SgmParams& params,
                       std::vector<float>& disparity,
                       std::string* errorOut);

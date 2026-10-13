@@ -4,6 +4,27 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261013-2235
+
+### Fixed
+- **Calibration: the app now uses the scanner's own factory calibration.**
+  It is read from the scanner on Connect (`/data/camparam/camparam.yaml`,
+  over the vendor's read-only file channel) and cached per device. This
+  replaces the guessed 28 mm baseline and the fitted rectification.
+  - Real metric depth: 118.6 mm baseline, factory lens model.
+  - Correct vertical scale: the images are x/4, y/2 of the 1280×1024
+    sensors, so point clouds and meshes were stretched about 2× vertically
+    before.
+  - Flatter surfaces (19–30% less depth noise) and better tracking on real
+    scans (351/400 frames, was 332).
+  - CPU and CUDA decode stay byte-identical; without a factory file the
+    previous behaviour is unchanged.
+
+### Added
+- `all3dscan --read-device-file <path> <out>` (read-only file transfer from
+  the scanner) and `all3dscan --usb-reset`.
+- `ALL3DSCAN_CAMPARAM=<camparam.yaml>` for offline decode and replay.
+
 ## Alpha-v20261013-2159
 
 ### Changed

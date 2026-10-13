@@ -200,6 +200,88 @@ TEST_CASE("Pop4DepthDecoder CUDA matcher agrees with CPU") {
 }
 #endif
 
+TEST_CASE("Pop4DepthDecoder factory calibration gives metric depth f*B/d") {
+    // Rectification-free synthetic rig: identical cameras, R = I, baseline
+    // 40 mm along x, f = 1500 at 1280x1024 (375 px horizontally at 320x512).
+    const char* yaml = R"(%YAML:1.0
+---
+deviceID: "SYNTH"
+width: "1280"
+height: "1024"
+cameraMatrixL: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1500., 0., 640., 0., 1500., 512., 0., 0., 1. ]
+distCoeffL: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [ 0., 0., 0., 0., 0. ]
+cameraMatrixR: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1500., 0., 640., 0., 1500., 512., 0., 0., 1. ]
+distCoeffR: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [ 0., 0., 0., 0., 0. ]
+steroRotation: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+steroTranslation: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ -40., 0., 0. ]
+pL: !!opencv-matrix
+   rows: 3
+   cols: 4
+   dt: d
+   data: [ 1500., 0., 640., 0., 0., 1500., 512., 0., 0., 0., 1., 0. ]
+pR: !!opencv-matrix
+   rows: 3
+   cols: 4
+   dt: d
+   data: [ 1500., 0., 640., -60000., 0., 1500., 512., 0., 0., 0., 1., 0. ]
+)";
+    const auto rig = decoder::parseCamparamYaml(yaml);
+    REQUIRE(rig.has_value());
+    decoder::Pop4DepthDecoder decoder;
+    decoder.setStereoRig(*rig);
+    decoder.setDepthRange(200.0f, 650.0f);
+    const auto cal = decoder.factoryCalibration();
+    REQUIRE(cal.has_value());
+    REQUIRE(cal->source == "FactoryCamparam");
+    REQUIRE(std::fabs(cal->depth.fx - 375.0) < 1e-9);
+    REQUIRE(std::fabs(cal->depth.fy - 750.0) < 1e-9); // 1024 rows -> 512: y/2
+    REQUIRE(std::fabs(cal->baselineMm - 40.0) < 1e-9);
+
+    // The synthetic frame puts the left pattern in image 9; factory mode reads
+    // the left camera from image 4, so swap for this fixture.
+    setenv("ALL3DSCAN_POP4_SWAP_LR", "1", 1);
+    constexpr int disparity = 35;
+    const auto metric = decoder.decode(makeSyntheticSpeckleFrame(disparity));
+    unsetenv("ALL3DSCAN_POP4_SWAP_LR");
+    REQUIRE(metric.has_value());
+    const double expectedMm = 375.0 * 40.0 / disparity; // 428.6
+    uint32_t nonzero = 0;
+    uint32_t near = 0;
+    for (uint16_t d : metric->depthMm) {
+        if (d == 0) {
+            continue;
+        }
+        ++nonzero;
+        near += std::fabs(static_cast<double>(d) - expectedMm) < 3.0;
+    }
+    REQUIRE(nonzero > 320u * 512u / 2);
+    REQUIRE(near > nonzero * 95 / 100);
+}
+
 TEST_CASE("validateMetricPlane scales and accepts dense metric frames") {
     protocol::ScannerCalibration cal;
     cal.valid = true;

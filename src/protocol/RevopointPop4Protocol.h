@@ -2,6 +2,9 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace revoscan::protocol::pop4 {
 
@@ -28,5 +31,16 @@ std::array<uint8_t, 60> makeSettingsPayload(int32_t gain = 1,
                                             int32_t irLum = 130,
                                             int32_t crossLaserLight = 780,
                                             int32_t singleLaserLight = 706);
+
+// Read-only file transfer from the scanner's own filesystem, as the vendor
+// SDK's libuvcReadFile does (RevoScan 6.0.2.4 lib3DCamera.so @0x72c450):
+//   open : SET_CUR XU4 selector 1, 60 B = [0x01, path..., NUL]
+//   read : GET_CUR XU4 selector 2, 60 B = [len LE32 (<=56), data...], until len 0
+//   close: SET_CUR XU4 selector 1, 60 B of zeros
+// The factory calibration lives under /data/camparam/ (camparam.yaml, maps,
+// Q/P matrices). Must not run while the depth interface is claimed elsewhere.
+std::optional<std::vector<uint8_t>> readDeviceFile(const std::string& path,
+                                                   std::string* error = nullptr,
+                                                   size_t maxBytes = 8u << 20);
 
 } // namespace revoscan::protocol::pop4

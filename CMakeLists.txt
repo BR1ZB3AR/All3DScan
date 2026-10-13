@@ -74,6 +74,8 @@ target_compile_options(usb PRIVATE ${LIBUSB_CFLAGS_OTHER})
 set(DECODER_SOURCES
     src/decoder/Pop4DepthDecoder.h
     src/decoder/Pop4DepthDecoder.cpp
+    src/decoder/StereoRig.h
+    src/decoder/StereoRig.cpp
     src/decoder/Pop4StereoCuda.h
 )
 if(ALL3DSCAN_CUDA_ENABLED)

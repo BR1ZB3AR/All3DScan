@@ -52,7 +52,12 @@ async scan fusion / tracking UI, lighting & blue-laser control panel (enabled
 only for capture-backed capabilities — mock backend exercises the full UI),
 post-scan edit tools with undo/redo, and metric-safe PLY/OBJ/STL export.
 
-**POP4 depth decoding works (approximate scale).** The packed 640×2560 Y16
+**POP4 uses its own factory calibration.** On Connect the app reads
+`/data/camparam/camparam.yaml` from the scanner (read-only) and decodes with
+the real lens, rectification and 118.6 mm baseline, so depth is in true
+millimetres. See `docs/protocol/RE_NOTES.md` (2026-10-13).
+
+**POP4 depth decoding works.** The packed 640×2560 Y16
 frame turned out to be ten 320×512 images carrying a speckle stereo pair, not
 four-step phase. The decoder row-aligns the two cameras and runs census +
 semi-global matching. Absolute millimetres still rely on a provisional

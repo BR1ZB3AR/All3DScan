@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "decoder/StereoRig.h"
 #include "protocol/ScannerProtocol.h"
 
 namespace revoscan::decoder {
@@ -42,6 +43,15 @@ using DisparityBias = std::array<double, 3>;
 DisparityBias defaultPop4DisparityBias();
 constexpr DisparityBias kZeroDisparityBias{{0, 0, 0}};
 
+// Per-output-pixel source coordinates for the left and right speckle images.
+struct RectifyMaps {
+    std::vector<float> lx, ly, rx, ry;
+};
+
+// The POP4 delivers its 1280×1024 sensors as 320×512 images (x/4, y/2).
+constexpr double kRigScaleX = 0.25;
+constexpr double kRigScaleY = 0.5;
+
 // Converts packed POP4 vendor-raw Y16 into metric millimetre depth.
 //
 // The 640×2560 buffer is ten 320×512 images (row stride 320, not 640):
@@ -56,6 +66,16 @@ public:
     void setCalibration(const protocol::ScannerCalibration& calibration);
     void setRowRectification(const RowRectification& coeffs);
     void setDisparityBias(const DisparityBias& coeffs);
+
+    // Factory calibration (camparam.yaml from the scanner). When set it
+    // replaces the fitted row map / disparity bias / approximate Q entirely:
+    // both images are rectified with the factory model and depth uses the
+    // factory baseline and focal length.
+    void setStereoRig(const StereoRig& rig);
+    void clearStereoRig();
+    bool hasStereoRig() const { return rig_.has_value(); }
+    // Rectified-left intrinsics + Q (shift 0) on the 320×512 grid, if a rig is set.
+    std::optional<protocol::ScannerCalibration> factoryCalibration() const;
 
     // Working-distance band (millimetres). The disparity search range and the
     // final depth clamp are both derived from it via the stereo Q matrix.
@@ -85,10 +105,14 @@ public:
 
 private:
     void rebuildRectificationMap();
+    protocol::ScannerCalibration rigCalibration(double shift) const;
 
     protocol::ScannerCalibration calibration_;
     RowRectification rect_{};
-    std::vector<float> rectMapY_; // per output pixel: source row in raw right image
+    RectifyMaps maps_;
+    std::optional<StereoRig> rig_;
+    std::array<double, 9> rigR1_{}, rigR2_{};
+    double rigShift_ = 0.0;
     DisparityBias bias_{};
     std::vector<float> biasMap_;  // per left pixel: disparity bias in px
     float biasMin_ = 0.0f;

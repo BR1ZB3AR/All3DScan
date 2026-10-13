@@ -1,6 +1,7 @@
 #include "Pop4DepthDecoder.h"
 
 #include "Pop4StereoCuda.h"
+#include "decoder/StereoRig.h"
 
 #include <algorithm>
 #include <chrono>
@@ -434,14 +435,45 @@ void computeDispRange(const protocol::ScannerCalibration& cal, float depthMinMm,
 
 // Grayscale IR texture for the left view: the mean of its ambient exposures,
 // auto-gained so the 99th percentile lands near white.
-void ambientTexture(const protocol::RawFrame& raw, int firstAmbient, std::vector<uint8_t>& rgb) {
-    std::vector<float> mean(kImagePixels, 0.0f);
+// Bilinear sample of a kW×kH float image at (sx, sy); 0 outside. The CUDA
+// prepare kernel uses the identical expression (bit-equal with --fmad=false).
+// With an identity map (integer coordinates) it returns the pixel exactly.
+inline float sampleBilinear(const float* img, float sx, float sy) {
+    if (!(sx >= 0.0f && sy >= 0.0f && sx <= static_cast<float>(kW - 1) &&
+          sy <= static_cast<float>(kH - 1))) {
+        return 0.0f;
+    }
+    const auto x0 = static_cast<uint32_t>(sx);
+    const auto y0 = static_cast<uint32_t>(sy);
+    const uint32_t x1 = std::min(x0 + 1, kW - 1);
+    const uint32_t y1 = std::min(y0 + 1, kH - 1);
+    const float ax = sx - static_cast<float>(x0);
+    const float ay = sy - static_cast<float>(y0);
+    const float top = (1.0f - ax) * img[y0 * kW + x0] + ax * img[y0 * kW + x1];
+    const float bot = (1.0f - ax) * img[y1 * kW + x0] + ax * img[y1 * kW + x1];
+    return (1.0f - ay) * top + ay * bot;
+}
+
+void remapImage(const std::vector<float>& src, const std::vector<float>& mapX,
+                const std::vector<float>& mapY, std::vector<float>& dst) {
+    dst.resize(kImagePixels);
+    for (size_t p = 0; p < kImagePixels; ++p) {
+        dst[p] = sampleBilinear(src.data(), mapX[p], mapY[p]);
+    }
+}
+
+void ambientTexture(const protocol::RawFrame& raw, int firstAmbient,
+                    const std::vector<float>& mapX, const std::vector<float>& mapY,
+                    std::vector<uint8_t>& rgb) {
+    std::vector<float> meanRaw(kImagePixels, 0.0f);
     for (int i = 0; i < 4; ++i) {
         const uint16_t* src = imageAt(raw, firstAmbient + i);
         for (size_t p = 0; p < kImagePixels; ++p) {
-            mean[p] += static_cast<float>(src[p]) / (257.0f * 4.0f);
+            meanRaw[p] += static_cast<float>(src[p]) / (257.0f * 4.0f);
         }
     }
+    std::vector<float> mean;
+    remapImage(meanRaw, mapX, mapY, mean); // registered with the rectified left depth
     std::vector<float> sorted = mean;
     const size_t k = sorted.size() * 99 / 100;
     std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
@@ -461,33 +493,22 @@ void ambientTexture(const protocol::RawFrame& raw, int firstAmbient, std::vector
 // this exactly so both backends feed the same post-processing.
 std::vector<float> matchCpu(const uint16_t* leftRaw,
                             const uint16_t* rightRaw,
-                            const std::vector<float>& rectMapY,
+                            const RectifyMaps& maps,
                             const MatchTuning& t,
                             int dispMin,
                             int numDisp) {
-    // 1. Left speckle, and right speckle resampled onto left rows.
+    // 1. Both speckle images resampled onto the rectified grid.
     std::vector<float> rawL;
     std::vector<float> rawR;
     toFloat(leftRaw, rawL);
     toFloat(rightRaw, rawR);
-    std::vector<float> rectR(kImagePixels, 0.0f);
-    for (uint32_t y = 0; y < kH; ++y) {
-        for (uint32_t x = 0; x < kW; ++x) {
-            const float sy = rectMapY[static_cast<size_t>(y) * kW + x];
-            if (sy < 0.0f || sy > static_cast<float>(kH - 1)) {
-                continue;
-            }
-            const auto y0 = static_cast<uint32_t>(sy);
-            const uint32_t y1 = std::min(y0 + 1, kH - 1);
-            const float a = sy - static_cast<float>(y0);
-            rectR[static_cast<size_t>(y) * kW + x] =
-                (1.0f - a) * rawR[static_cast<size_t>(y0) * kW + x] +
-                a * rawR[static_cast<size_t>(y1) * kW + x];
-        }
-    }
+    std::vector<float> rectL;
+    std::vector<float> rectR;
+    remapImage(rawL, maps.lx, maps.ly, rectL);
+    remapImage(rawR, maps.rx, maps.ry, rectR);
     std::vector<float> L;
     std::vector<float> R;
-    blur5(rawL, L);
+    blur5(rectL, L);
     blur5(rectR, R);
 
     // 2. Census matching cost volume [pixel][d - dispMin].
@@ -725,17 +746,78 @@ void Pop4DepthDecoder::setCalibration(const protocol::ScannerCalibration& calibr
 }
 
 void Pop4DepthDecoder::setRowRectification(const RowRectification& coeffs) {
-    if (coeffs == rect_ && !rectMapY_.empty()) {
+    if (coeffs == rect_ && !maps_.ry.empty()) {
         return;
     }
     rect_ = coeffs;
     rebuildRectificationMap();
 }
 
+void Pop4DepthDecoder::setStereoRig(const StereoRig& rig) {
+    rig_ = rig;
+    stereoRectifyRotations(rig.R, rig.T, rigR1_, rigR2_);
+    buildRectifyMap(rig.KL, rig.DL, rigR1_, rig.PL, kRigScaleX, kRigScaleY, kW, kH, 0.0,
+                    maps_.lx, maps_.ly);
+    rigShift_ = std::numeric_limits<double>::quiet_NaN(); // right map built on demand
+}
+
+void Pop4DepthDecoder::clearStereoRig() {
+    rig_.reset();
+    maps_ = {};
+    rebuildRectificationMap();
+}
+
+protocol::ScannerCalibration Pop4DepthDecoder::rigCalibration(double shift) const {
+    // Rectified left camera on our 320×512 grid; Q per the shifted right image:
+    // Z = fx·B / (d - shift + (cxR - cxL)).
+    protocol::ScannerCalibration cal;
+    if (!rig_) {
+        return cal;
+    }
+    const auto& r = *rig_;
+    const double fx = r.PL[0] * kRigScaleX, fy = r.PL[5] * kRigScaleY;
+    const double cxL = r.PL[2] * kRigScaleX, cy = r.PL[6] * kRigScaleY;
+    const double cxR = r.PR[2] * kRigScaleX;
+    const double baseline = -r.PR[3] / r.PR[0]; // mm (P2 Tx = -f·B)
+    cal.valid = true;
+    cal.source = "FactoryCamparam";
+    cal.serial = r.deviceId;
+    cal.depthScale = 1.0;
+    cal.baselineMm = baseline;
+    cal.depth = {.fx = fx, .fy = fy, .cx = cxL, .cy = cy};
+    cal.depthRight = {.fx = fx, .fy = fy, .cx = cxR - shift, .cy = cy};
+    cal.stereoTranslation = {-baseline / 1000.0, 0.0, 0.0};
+    cal.qMatrix = {1, 0, 0, -cxL, 0, 1, 0, -cy, 0, 0, 0, fx * baseline, 0, 0, 1, (cxR - cxL) - shift};
+    return cal;
+}
+
+std::optional<protocol::ScannerCalibration> Pop4DepthDecoder::factoryCalibration() const {
+    if (!rig_) {
+        return std::nullopt;
+    }
+    return rigCalibration(0.0);
+}
+
 void Pop4DepthDecoder::rebuildRectificationMap() {
-    // For each output pixel find the raw right-image row yR whose mapped row
-    // equals the output row (x is unchanged): Newton on yL(x, yR) = y.
-    rectMapY_.resize(kImagePixels);
+    // Legacy (no factory calibration): left unchanged, right resampled onto
+    // left rows. For each output pixel find the raw right-image row yR whose
+    // mapped row equals the output row (x is unchanged): Newton on yL(x, yR) = y.
+    if (rig_) {
+        return; // factory maps own the geometry
+    }
+    std::vector<float>& rowMap = maps_.ry;
+    maps_.lx.resize(kImagePixels);
+    maps_.ly.resize(kImagePixels);
+    maps_.rx.resize(kImagePixels);
+    for (uint32_t y = 0; y < kH; ++y) {
+        for (uint32_t x = 0; x < kW; ++x) {
+            const size_t i = static_cast<size_t>(y) * kW + x;
+            maps_.lx[i] = static_cast<float>(x);
+            maps_.ly[i] = static_cast<float>(y);
+            maps_.rx[i] = static_cast<float>(x);
+        }
+    }
+    rowMap.resize(kImagePixels);
     const auto& c = rect_;
     for (uint32_t y = 0; y < kH; ++y) {
         for (uint32_t x = 0; x < kW; ++x) {
@@ -752,7 +834,7 @@ void Pop4DepthDecoder::rebuildRectificationMap() {
                 }
                 yR -= (f - static_cast<double>(y)) / df;
             }
-            rectMapY_[static_cast<size_t>(y) * kW + x] = static_cast<float>(yR);
+            rowMap[static_cast<size_t>(y) * kW + x] = static_cast<float>(yR);
         }
     }
 }
@@ -780,7 +862,7 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
         lastError_ = "POP4 decoder expects VendorRawY16 input";
         return std::nullopt;
     }
-    if (!calibration_.hasStereoCalibration()) {
+    if (!rig_ && !calibration_.hasStereoCalibration()) {
         lastError_ = "POP4 metric decode blocked: stereo calibration not loaded";
         return std::nullopt;
     }
@@ -794,17 +876,36 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     }
 
     const MatchTuning t = readMatchTuning();
-    const bool swap = swapCameras();
+    // Factory calibration: camparam "L" is the block of images 0–4. The legacy
+    // fitted model had the pair the other way round.
+    const bool swap = swapCameras() != static_cast<bool>(rig_);
     const int leftIdx = swap ? kRightSpeckle : kLeftSpeckle;
     const int rightIdx = swap ? kLeftSpeckle : kRightSpeckle;
     const int leftAmbient = swap ? kRightAmbientFirst : kLeftAmbientFirst;
 
+    protocol::ScannerCalibration cal = calibration_;
+    if (rig_) {
+        // Shift the rectified right image so the farthest depth of the preset
+        // lands near disparity 8: all searched disparities stay positive.
+        const protocol::ScannerCalibration base = rigCalibration(0.0);
+        const double shift =
+            std::round(8.0 - base.qMatrix[11] / depthMaxMm_ + base.qMatrix[15]);
+        if (!(shift == rigShift_)) {
+            buildRectifyMap(rig_->KR, rig_->DR, rigR2_, rig_->PR, kRigScaleX, kRigScaleY, kW, kH,
+                            shift, maps_.rx, maps_.ry);
+            rigShift_ = shift;
+        }
+        cal = rigCalibration(shift);
+    }
+
     int dispMin = kFallbackDispMin;
     int dispMax = kFallbackDispMax;
-    computeDispRange(calibration_, depthMinMm_, depthMaxMm_, dispMin, dispMax);
-    // Matched disparities carry the lens bias, so search the biased band.
-    dispMin = std::max(kDispSearchFloor, dispMin + static_cast<int>(std::floor(biasMin_)));
-    dispMax = std::min(kDispSearchCeil, dispMax + static_cast<int>(std::ceil(biasMax_)));
+    computeDispRange(cal, depthMinMm_, depthMaxMm_, dispMin, dispMax);
+    if (!rig_) {
+        // Legacy fitted model: matched disparities carry the lens bias.
+        dispMin = std::max(kDispSearchFloor, dispMin + static_cast<int>(std::floor(biasMin_)));
+        dispMax = std::min(kDispSearchCeil, dispMax + static_cast<int>(std::ceil(biasMax_)));
+    }
     const int numDisp = dispMax - dispMin + 1;
 
     // 1-4. Matching: GPU when built and available, otherwise CPU.
@@ -822,26 +923,30 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
         params.textureMin = t.textureMin;
         std::string cudaError;
         if (cuda_stereo::computeDisparity(imageAt(rawY16, leftIdx), imageAt(rawY16, rightIdx),
-                                          rectMapY_.data(), params, disp, &cudaError)) {
+                                          maps_.lx.data(), maps_.ly.data(), maps_.rx.data(),
+                                          maps_.ry.data(), params, disp, &cudaError)) {
             backend = "CUDA";
         } else if (t.debug) {
             std::fprintf(stderr, "[POP4] %s; using CPU\n", cudaError.c_str());
         }
     }
     if (backend != "CUDA") {
-        disp = matchCpu(imageAt(rawY16, leftIdx), imageAt(rawY16, rightIdx), rectMapY_, t,
-                        dispMin, numDisp);
+        disp = matchCpu(imageAt(rawY16, leftIdx), imageAt(rawY16, rightIdx), maps_, t, dispMin,
+                        numDisp);
     }
 
     const double matchMs = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - matchStart)
                                .count();
 
-    // Remove the lens bias so flat surfaces come out flat.
-    for (size_t p = 0; p < kImagePixels; ++p) {
-        if (disp[p] >= 0.0f) {
-            const float d = disp[p] - biasMap_[p];
-            disp[p] = d > 0.5f ? d : -1.0f;
+    // Legacy fitted model only: remove the lens bias so flat surfaces come
+    // out flat (factory rectification has no bias).
+    if (!rig_) {
+        for (size_t p = 0; p < kImagePixels; ++p) {
+            if (disp[p] >= 0.0f) {
+                const float d = disp[p] - biasMap_[p];
+                disp[p] = d > 0.5f ? d : -1.0f;
+            }
         }
     }
 
@@ -861,7 +966,7 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     out.timestampUs = rawY16.timestampUs;
     out.encoding = protocol::DepthEncoding::MetricMillimeters;
     out.depthMm.assign(kImagePixels, 0);
-    ambientTexture(rawY16, leftAmbient, out.rgb);
+    ambientTexture(rawY16, leftAmbient, maps_.lx, maps_.ly, out.rgb);
 
     uint32_t validDepth = 0;
     double sumD = 0.0;
@@ -870,7 +975,7 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
         if (disp[p] < 0.0f) {
             continue;
         }
-        const float z = depthFromDisparity(disp[p], calibration_, depthMinMm_, depthMaxMm_);
+        const float z = depthFromDisparity(disp[p], cal, depthMinMm_, depthMaxMm_);
         if (z <= 0.0f) {
             disp[p] = -1.0f;
             continue;

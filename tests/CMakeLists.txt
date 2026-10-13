@@ -13,6 +13,7 @@ add_executable(unit_tests
     test_registration.cpp
     test_depth_mesh.cpp
     test_tsdf.cpp
+    test_stereo_rig.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     Catch2::Catch2WithMain

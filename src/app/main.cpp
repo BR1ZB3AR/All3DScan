@@ -22,6 +22,8 @@
 #include "io/PointCloudExport.h"
 #include "pointcloud/PointCloud.h"
 #include "processing/Registration.h"
+#include "protocol/RevopointPop4Protocol.h"
+#include "usb/UsbDevice.h"
 #include "processing/ScanPipeline.h"
 #include "util/ResourcePaths.h"
 #include "protocol/ScannerProtocol.h"
@@ -38,6 +40,13 @@ int probePop4() {
     if (!scanner->connect()) {
         std::cerr << "Connect failed: " << scanner->lastError() << '\n';
         return 2;
+    }
+    {
+        // connect() loads the factory calibration from the scanner (or cache).
+        const auto connected = scanner->calibration();
+        std::cout << "After connect: " << scanner->backendName() << ", calibration "
+                  << connected.source << " baselineMm=" << connected.baselineMm
+                  << (connected.serial.empty() ? "" : " device=" + connected.serial) << '\n';
     }
     if (!scanner->startStream()) {
         std::cerr << "Stream start failed: " << scanner->lastError() << '\n';
@@ -81,7 +90,7 @@ int probePop4() {
               << ", nonzero=" << nonZero << '\n';
 
     if (frame->encoding == revoscan::protocol::DepthEncoding::MetricMillimeters) {
-        std::cout << "Metric decoding: ok (approximate full-field mm)\n";
+        std::cout << "Metric decoding: ok (" << scanner->calibration().source << ")\n";
         return 0;
     }
 
@@ -104,6 +113,21 @@ int probePop4() {
     return 0;
 }
 
+// ALL3DSCAN_CAMPARAM=<camparam.yaml>: use the scanner's factory calibration
+// (e.g. copied with --read-device-file) instead of the approximate model.
+void applyCamparamEnv(revoscan::decoder::Pop4DepthDecoder& decoder) {
+    if (const char* path = std::getenv("ALL3DSCAN_CAMPARAM")) {
+        std::string error;
+        if (const auto rig = revoscan::decoder::loadCamparamFile(path, &error)) {
+            decoder.setStereoRig(*rig);
+            std::cerr << "factory calibration " << rig->deviceId << " (baseline "
+                      << rig->baselineMm() << " mm)\n";
+        } else {
+            std::cerr << "ALL3DSCAN_CAMPARAM ignored: " << error << '\n';
+        }
+    }
+}
+
 // Offline decoder check on frames written by ALL3DSCAN_POP4_DUMP_DIR:
 //   all3dscan --decode-dump frame.y16 [disparity.pgm]
 int decodeDump(const char* path, const char* pgmOut) {
@@ -124,6 +148,7 @@ int decodeDump(const char* path, const char* pgmOut) {
     }
     revoscan::decoder::Pop4DepthDecoder decoder;
     decoder.setCalibration(revoscan::decoder::makeApproximatePop4FullFieldCalibration());
+    applyCamparamEnv(decoder);
     decoder.setDepthRange(150.0f, 650.0f);
     // Decode several times: the first call pays one-off costs (CUDA context,
     // allocations); report the best steady-state time.
@@ -183,9 +208,11 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
         std::cerr << dir << ": no .y16 dumps\n";
         return 2;
     }
-    const auto cal = revoscan::decoder::makeApproximatePop4FullFieldCalibration();
     revoscan::decoder::Pop4DepthDecoder decoder;
-    decoder.setCalibration(cal);
+    decoder.setCalibration(revoscan::decoder::makeApproximatePop4FullFieldCalibration());
+    applyCamparamEnv(decoder);
+    const auto cal = decoder.factoryCalibration().value_or(
+        revoscan::decoder::makeApproximatePop4FullFieldCalibration());
     decoder.setDepthRange(250.0f, 500.0f); // the app's default 250-500 mm preset
 
     revoscan::document::ScanDocument document;
@@ -316,6 +343,34 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--probe-pop4") {
             return probePop4();
         }
+        if (std::string_view(argv[i]) == "--usb-reset") {
+            // Port-reset the scanner: it reboots and re-enumerates (~40 s).
+            // Clears the state where vendor controls fail with LIBUSB_ERROR_IO.
+            revoscan::usb::UsbDevice dev;
+            if (!dev.open(revoscan::protocol::pop4::kVendorId, revoscan::protocol::pop4::kProductId)) {
+                std::cerr << "scanner not found or permission denied\n";
+                return 2;
+            }
+            const int rc = dev.resetDevice();
+            std::cout << "reset requested (rc=" << rc << "); the scanner reboots in ~40 s\n";
+            return 0;
+        }
+        if (std::string_view(argv[i]) == "--read-device-file" && i + 2 < argc) {
+            // Read-only copy of a file from the scanner (e.g. the factory
+            // calibration /data/camparam/camparam.yaml).
+            std::string error;
+            const auto data = revoscan::protocol::pop4::readDeviceFile(argv[i + 1], &error);
+            if (!data) {
+                std::cerr << "read " << argv[i + 1] << " failed: " << error << '\n';
+                return 2;
+            }
+            std::ofstream out(argv[i + 2], std::ios::binary);
+            out.write(reinterpret_cast<const char*>(data->data()),
+                      static_cast<std::streamsize>(data->size()));
+            std::cout << "read " << data->size() << " bytes from " << argv[i + 1] << " -> "
+                      << argv[i + 2] << (error.empty() ? "" : " [" + error + "]") << '\n';
+            return out ? 0 : 3;
+        }
         if (std::string_view(argv[i]) == "--replay-dumps" && i + 1 < argc) {
             return replayDumps(argc, argv, argv[i + 1], i + 2 < argc ? argv[i + 2] : nullptr);
         }
@@ -326,7 +381,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261013-2159");
+    QApplication::setApplicationVersion("Alpha-v20261013-2235");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme

@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <filesystem>
 #include <array>
 #include <vector>
 #include <string>
@@ -19,6 +21,7 @@
 
 #include "ScannerProtocol.h"
 #include "decoder/Pop4DepthDecoder.h"
+#include "decoder/StereoRig.h"
 #include "usb/UsbDevice.h"
 #include "usb/V4l2Capture.h"
 
@@ -73,8 +76,7 @@ public:
     bool connect() override {
         disconnect();
         lastError_.clear();
-        // Re-install approximate calib each connect until factory camparam lands.
-        calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
+        loadCalibration();
 
         // At most one USB reset per connect: every reset reboots the POP4,
         // and stacking them (as the old 1.5 s retry did) caused reset storms.
@@ -322,6 +324,9 @@ public:
 
     std::string backendName() const override {
         const std::string decodePath = decoder::Pop4DepthDecoder::backendName();
+        if (calibration_.source == "FactoryCamparam") {
+            return "Revopoint POP4 (factory calibration, " + decodePath + ")";
+        }
         if (calibration_.source == "ApproximatePop4FullField") {
             return "Revopoint POP4 (full-field approx mm, " + decodePath + ")";
         }
@@ -332,6 +337,59 @@ public:
     std::string lastError() const override { return lastError_; }
 
 private:
+    // Factory stereo calibration, in order of preference:
+    //  1. ALL3DSCAN_CAMPARAM=<camparam.yaml> (offline / override)
+    //  2. /data/camparam/camparam.yaml read from the scanner (cached per device
+    //     under $XDG_CONFIG_HOME/All3DScan/camparam/<deviceID>.yaml)
+    //  3. the most recent cached file
+    //  4. the approximate FOV/baseline model (legacy fitted rectification)
+    void loadCalibration() {
+        namespace fs = std::filesystem;
+        std::optional<decoder::StereoRig> rig;
+        std::string note;
+        if (const char* env = std::getenv("ALL3DSCAN_CAMPARAM")) {
+            rig = decoder::loadCamparamFile(env, &note);
+        }
+        const char* xdg = std::getenv("XDG_CONFIG_HOME");
+        const char* home = std::getenv("HOME");
+        const fs::path cacheDir = xdg && *xdg ? fs::path(xdg) / "All3DScan" / "camparam"
+                                  : home     ? fs::path(home) / ".config" / "All3DScan" / "camparam"
+                                             : fs::path();
+        if (!rig) {
+            std::string err;
+            if (const auto bytes = pop4::readDeviceFile("/data/camparam/camparam.yaml", &err)) {
+                const std::string text(bytes->begin(), bytes->end());
+                rig = decoder::parseCamparamYaml(text, &note);
+                if (rig && !cacheDir.empty() && !rig->deviceId.empty()) {
+                    std::error_code ec;
+                    fs::create_directories(cacheDir, ec);
+                    std::ofstream(cacheDir / (rig->deviceId + ".yaml"), std::ios::binary) << text;
+                }
+            }
+        }
+        if (!rig && !cacheDir.empty()) {
+            std::error_code ec;
+            fs::path newest;
+            fs::file_time_type newestTime{};
+            for (const auto& e : fs::directory_iterator(cacheDir, ec)) {
+                if (e.path().extension() == ".yaml" && (newest.empty() || e.last_write_time() > newestTime)) {
+                    newest = e.path();
+                    newestTime = e.last_write_time();
+                }
+            }
+            if (!newest.empty()) {
+                rig = decoder::loadCamparamFile(newest.string(), &note);
+            }
+        }
+        if (rig) {
+            decoder_.setStereoRig(*rig);
+            calibration_ = *decoder_.factoryCalibration();
+        } else {
+            decoder_.clearStereoRig();
+            calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
+        }
+    }
+
     // ALL3DSCAN_POP4_DUMP_DIR=<dir> writes the first ALL3DSCAN_POP4_DUMP_MAX
     // (default 30, max 2000) packed Y16 frames as pop4_<w>x<h>_NNN.y16
     // (little-endian, 3.2 MB each) for offline decoder / tracking work.
@@ -701,6 +759,90 @@ std::array<uint8_t, 60> makeSettingsPayload(int32_t gain,
 }
 
 } // namespace pop4
+
+std::optional<std::vector<uint8_t>> pop4::readDeviceFile(const std::string& path,
+                                                         std::string* error,
+                                                         size_t maxBytes) {
+    auto fail = [&](const std::string& msg) -> std::optional<std::vector<uint8_t>> {
+        if (error) {
+            *error = msg;
+        }
+        return std::nullopt;
+    };
+    if (path.empty() || path.size() > 58) {
+        return fail("device path must be 1-58 characters");
+    }
+    usb::UsbDevice dev;
+    if (!dev.open(kVendorId, kProductId)) {
+        return fail("Revopoint POP4 2207:110c not found or permission denied");
+    }
+    bool detached = false;
+    if (dev.kernelDriverActive(kDepthInterface) == 1) {
+        if (dev.detachKernelDriver(kDepthInterface) != LIBUSB_SUCCESS) {
+            return fail("could not detach uvcvideo from the depth interface");
+        }
+        detached = true;
+    }
+    if (!dev.claimInterface(kDepthInterface)) {
+        if (detached) {
+            dev.attachKernelDriver(kDepthInterface);
+        }
+        return fail("could not claim the depth control interface (is the scanner in use?)");
+    }
+    const uint16_t index = xuIndex(kXuUnitId, kDepthInterface);
+    std::array<uint8_t, 60> buf{};
+    buf[0] = 0x01; // open for reading
+    std::memcpy(buf.data() + 1, path.data(), path.size());
+    std::string err;
+    std::vector<uint8_t> data;
+    int rc = dev.controlTransfer(kUvcSetRequestType, kUvcSetCur, xuValue(1), index, buf.data(),
+                                 buf.size(), 1000);
+    if (rc < 0) {
+        err = std::string("open failed: ") + libusb_error_name(rc);
+    } else {
+        for (int chunk = 0; chunk < 400000; ++chunk) {
+            buf.fill(0);
+            rc = dev.controlTransfer(0xa1 /*GET, class, interface*/, 0x81 /*GET_CUR*/, xuValue(2),
+                                     index, buf.data(), buf.size(), 1000);
+            if (rc <= 0) {
+                err = std::string("read failed: ") + (rc < 0 ? libusb_error_name(rc) : "empty");
+                break;
+            }
+            uint32_t len = 0;
+            std::memcpy(&len, buf.data(), 4); // little-endian on all supported hosts
+            if (len == 0) {
+                break; // end of file
+            }
+            if (len > 56) {
+                err = "device reported a chunk longer than 56 bytes";
+                break;
+            }
+            if (data.size() + len > maxBytes) {
+                err = "file larger than the read limit";
+                break;
+            }
+            data.insert(data.end(), buf.begin() + 4, buf.begin() + 4 + len);
+        }
+    }
+    buf.fill(0); // close
+    dev.controlTransfer(kUvcSetRequestType, kUvcSetCur, xuValue(1), index, buf.data(), buf.size(),
+                        1000);
+    dev.releaseInterface();
+    if (detached) {
+        dev.attachKernelDriver(kDepthInterface);
+    }
+    dev.close();
+    if (!err.empty() && data.empty()) {
+        return fail(err);
+    }
+    if (data.empty()) {
+        return fail("file is empty or does not exist on the device");
+    }
+    if (!err.empty() && error) {
+        *error = err + " (partial data returned)";
+    }
+    return data;
+}
 
 std::unique_ptr<IScannerProtocol> makeRevopointPop4Protocol() {
     return std::make_unique<RevopointPop4Protocol>();

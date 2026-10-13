@@ -17,6 +17,9 @@ bool enabledByEnv() {
 bool computeDisparity(const uint16_t*,
                       const uint16_t*,
                       const float*,
+                      const float*,
+                      const float*,
+                      const float*,
                       const SgmParams&,
                       std::vector<float>& disparity,
                       std::string* errorOut) {

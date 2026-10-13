@@ -6,6 +6,52 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Factory calibration read from the scanner (2026-10-13)
+
+**This supersedes the fitted row map, the "lens bias" and the 28 mm
+provisional baseline described below.** They remain only as a fallback when
+no factory calibration is available.
+
+- **File channel.** `libuvcReadFile` (RevoScan Android `lib3DCamera.so`
+  @`0x72c450`) is read-only and uses XU unit 4 / interface 0. Open is
+  `SET_CUR` selector 1 with 60 B `[0x01, path, NUL]`. Each read is
+  `GET_CUR` selector 2 returning 60 B `[len LE32 ≤56, data]`, repeated
+  until `len == 0`. Close is `SET_CUR` selector 1 with 60 zero bytes.
+  `all3dscan --read-device-file <path> <out>` implements it.
+  A scanner left in the post-session state answers with `LIBUSB_ERROR_IO`;
+  `all3dscan --usb-reset` reboots it (~40 s).
+- **Files.** `/data/camparam/`: `camparam.yaml`, `camparamLR/{P,Q}.bin`,
+  `mapparam{L,R}.bin`, `Distort.bin`, `LC_RT.bin`, `Pl.bin`, `Prgb.bin`,
+  `metroExtra.bin`; `/data/camparam_blue/` holds the blue-laser
+  equivalents. `camparam.yaml` is OpenCV YAML: `cameraMatrixL/R`,
+  `distCoeffL/R`, `steroRotation`, `steroTranslation`, `pL`, `pR`, `Q`, all
+  at the sensors' native **1280×1024**.
+- **Geometry (this unit).** Baseline 118.6 mm. The cameras are toed in by
+  ~20°: Bouguet rectification rotates each about ±10°. Focal length is
+  1489 px.
+- **Our 320×512 images are the unrectified sensor images scaled x/4, y/2.**
+  Non-square pixels: fx 372, fy 745 on our grid. Camparam "L" is the block
+  of images **0–4**; the legacy model had the pair reversed. Validation:
+  - Rectifying our images with `cv::stereoRectify` and
+    `initUndistortRectifyMap`, using `K' = S·K` and `P' = S·P` with
+    S = diag(¼, ½, 1), gives row-aligned pairs; the best vertical shift is
+    0 on four captures.
+  - The rectified flat faces are planar: 0.22–0.24 px RMS against 0.30–0.32
+    with the fitted model, and the "bowl" disappears.
+  - Depth is about 463 mm for the box (1 px of disparity ≈ 4.9 mm there).
+  - `cv::stereoRectify` with alpha = −1 reproduces the file's `pL`/`pR`
+    exactly.
+- **Decoder.** It rectifies both speckle images with native maps
+  (`decoder/StereoRig`, matching OpenCV to 1e-9 for R1/R2 and 2e-3 px for
+  the maps). The right image is shifted by K px, chosen per depth preset,
+  so that disparities stay positive: Z = fx·B / (d − K + Δcx). CPU and
+  CUDA agree byte for byte. On the 400-frame recording, 351 frames track
+  (was 332).
+- **The app** reads `camparam.yaml` on Connect and caches it as
+  `$XDG_CONFIG_HOME/All3DScan/camparam/<deviceID>.yaml`; it falls back to
+  the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
+  overrides, including for `--decode-dump` and `--replay-dumps`.
+
 ## Device command channel, fringe exposures and open questions (2026-10-13)
 
 **Corrections to the 2026-10-12 section below.** (1) Exposures 0–3 / 5–8

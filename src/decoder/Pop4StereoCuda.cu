@@ -27,9 +27,34 @@ __constant__ float kBlur[5] = {1 / 16.f, 4 / 16.f, 6 / 16.f, 4 / 16.f, 1 / 16.f}
 
 // --- 1. row alignment ------------------------------------------------------
 
+// Bilinear sample of a raw Y16 image (as /257 floats), 0 outside; the same
+// expression as the CPU sampleBilinear so results stay bit-equal.
+__device__ float sampleRaw(const uint16_t* __restrict__ img, float sx, float sy) {
+    if (!(sx >= 0.0f && sy >= 0.0f && sx <= static_cast<float>(kW - 1) &&
+          sy <= static_cast<float>(kH - 1))) {
+        return 0.0f;
+    }
+    const int x0 = static_cast<int>(sx);
+    const int y0 = static_cast<int>(sy);
+    const int x1 = min(x0 + 1, kW - 1);
+    const int y1 = min(y0 + 1, kH - 1);
+    const float ax = sx - static_cast<float>(x0);
+    const float ay = sy - static_cast<float>(y0);
+    const float p00 = static_cast<float>(img[y0 * kW + x0]) / 257.0f;
+    const float p10 = static_cast<float>(img[y0 * kW + x1]) / 257.0f;
+    const float p01 = static_cast<float>(img[y1 * kW + x0]) / 257.0f;
+    const float p11 = static_cast<float>(img[y1 * kW + x1]) / 257.0f;
+    const float top = (1.0f - ax) * p00 + ax * p10;
+    const float bot = (1.0f - ax) * p01 + ax * p11;
+    return (1.0f - ay) * top + ay * bot;
+}
+
 __global__ void prepareKernel(const uint16_t* __restrict__ left,
                               const uint16_t* __restrict__ right,
-                              const float* __restrict__ mapY,
+                              const float* __restrict__ mapLx,
+                              const float* __restrict__ mapLy,
+                              const float* __restrict__ mapRx,
+                              const float* __restrict__ mapRy,
                               float* __restrict__ outL,
                               float* __restrict__ outR) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,18 +63,8 @@ __global__ void prepareKernel(const uint16_t* __restrict__ left,
         return;
     }
     const int p = y * kW + x;
-    outL[p] = static_cast<float>(left[p]) / 257.0f;
-    const float sy = mapY[p];
-    float v = 0.0f;
-    if (!(sy < 0.0f || sy > static_cast<float>(kH - 1))) {
-        const int y0 = static_cast<int>(sy);
-        const int y1 = min(y0 + 1, kH - 1);
-        const float a = sy - static_cast<float>(y0);
-        const float r0 = static_cast<float>(right[y0 * kW + x]) / 257.0f;
-        const float r1 = static_cast<float>(right[y1 * kW + x]) / 257.0f;
-        v = (1.0f - a) * r0 + a * r1;
-    }
-    outR[p] = v;
+    outL[p] = sampleRaw(left, mapLx[p], mapLy[p]);
+    outR[p] = sampleRaw(right, mapRx[p], mapRy[p]);
 }
 
 __global__ void blurRowsKernel(const float* __restrict__ in, float* __restrict__ out) {
@@ -324,7 +339,10 @@ __global__ void winnerKernel(const uint16_t* __restrict__ sum,
 struct DeviceBuffers {
     uint16_t* left = nullptr;
     uint16_t* right = nullptr;
-    float* mapY = nullptr;
+    float* mapLx = nullptr;
+    float* mapLy = nullptr;
+    float* mapRx = nullptr;
+    float* mapRy = nullptr;
     float* rawL = nullptr;
     float* rectR = nullptr;
     float* tmp = nullptr;
@@ -345,7 +363,10 @@ struct DeviceBuffers {
         const size_t px = kPixels;
         bool ok = cudaMalloc(&left, px * sizeof(uint16_t)) == cudaSuccess &&
                   cudaMalloc(&right, px * sizeof(uint16_t)) == cudaSuccess &&
-                  cudaMalloc(&mapY, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&mapLx, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&mapLy, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&mapRx, px * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&mapRy, px * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&rawL, px * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&rectR, px * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&tmp, px * sizeof(float)) == cudaSuccess &&
@@ -367,7 +388,9 @@ struct DeviceBuffers {
 
     void freeAll() {
         for (void* p : {static_cast<void*>(left), static_cast<void*>(right),
-                        static_cast<void*>(mapY), static_cast<void*>(rawL),
+                        static_cast<void*>(mapLx), static_cast<void*>(mapLy),
+                        static_cast<void*>(mapRx), static_cast<void*>(mapRy),
+                        static_cast<void*>(rawL),
                         static_cast<void*>(rectR), static_cast<void*>(tmp),
                         static_cast<void*>(L), static_cast<void*>(R),
                         static_cast<void*>(cL), static_cast<void*>(cR),
@@ -451,7 +474,10 @@ bool available() {
 
 bool computeDisparity(const uint16_t* leftY16,
                       const uint16_t* rightY16,
-                      const float* rectMapY,
+                      const float* mapLx,
+                      const float* mapLy,
+                      const float* mapRx,
+                      const float* mapRy,
                       const SgmParams& params,
                       std::vector<float>& disparity,
                       std::string* errorOut) {
@@ -462,7 +488,7 @@ bool computeDisparity(const uint16_t* leftY16,
         disparity.clear();
         return false;
     };
-    if (!leftY16 || !rightY16 || !rectMapY) {
+    if (!leftY16 || !rightY16 || !mapLx || !mapLy || !mapRx || !mapRy) {
         return fail("CUDA decode: null input");
     }
     if (params.numDisp < 3 || params.numDisp > kMaxDisp || params.dispMin < 0) {
@@ -494,8 +520,11 @@ bool computeDisparity(const uint16_t* leftY16,
     const size_t px = kPixels;
     if (!check(cudaMemcpy(b.left, leftY16, px * sizeof(uint16_t), cudaMemcpyHostToDevice)) ||
         !check(cudaMemcpy(b.right, rightY16, px * sizeof(uint16_t), cudaMemcpyHostToDevice)) ||
-        // 640 KB per frame; cheaper than tracking in-place map edits.
-        !check(cudaMemcpy(b.mapY, rectMapY, px * sizeof(float), cudaMemcpyHostToDevice))) {
+        // Four 640 KB maps per frame; cheaper than tracking map changes.
+        !check(cudaMemcpy(b.mapLx, mapLx, px * sizeof(float), cudaMemcpyHostToDevice)) ||
+        !check(cudaMemcpy(b.mapLy, mapLy, px * sizeof(float), cudaMemcpyHostToDevice)) ||
+        !check(cudaMemcpy(b.mapRx, mapRx, px * sizeof(float), cudaMemcpyHostToDevice)) ||
+        !check(cudaMemcpy(b.mapRy, mapRy, px * sizeof(float), cudaMemcpyHostToDevice))) {
         return false;
     }
 
@@ -516,7 +545,8 @@ bool computeDisparity(const uint16_t* leftY16,
     mark(0);
     const dim3 block(32, 8);
     const dim3 grid((kW + block.x - 1) / block.x, (kH + block.y - 1) / block.y);
-    prepareKernel<<<grid, block>>>(b.left, b.right, b.mapY, b.rawL, b.rectR);
+    prepareKernel<<<grid, block>>>(b.left, b.right, b.mapLx, b.mapLy, b.mapRx, b.mapRy, b.rawL,
+                                   b.rectR);
     blurRowsKernel<<<grid, block>>>(b.rawL, b.tmp);
     blurColsKernel<<<grid, block>>>(b.tmp, b.L);
     blurRowsKernel<<<grid, block>>>(b.rectR, b.tmp);
