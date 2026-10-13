@@ -879,7 +879,33 @@ bool ScanPipeline::completeAndMesh(const std::string& workerScript,
         params.maxDepthM = depthClipFarM_.load();
         // Copy once: the worker may still be fusing queued frames.
         const pointcloud::PointCloud model = document_->cloudCopy();
-        geometry::TriangleMesh mesh = geometry::reconstructTsdf(frames, model, 0.01f, params);
+        // Robust volume bounds: a few mis-tracked points far away used to
+        // inflate the volume, coarsening voxels and slowing Complete a lot.
+        pointcloud::PointCloud bounds;
+        if (!model.points.empty()) {
+            std::array<std::vector<float>, 3> axis;
+            for (auto& a : axis) {
+                a.reserve(model.points.size());
+            }
+            for (const auto& p : model.points) {
+                axis[0].push_back(p.x);
+                axis[1].push_back(p.y);
+                axis[2].push_back(p.z);
+            }
+            std::array<float, 3> lo{}, hi{};
+            for (int k = 0; k < 3; ++k) {
+                auto& a = axis[static_cast<size_t>(k)];
+                const size_t i0 = a.size() / 200;              // 0.5th percentile
+                const size_t i1 = a.size() - 1 - a.size() / 200; // 99.5th percentile
+                std::nth_element(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(i0), a.end());
+                lo[static_cast<size_t>(k)] = a[i0];
+                std::nth_element(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(i1), a.end());
+                hi[static_cast<size_t>(k)] = a[i1];
+            }
+            bounds.points.push_back({lo[0], lo[1], lo[2]});
+            bounds.points.push_back({hi[0], hi[1], hi[2]});
+        }
+        geometry::TriangleMesh mesh = geometry::reconstructTsdf(frames, bounds, 0.02f, params);
         // Base removal + floating-fragment cleanup against the tracked model.
         geometry::cleanMesh(mesh, model, std::max(0.004f, 3.0f * params.voxelM));
         geometry::smoothMeshTaubin(mesh, kFinalMeshSmoothIterations);

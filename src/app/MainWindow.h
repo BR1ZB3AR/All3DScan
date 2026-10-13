@@ -1,5 +1,7 @@
 #pragma once
 
+#include <thread>
+
 #include <QElapsedTimer>
 #include <QMainWindow>
 
@@ -41,6 +43,7 @@ protected:
 private slots:
     void onConnectToggle();
     void onConnectFinished(bool ok);
+    void onCompleteFinished(bool ok, const QString& error);
     void onScanToggle();
     void onSingleShot();
     void onComplete();
@@ -113,6 +116,10 @@ private:
     QPushButton* scanButton_ = nullptr;
     QPushButton* singleShotButton_ = nullptr;
     QPushButton* completeButton_ = nullptr;
+    // Complete (meshing) runs off the UI thread; the window is disabled until
+    // onCompleteFinished so nothing resets the pipeline mid-build.
+    std::thread completeThread_;
+    bool completing_ = false;
     QPushButton* cancelButton_ = nullptr;
     QPushButton* colorButton_ = nullptr;
     QPushButton* noColorButton_ = nullptr;

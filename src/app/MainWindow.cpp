@@ -482,6 +482,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
+    // A running Complete uses the pipeline and the document; let it finish.
+    if (completeThread_.joinable()) {
+        completeThread_.join();
+    }
     if (pipeline_) {
         pipeline_->stop();
     }
@@ -1294,33 +1298,63 @@ void MainWindow::onSingleShot() {
 }
 
 void MainWindow::onComplete() {
+    if (completing_) {
+        return;
+    }
     if (streaming_) {
         controller_->stopScan();
         streaming_ = false;
         scanning_ = false;
         scanButton_->setText(tr("Scan"));
     }
-
-    if (document_.isMetric()) {
-        std::string error;
-        const auto worker = util::findMeshWorkerScript().value_or("tools/pipeline/mesh_worker.py");
-        if (!pipeline_->completeAndMesh(worker, "python3", &error)) {
-            onError(tr("Mesh complete: %1").arg(QString::fromStdString(error)));
-        } else {
-            connLabel_->setText(tr("● Scan complete — mesh ready"));
-            connLabel_->setStyleSheet("color:#5bbf5b;");
-        }
-        // Land on the richest available stage, like Revo Scan's Model view.
-        if (!document_.meshEmpty()) {
-            modelStage_ = document_.meshHasColors() ? ModelStage::Textured
-                                                     : ModelStage::Meshed;
-        } else {
-            modelStage_ = ModelStage::PointClouds;
-        }
-        showEditPage();
-    } else {
+    if (!document_.isMetric()) {
         onError(tr("Complete/meshing needs metric depth (scan until full-field decode succeeds)"));
+        updateControlStates();
+        return;
     }
+
+    // Meshing can take many seconds on a long scan (hundreds of keyframes into
+    // a large volume). Doing it on the UI thread froze the window, so run it
+    // in the background and keep the window responsive but locked.
+    completing_ = true;
+    if (centralWidget()) {
+        centralWidget()->setEnabled(false);
+    }
+    connLabel_->setText(tr("● Building mesh…"));
+    connLabel_->setStyleSheet("color:#d0a24c;");
+    if (completeThread_.joinable()) {
+        completeThread_.join();
+    }
+    const std::string worker =
+        util::findMeshWorkerScript().value_or("tools/pipeline/mesh_worker.py");
+    completeThread_ = std::thread([this, worker] {
+        std::string error;
+        const bool ok = pipeline_->completeAndMesh(worker, "python3", &error);
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok, error] { onCompleteFinished(ok, QString::fromStdString(error)); },
+            Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::onCompleteFinished(bool ok, const QString& error) {
+    completing_ = false;
+    if (centralWidget()) {
+        centralWidget()->setEnabled(true);
+    }
+    if (!ok) {
+        onError(tr("Mesh complete: %1").arg(error));
+    } else {
+        connLabel_->setText(tr("● Scan complete — mesh ready"));
+        connLabel_->setStyleSheet("color:#5bbf5b;");
+    }
+    // Land on the richest available stage, like Revo Scan's Model view.
+    if (!document_.meshEmpty()) {
+        modelStage_ = document_.meshHasColors() ? ModelStage::Textured : ModelStage::Meshed;
+    } else {
+        modelStage_ = ModelStage::PointClouds;
+    }
+    showEditPage();
     updateControlStates();
 }
 
@@ -1951,6 +1985,10 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
                     (height() - shortcutHint_->height()) / 2);
             }
         }
+        return;
+    }
+    if (completing_) {
+        QMainWindow::keyPressEvent(event); // no Space/Esc actions while meshing
         return;
     }
     if (event->key() == Qt::Key_Space) {
