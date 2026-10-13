@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "ArOverlayView.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
@@ -17,6 +18,7 @@
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QMenuBar>
+#include <QKeySequence>
 #include <QMessageBox>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -494,6 +496,9 @@ MainWindow::~MainWindow() {
 
 void MainWindow::buildMenus() {
     QMenu* fileMenu = menuBar()->addMenu(tr("File"));
+    QAction* newScanAction = fileMenu->addAction(tr("New Scan"), this, &MainWindow::onNewScan);
+    newScanAction->setShortcut(QKeySequence::New);
+    fileMenu->addSeparator();
     fileMenu->addAction(tr("Open PLY…"), this, &MainWindow::onImportPly);
     fileMenu->addAction(tr("Export…"), this, &MainWindow::onExport);
     fileMenu->addAction(tr("Send to OrcaSlicer"), this, &MainWindow::onSendToSlicer);
@@ -876,6 +881,10 @@ QWidget* MainWindow::buildEditPage() {
            "OrcaSlicer / PrusaSlicer / Bambu Studio"));
     connect(slicerBtn, &QPushButton::clicked, this, &MainWindow::onSendToSlicer);
     hh->addWidget(slicerBtn);
+    auto* editNewScanBtn = new QPushButton(tr("New Scan"), header);
+    editNewScanBtn->setToolTip(tr("Discard this model and go back to scanning (Ctrl+N)."));
+    connect(editNewScanBtn, &QPushButton::clicked, this, &MainWindow::onNewScan);
+    hh->addWidget(editNewScanBtn);
     auto* exitBtn = new QPushButton(tr("Exit Edit Mode"), header);
     connect(exitBtn, &QPushButton::clicked, this, &MainWindow::showScanPage);
     hh->addWidget(exitBtn);
@@ -1123,7 +1132,11 @@ QWidget* MainWindow::buildViewport() {
     singleShotButton_ = new QPushButton(tr("Single Shot"), controls);
     completeButton_ = new QPushButton(tr("Complete"), controls);
     cancelButton_ = new QPushButton(tr("Cancel"), controls);
-    for (QPushButton* b : {scanButton_, singleShotButton_, completeButton_, cancelButton_}) {
+    newScanButton_ = new QPushButton(tr("New Scan"), controls);
+    newScanButton_->setToolTip(tr("Discard the current scan and start a fresh one (Ctrl+N).\n"
+                                  "The scanner stays connected."));
+    for (QPushButton* b :
+         {scanButton_, singleShotButton_, completeButton_, cancelButton_, newScanButton_}) {
         ch->addWidget(b);
     }
 
@@ -1167,6 +1180,7 @@ QWidget* MainWindow::buildViewport() {
     connect(singleShotButton_, &QPushButton::clicked, this, &MainWindow::onSingleShot);
     connect(completeButton_, &QPushButton::clicked, this, &MainWindow::onComplete);
     connect(cancelButton_, &QPushButton::clicked, this, &MainWindow::onCancel);
+    connect(newScanButton_, &QPushButton::clicked, this, &MainWindow::onNewScan);
     connect(fusionButton_, &QPushButton::toggled, this, &MainWindow::onFusionToggled);
     connect(isolateButton_, &QPushButton::toggled, this, &MainWindow::onIsolateToggled);
     connect(liveMeshButton_, &QPushButton::toggled, this, [this](bool on) {
@@ -1291,8 +1305,16 @@ void MainWindow::onConnectFinished(bool ok) {
 }
 
 void MainWindow::onScanToggle() {
-    if (!connected_) {
+    if (!connected_ || completing_) {
         return;
+    }
+    // Complete / Cancel stop the camera stream; restart it so Scan works
+    // again without reconnecting.
+    if (!scanning_ && !streaming_) {
+        streaming_ = controller_->startScan();
+        if (!streaming_) {
+            return;
+        }
     }
     scanning_ = !scanning_;
     scanButton_->setText(scanning_ ? tr("Pause") : tr("Scan"));
@@ -1367,14 +1389,62 @@ void MainWindow::onCompleteFinished(bool ok, const QString& error) {
 }
 
 void MainWindow::onCancel() {
+    if (completing_) {
+        return;
+    }
     if (streaming_) {
         controller_->stopScan();
         streaming_ = false;
-        scanning_ = false;
-        scanButton_->setText(tr("Scan"));
     }
+    discardScan();
+}
+
+void MainWindow::onNewScan() {
+    if (completing_) {
+        return;
+    }
+    if (!document_.cloudEmpty() || !document_.meshEmpty()) {
+        const auto answer = QMessageBox::question(
+            this, tr("New Scan"),
+            tr("Start a new scan? The current scan and mesh will be discarded.\n\n"
+               "Use File → Export… first if you want to keep it."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            return;
+        }
+    }
+    discardScan();
+    showScanPage();
+    // Keep the scanner live and ready: restart the preview if Complete or
+    // Cancel stopped it. Scanning itself starts when the user presses Scan.
+    if (connected_ && !streaming_) {
+        streaming_ = controller_->startScan();
+    }
+    if (connLabel_ && connected_) {
+        connLabel_->setText(tr("● New scan — press Scan to start"));
+        connLabel_->setStyleSheet("color:#5bbf5b;");
+    }
+    updateControlStates();
+}
+
+void MainWindow::discardScan() {
+    scanning_ = false;
+    scanButton_->setText(tr("Scan"));
     controller_->resetAccumulation();
+    // Resetting the pipeline drops its keyframes, live TSDF and live mesh and
+    // clears the document; clearing the document alone left the old live mesh
+    // on screen and fed old keyframes into the next Complete.
+    if (pipeline_) {
+        pipeline_->reset();
+    }
     document_.clear();
+    showingLiveMesh_ = false;
+    shownLiveMeshRev_ = 0;
+    modelStage_ = ModelStage::PointClouds;
+    if (trackLabel_) {
+        trackLabel_->setText(liveFusion_ ? tr("Tracking: Idle") : tr("Fusion off"));
+        trackLabel_->setStyleSheet("color:#5b6169;");
+    }
     refreshScanView();
     refreshEditView();
     updateControlStates();

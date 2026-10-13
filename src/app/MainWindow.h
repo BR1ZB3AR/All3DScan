@@ -48,6 +48,7 @@ private slots:
     void onSingleShot();
     void onComplete();
     void onCancel();
+    void onNewScan();
     void onExport();
     void onSendToSlicer();
     void onImportPly();
@@ -97,6 +98,8 @@ private:
     void updateControlStates();
     void updateFrameTelemetry();
     void refreshScanView();
+    // Drops the current model, keyframes and live mesh; keeps the connection.
+    void discardScan();
     void refreshEditView();
 
     std::unique_ptr<ScannerController> controller_;
@@ -121,6 +124,7 @@ private:
     std::thread completeThread_;
     bool completing_ = false;
     QPushButton* cancelButton_ = nullptr;
+    QPushButton* newScanButton_ = nullptr;
     QPushButton* colorButton_ = nullptr;
     QPushButton* noColorButton_ = nullptr;
     QPushButton* openEditBtn_ = nullptr;

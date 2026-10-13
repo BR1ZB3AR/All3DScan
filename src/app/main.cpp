@@ -2,6 +2,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QIcon>
+#include <QTimer>
 
 #include <algorithm>
 #include <chrono>
@@ -381,7 +382,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261013-2235");
+    QApplication::setApplicationVersion("Alpha-v20261013-2242");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
@@ -400,5 +401,16 @@ int main(int argc, char** argv) {
 
     revoscan::app::MainWindow window;
     window.show();
+    // --screenshot <file.png>: render the main window itself (QWidget::grab,
+    // nothing else on screen) after startup and exit. For docs / UI checks.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string_view(argv[i]) == "--screenshot") {
+            const QString path = QString::fromLocal8Bit(argv[i + 1]);
+            QTimer::singleShot(2000, &window, [&window, path] {
+                window.grab().save(path);
+                QApplication::quit();
+            });
+        }
+    }
     return app.exec();
 }

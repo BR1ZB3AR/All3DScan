@@ -4,6 +4,22 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261013-2242
+
+### Added
+- **New Scan** button (scan page and Edit page) and File → New Scan
+  (Ctrl+N). It discards the current model, mesh, keyframes and live mesh,
+  then returns to the scan page with the scanner still connected and the
+  preview running. It asks for confirmation when there is a scan to lose.
+- `all3dscan --screenshot <file.png>` renders the main window to an image.
+
+### Fixed
+- Cancel cleared the point model but left the pipeline's keyframes, live
+  TSDF and live mesh behind: the old live mesh stayed on screen, and old
+  keyframes leaked into the next Complete. It now resets the pipeline too.
+- After Complete or Cancel stopped the camera stream, Scan did nothing until
+  you reconnected. Scan now restarts the stream.
+
 ## Alpha-v20261013-2235
 
 ### Fixed
