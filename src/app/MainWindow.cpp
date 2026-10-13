@@ -1211,7 +1211,7 @@ void MainWindow::showScanPage() {
 }
 
 void MainWindow::showEditPage() {
-    if (!document_.isMetric() || document_.cloud().points.empty()) {
+    if (!document_.isMetric() || document_.cloudEmpty()) {
         onError(tr("Edit page needs a completed metric scan or an imported PLY"));
     }
     refreshEditView();
@@ -1311,8 +1311,8 @@ void MainWindow::onComplete() {
             connLabel_->setStyleSheet("color:#5bbf5b;");
         }
         // Land on the richest available stage, like Revo Scan's Model view.
-        if (!document_.mesh().empty()) {
-            modelStage_ = document_.mesh().hasColors ? ModelStage::Textured
+        if (!document_.meshEmpty()) {
+            modelStage_ = document_.meshHasColors() ? ModelStage::Textured
                                                      : ModelStage::Meshed;
         } else {
             modelStage_ = ModelStage::PointClouds;
@@ -1400,7 +1400,10 @@ void MainWindow::onExport() {
         return;
     }
 
-    const bool hasMesh = !document_.mesh().empty();
+    // One consistent copy: the scan pipeline may still be fusing.
+    const geometry::TriangleMesh mesh = document_.meshCopy();
+    const pointcloud::PointCloud docCloud = document_.cloudCopy();
+    const bool hasMesh = !mesh.empty();
     const QString filter = hasMesh
                                ? tr("Binary STL (*.stl);;OBJ Mesh (*.obj);;PLY Mesh (*.ply);;PLY Cloud (*.ply)")
                                : tr("PLY Cloud (*.ply);;OBJ Points (*.obj)");
@@ -1415,7 +1418,7 @@ void MainWindow::onExport() {
     options.unit = io::LengthUnit::Meters;
     if (path.endsWith(".stl", Qt::CaseInsensitive)) {
         options.unit = io::LengthUnit::Millimeters; // STL has no units; use mm for printing
-        auto result = io::writeStlBinary(path.toStdString(), document_.mesh(), options);
+        auto result = io::writeStlBinary(path.toStdString(), mesh, options);
         if (!result.ok) {
             QMessageBox::critical(this, tr("Export"), QString::fromStdString(result.error));
         }
@@ -1424,12 +1427,12 @@ void MainWindow::onExport() {
 
     if (path.endsWith(".obj", Qt::CaseInsensitive)) {
         if (hasMesh) {
-            auto result = io::writeObjMesh(path.toStdString(), document_.mesh(), options);
+            auto result = io::writeObjMesh(path.toStdString(), mesh, options);
             if (!result.ok) {
                 QMessageBox::critical(this, tr("Export"), QString::fromStdString(result.error));
             }
         } else if (document_.isMetric()) {
-            if (!io::writeObj(path.toStdString(), document_.cloud())) {
+            if (!io::writeObj(path.toStdString(), docCloud)) {
                 QMessageBox::critical(this, tr("Export"), tr("Failed to write OBJ."));
             }
         } else {
@@ -1439,9 +1442,9 @@ void MainWindow::onExport() {
     }
 
     if (hasMesh && path.endsWith(".ply", Qt::CaseInsensitive)) {
-        auto result = io::writePlyMesh(path.toStdString(), document_.mesh(), options);
+        auto result = io::writePlyMesh(path.toStdString(), mesh, options);
         if (!result.ok) {
-            result = io::writePlyCloud(path.toStdString(), document_.cloud(), true, options);
+            result = io::writePlyCloud(path.toStdString(), docCloud, true, options);
         }
         if (!result.ok) {
             QMessageBox::critical(this, tr("Export"), QString::fromStdString(result.error));
@@ -1450,7 +1453,7 @@ void MainWindow::onExport() {
     }
 
     auto result = io::writePlyCloud(path.toStdString(),
-                                    document_.isMetric() ? document_.cloud()
+                                    document_.isMetric() ? docCloud
                                                          : controller_->lastCloud(),
                                     document_.isMetric() || controller_->lastCloudMetric(),
                                     options);
@@ -1460,8 +1463,9 @@ void MainWindow::onExport() {
 }
 
 void MainWindow::onSendToSlicer() {
+    const geometry::TriangleMesh mesh = document_.meshCopy();
     // Slicers need a watertight, metric mesh — not a raw point cloud.
-    if (document_.mesh().empty()) {
+    if (mesh.empty()) {
         QMessageBox::information(
             this,
             tr("Send to OrcaSlicer"),
@@ -1473,7 +1477,7 @@ void MainWindow::onSendToSlicer() {
                "use ALL3DSCAN_BACKEND=mock to test the full mesh → slice flow."));
         return;
     }
-    if (!document_.mesh().metric) {
+    if (!mesh.metric) {
         QMessageBox::warning(
             this,
             tr("Send to OrcaSlicer"),
@@ -1504,7 +1508,7 @@ void MainWindow::onSendToSlicer() {
     io::ExportOptions options;
     options.requireMetric = true;
     options.unit = io::LengthUnit::Millimeters;
-    auto result = io::writeStlBinary(stlPath.toStdString(), document_.mesh(), options);
+    auto result = io::writeStlBinary(stlPath.toStdString(), mesh, options);
     if (!result.ok) {
         QMessageBox::critical(this, tr("Send to OrcaSlicer"),
                               QString::fromStdString(result.error));
@@ -1559,8 +1563,9 @@ void MainWindow::onFrameReady(const pointcloud::PointCloud& cloud) {
     }
     // When live fusion is building a model, the fused document drives the view
     // (via onDocumentUpdated); don't overwrite it with the single raw frame.
-    const bool fusedActive = liveFusion_ && !document_.cloud().points.empty();
-    if (!fusedActive && (!document_.isMetric() || document_.cloud().points.empty())) {
+    const bool docEmpty = document_.cloudEmpty();
+    const bool fusedActive = liveFusion_ && !docEmpty;
+    if (!fusedActive && (!document_.isMetric() || docEmpty)) {
         view_->setColorEnabled(useColor_);
         view_->setPointCloud(cloud);
         std::vector<float> depths;
@@ -1706,9 +1711,11 @@ void MainWindow::onDocumentUpdated() {
 }
 
 void MainWindow::refreshScanView() {
-    const bool showFused =
-        (document_.isMetric() || liveFusion_) && !document_.cloud().points.empty();
-    const auto& cloud = showFused ? document_.cloud() : controller_->lastCloud();
+    // The pipeline fuses into document_ on its worker thread: read it only
+    // through the document's locked accessors (a plain reference raced with
+    // fusion and crashed in PointCloudView::recomputeBounds).
+    const bool docEmpty = document_.cloudEmpty();
+    const bool showFused = (document_.isMetric() || liveFusion_) && !docEmpty;
     view_->setColorEnabled(useColor_);
 
     // Live polygon model (TSDF) whenever it exists. Metric frames are always
@@ -1724,29 +1731,39 @@ void MainWindow::refreshScanView() {
             showingLiveMesh_ = true;
         }
     } else {
-        view_->setPointCloud(cloud);
+        if (showFused) {
+            document_.withCloud([&](const pointcloud::PointCloud& c) { view_->setPointCloud(c); });
+        } else {
+            view_->setPointCloud(controller_->lastCloud());
+        }
         showingLiveMesh_ = false;
     }
 
-    const auto& cloudForGauge =
-        !document_.cloud().points.empty() ? document_.cloud() : controller_->lastCloud();
-    const size_t ptCount = cloudForGauge.points.size();
     std::vector<float> depths;
-    if (ptCount > 0) {
+    auto sampleDepths = [&depths](const pointcloud::PointCloud& c) {
+        const size_t ptCount = c.points.size();
+        if (ptCount == 0) {
+            return;
+        }
         const size_t maxSamples = 500;
         const size_t stride = std::max<size_t>(1, ptCount / maxSamples);
         depths.reserve(std::min(ptCount, maxSamples));
         for (size_t i = 0; i < ptCount; i += stride) {
-            depths.push_back(cloudForGauge.points[i].z * 1000.0f);
+            depths.push_back(c.points[i].z * 1000.0f);
         }
+    };
+    if (!docEmpty) {
+        document_.withCloud(sampleDepths);
+    } else {
+        sampleDepths(controller_->lastCloud());
     }
     distanceScale_->setDepthSamplesMm(depths);
 }
 
 void MainWindow::updateStageAvailability() {
-    const bool hasCloud = !document_.cloud().points.empty();
-    const bool hasMesh = !document_.mesh().empty();
-    const bool hasTexture = hasMesh && document_.mesh().hasColors;
+    const bool hasCloud = !document_.cloudEmpty();
+    const bool hasMesh = !document_.meshEmpty();
+    const bool hasTexture = hasMesh && document_.meshHasColors();
     if (stageRawBtn_) {
         stageRawBtn_->setEnabled(hasCloud);
     }
@@ -1798,17 +1815,17 @@ void MainWindow::applyModelStage(ModelStage stage) {
     switch (stage) {
     case ModelStage::Raw:
         editView_->setColorEnabled(false);
-        editView_->setPointCloud(document_.cloud());
+        document_.withCloud([&](const pointcloud::PointCloud& c) { editView_->setPointCloud(c); });
         break;
     case ModelStage::PointClouds:
         editView_->setColorEnabled(useColor_);
-        editView_->setPointCloud(document_.cloud());
+        document_.withCloud([&](const pointcloud::PointCloud& c) { editView_->setPointCloud(c); });
         break;
     case ModelStage::Meshed:
-        editView_->setMesh(document_.mesh(), /*textured=*/false);
+        document_.withMesh([&](const geometry::TriangleMesh& m) { editView_->setMesh(m, false); });
         break;
     case ModelStage::Textured:
-        editView_->setMesh(document_.mesh(), /*textured=*/true);
+        document_.withMesh([&](const geometry::TriangleMesh& m) { editView_->setMesh(m, true); });
         break;
     }
 }
@@ -1820,11 +1837,12 @@ void MainWindow::refreshEditView() {
     updateStageAvailability();
     applyModelStage(modelStage_);
     if (editInfoLabel_) {
-        const auto& mesh = document_.mesh();
+        size_t triangles = 0;
+        document_.withMesh([&](const geometry::TriangleMesh& m) { triangles = m.triangleCount(); });
         editInfoLabel_->setText(
             tr("%1 points, %2 triangles, revision %3%4")
-                .arg(document_.cloud().points.size())
-                .arg(mesh.triangleCount())
+                .arg(document_.cloudSize())
+                .arg(triangles)
                 .arg(document_.revision())
                 .arg(document_.isMetric() ? QString() : tr(" (non-metric)")));
     }
@@ -1977,8 +1995,7 @@ void MainWindow::updateControlStates() {
     completeButton_->setEnabled(connected_);
     cancelButton_->setEnabled(connected_ && streaming_);
     if (openEditBtn_) {
-        openEditBtn_->setEnabled(document_.isMetric() &&
-                                 !document_.cloud().points.empty());
+        openEditBtn_->setEnabled(document_.isMetric() && !document_.cloudEmpty());
     }
     if (undoButton_) {
         undoButton_->setEnabled(document_.canUndo());

@@ -363,7 +363,7 @@ private:
             QMutexLocker lock(&kfMutex_);
             kf = static_cast<int>(keyframes_.size());
         }
-        emit stats(fitness, static_cast<int>(document_->cloud().points.size()), kf);
+        emit stats(fitness, static_cast<int>(document_->cloudSize()), kf);
     }
 
     void seedModel(const pointcloud::PointCloud& src, bool metric) {
@@ -523,9 +523,12 @@ private:
         // few frames: preparing it dominated per-frame cost, and tracking
         // against a model a few frames old loses nothing measurable.
         if (!icpTarget_ || ++framesSinceTarget_ >= kIcpTargetRefreshFrames) {
+            pointcloud::PointCloud coarse;
+            document_->withCloud([&](const pointcloud::PointCloud& c) {
+                coarse = voxelDownsample(c, icpModelVoxelM());
+            });
             icpTarget_ = std::make_unique<PlaneIcpTarget>(
-                voxelDownsample(document_->cloud(), icpModelVoxelM()),
-                std::max(0.004f, 3.0f * icpModelVoxelM()));
+                std::move(coarse), std::max(0.004f, 3.0f * icpModelVoxelM()));
             framesSinceTarget_ = 0;
         }
         const PlaneIcpTarget& model = *icpTarget_;
@@ -591,7 +594,7 @@ private:
             return;
         }
 
-        const bool modelUsable = !document_->cloud().points.empty() &&
+        const bool modelUsable = !document_->cloudEmpty() &&
                                  document_->isMetric() == item.metric && hasPose_;
         if (!modelUsable) {
             // Seed with a finer cloud so the first view isn't sparse.
@@ -842,7 +845,7 @@ void ScanPipeline::setPointDistance(float mm) {
 bool ScanPipeline::completeAndMesh(const std::string& workerScript,
                                    const std::string& pythonExecutable,
                                    std::string* errorOut) {
-    if (!document_ || !document_->isMetric() || document_->cloud().points.empty()) {
+    if (!document_ || !document_->isMetric() || document_->cloudEmpty()) {
         if (errorOut) {
             *errorOut = "no metric point cloud to mesh";
         }
@@ -874,11 +877,11 @@ bool ScanPipeline::completeAndMesh(const std::string& workerScript,
         params.voxelM = std::max(0.001f, modelVoxelM_.load());
         params.minDepthM = depthClipNearM_.load();
         params.maxDepthM = depthClipFarM_.load();
-        geometry::TriangleMesh mesh =
-            geometry::reconstructTsdf(frames, document_->cloud(), 0.01f, params);
+        // Copy once: the worker may still be fusing queued frames.
+        const pointcloud::PointCloud model = document_->cloudCopy();
+        geometry::TriangleMesh mesh = geometry::reconstructTsdf(frames, model, 0.01f, params);
         // Base removal + floating-fragment cleanup against the tracked model.
-        geometry::cleanMesh(mesh, document_->cloud(),
-                            std::max(0.004f, 3.0f * params.voxelM));
+        geometry::cleanMesh(mesh, model, std::max(0.004f, 3.0f * params.voxelM));
         geometry::smoothMeshTaubin(mesh, kFinalMeshSmoothIterations);
         if (!mesh.empty()) {
             document_->setMesh(std::move(mesh), true, "tsdf");
@@ -1011,7 +1014,7 @@ bool ScanPipeline::completeWithPoisson(const std::string& workerScript,
                                        std::string* errorOut) {
     const std::string ply = "/tmp/all3dscan_fuse.ply";
     const std::string meshPath = "/tmp/all3dscan_fuse.mesh.ply";
-    auto plyResult = io::writePlyCloud(ply, document_->cloud(), true, {});
+    auto plyResult = io::writePlyCloud(ply, document_->cloudCopy(), true, {});
     if (!plyResult.ok) {
         if (errorOut) {
             *errorOut = plyResult.error;

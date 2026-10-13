@@ -64,22 +64,35 @@ pointcloud::PointCloud voxelDownsample(const pointcloud::PointCloud& in, float v
 } // namespace
 
 void ScanDocument::clear() {
+    std::unique_lock lock(mutex_);
     history_.clear();
     index_ = 0;
     nextId_ = 1;
 }
 
 uint64_t ScanDocument::revision() const {
+    std::shared_lock lock(mutex_);
     return history_.empty() ? 0 : current().id;
 }
 
-bool ScanDocument::canUndo() const { return index_ > 0 && !history_.empty(); }
-bool ScanDocument::canRedo() const {
+bool ScanDocument::canUndoLocked() const { return index_ > 0 && !history_.empty(); }
+bool ScanDocument::canRedoLocked() const {
     return !history_.empty() && index_ + 1 < history_.size();
 }
 
+bool ScanDocument::canUndo() const {
+    std::shared_lock lock(mutex_);
+    return canUndoLocked();
+}
+
+bool ScanDocument::canRedo() const {
+    std::shared_lock lock(mutex_);
+    return canRedoLocked();
+}
+
 bool ScanDocument::undo() {
-    if (!canUndo()) {
+    std::unique_lock lock(mutex_);
+    if (!canUndoLocked()) {
         return false;
     }
     --index_;
@@ -87,7 +100,8 @@ bool ScanDocument::undo() {
 }
 
 bool ScanDocument::redo() {
-    if (!canRedo()) {
+    std::unique_lock lock(mutex_);
+    if (!canRedoLocked()) {
         return false;
     }
     ++index_;
@@ -95,18 +109,57 @@ bool ScanDocument::redo() {
 }
 
 bool ScanDocument::isMetric() const {
+    std::shared_lock lock(mutex_);
     return !history_.empty() && current().metric;
 }
 
 const pointcloud::PointCloud& ScanDocument::cloud() const {
+    std::shared_lock lock(mutex_);
     return history_.empty() ? empty_.cloud : current().cloud;
 }
 
 const geometry::TriangleMesh& ScanDocument::mesh() const {
+    std::shared_lock lock(mutex_);
     return history_.empty() ? empty_.mesh : current().mesh;
 }
 
+bool ScanDocument::cloudEmpty() const {
+    std::shared_lock lock(mutex_);
+    return history_.empty() || current().cloud.points.empty();
+}
+
+size_t ScanDocument::cloudSize() const {
+    std::shared_lock lock(mutex_);
+    return history_.empty() ? 0 : current().cloud.points.size();
+}
+
+bool ScanDocument::meshEmpty() const {
+    std::shared_lock lock(mutex_);
+    return history_.empty() || current().mesh.empty();
+}
+
+bool ScanDocument::meshHasColors() const {
+    std::shared_lock lock(mutex_);
+    return !history_.empty() && current().mesh.hasColors;
+}
+
+bool ScanDocument::meshIsMetric() const {
+    std::shared_lock lock(mutex_);
+    return !history_.empty() && current().mesh.metric;
+}
+
+pointcloud::PointCloud ScanDocument::cloudCopy() const {
+    std::shared_lock lock(mutex_);
+    return history_.empty() ? pointcloud::PointCloud{} : current().cloud;
+}
+
+geometry::TriangleMesh ScanDocument::meshCopy() const {
+    std::shared_lock lock(mutex_);
+    return history_.empty() ? geometry::TriangleMesh{} : current().mesh;
+}
+
 geometry::GeometrySnapshot ScanDocument::snapshot() const {
+    std::shared_lock lock(mutex_);
     geometry::GeometrySnapshot snap;
     if (history_.empty()) {
         return snap;
@@ -135,6 +188,12 @@ const ScanDocument::Revision& ScanDocument::current() const {
 }
 
 void ScanDocument::setCloud(pointcloud::PointCloud cloud, bool metric, const std::string& label) {
+    std::unique_lock lock(mutex_);
+    setCloudLocked(std::move(cloud), metric, label);
+}
+
+void ScanDocument::setCloudLocked(pointcloud::PointCloud cloud, bool metric,
+                                  const std::string& label) {
     Revision rev;
     rev.cloud = std::move(cloud);
     rev.metric = metric;
@@ -146,6 +205,7 @@ void ScanDocument::setCloud(pointcloud::PointCloud cloud, bool metric, const std
 }
 
 void ScanDocument::setMesh(geometry::TriangleMesh mesh, bool metric, const std::string& label) {
+    std::unique_lock lock(mutex_);
     Revision rev;
     if (!history_.empty()) {
         rev.cloud = current().cloud;
@@ -165,6 +225,7 @@ void ScanDocument::fuseCloud(const pointcloud::PointCloud& cloud, float voxelSiz
     if (cloud.points.empty()) {
         return;
     }
+    std::unique_lock lock(mutex_);
     // Only accumulate onto an existing base of the same metric-ness; switching
     // from preview to metric (or vice versa) starts a fresh model.
     if (!history_.empty() && current().metric == metric) {
@@ -186,11 +247,12 @@ void ScanDocument::fuseCloud(const pointcloud::PointCloud& cloud, float voxelSiz
     }
     pointcloud::PointCloud merged = cloud;
     merged = voxelDownsample(merged, voxelSizeM, /*preferNewest=*/true);
-    setCloud(std::move(merged), metric, label);
+    setCloudLocked(std::move(merged), metric, label);
 }
 
 bool ScanDocument::cropBox(float minX, float minY, float minZ, float maxX, float maxY,
                            float maxZ) {
+    std::unique_lock lock(mutex_);
     if (history_.empty()) {
         return false;
     }
@@ -201,11 +263,12 @@ bool ScanDocument::cropBox(float minX, float minY, float minZ, float maxX, float
             cropped.points.push_back(p);
         }
     }
-    setCloud(std::move(cropped), current().metric, "crop");
+    setCloudLocked(std::move(cropped), current().metric, "crop");
     return true;
 }
 
 bool ScanDocument::removeStatisticalOutliers(size_t nbNeighbors, double stdRatio) {
+    std::unique_lock lock(mutex_);
     if (history_.empty() || nbNeighbors == 0) {
         return false;
     }
@@ -250,7 +313,7 @@ bool ScanDocument::removeStatisticalOutliers(size_t nbNeighbors, double stdRatio
         filtered.points[i].b = filtered_pcl.points[i].b;
     }
 
-    setCloud(std::move(filtered), current().metric, "stat-outlier");
+    setCloudLocked(std::move(filtered), current().metric, "stat-outlier");
     return true;
 #else
     std::vector<double> meanDists(pts.size(), 0.0);
@@ -295,12 +358,13 @@ bool ScanDocument::removeStatisticalOutliers(size_t nbNeighbors, double stdRatio
             filtered.points.push_back(pts[i]);
         }
     }
-    setCloud(std::move(filtered), current().metric, "stat-outlier");
+    setCloudLocked(std::move(filtered), current().metric, "stat-outlier");
     return true;
 #endif
 }
 
 bool ScanDocument::deleteSelected(const std::vector<size_t>& indices) {
+    std::unique_lock lock(mutex_);
     if (history_.empty() || indices.empty()) {
         return false;
     }
@@ -311,11 +375,12 @@ bool ScanDocument::deleteSelected(const std::vector<size_t>& indices) {
             kept.points.push_back(current().cloud.points[i]);
         }
     }
-    setCloud(std::move(kept), current().metric, "delete");
+    setCloudLocked(std::move(kept), current().metric, "delete");
     return true;
 }
 
 bool ScanDocument::basePlaneRemoval(double distanceThresholdM) {
+    std::unique_lock lock(mutex_);
     if (history_.empty() || current().cloud.points.size() < 3) {
         return false;
     }
@@ -330,11 +395,12 @@ bool ScanDocument::basePlaneRemoval(double distanceThresholdM) {
             kept.points.push_back(p);
         }
     }
-    setCloud(std::move(kept), current().metric, "base-removal");
+    setCloudLocked(std::move(kept), current().metric, "base-removal");
     return true;
 }
 
 bool ScanDocument::smoothMLS(double searchRadiusM) {
+    std::unique_lock lock(mutex_);
     if (history_.empty() || current().cloud.points.size() < 10) {
         return false;
     }
@@ -380,7 +446,7 @@ bool ScanDocument::smoothMLS(double searchRadiusM) {
             smoothed.points[i].b = 200;
         }
     }
-    setCloud(std::move(smoothed), current().metric, "mls-smooth");
+    setCloudLocked(std::move(smoothed), current().metric, "mls-smooth");
     return true;
 #else
     return false;

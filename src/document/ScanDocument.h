@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,13 @@ namespace revoscan::document {
 // Immutable-revision scan document. Metric registration / edits push new
 // revisions; undo/redo switches the current index. Vendor-raw previews must
 // never be committed with metric=true.
+//
+// Thread safety: the scan pipeline fuses into the document on its worker
+// thread while the UI reads it, so every public method takes an internal
+// reader/writer lock. cloud() / mesh() return references that are NOT
+// protected once returned — use them only when no other thread can write
+// (tests, single-threaded tools). Cross-thread code must use withCloud /
+// withMesh / cloudCopy / meshCopy or the scalar queries.
 class ScanDocument {
 public:
     void clear();
@@ -23,9 +32,30 @@ public:
     bool redo();
 
     bool isMetric() const;
-    const pointcloud::PointCloud& cloud() const;
-    const geometry::TriangleMesh& mesh() const;
+    const pointcloud::PointCloud& cloud() const; // unsynchronised, see above
+    const geometry::TriangleMesh& mesh() const;  // unsynchronised, see above
     geometry::GeometrySnapshot snapshot() const;
+
+    // Thread-safe access.
+    bool cloudEmpty() const;
+    size_t cloudSize() const;
+    bool meshEmpty() const;
+    bool meshHasColors() const;
+    bool meshIsMetric() const;
+    pointcloud::PointCloud cloudCopy() const;
+    geometry::TriangleMesh meshCopy() const;
+    // Runs fn(const PointCloud&) / fn(const TriangleMesh&) under the read
+    // lock; writers wait until it returns, so keep fn short.
+    template <typename Fn>
+    void withCloud(Fn&& fn) const {
+        std::shared_lock lock(mutex_);
+        fn(history_.empty() ? empty_.cloud : current().cloud);
+    }
+    template <typename Fn>
+    void withMesh(Fn&& fn) const {
+        std::shared_lock lock(mutex_);
+        fn(history_.empty() ? empty_.mesh : current().mesh);
+    }
 
     // Appends a metric frame cloud into a voxel grid (simple native fusion).
     void fuseMetricCloud(const pointcloud::PointCloud& cloud, float voxelSizeM = 0.002f);
@@ -56,9 +86,14 @@ private:
         std::string label;
     };
 
+    // Callers hold the lock.
     void push(Revision rev);
     const Revision& current() const;
+    void setCloudLocked(pointcloud::PointCloud cloud, bool metric, const std::string& label);
+    bool canUndoLocked() const;
+    bool canRedoLocked() const;
 
+    mutable std::shared_mutex mutex_;
     std::vector<Revision> history_;
     size_t index_ = 0;
     uint64_t nextId_ = 1;
