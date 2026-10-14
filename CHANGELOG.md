@@ -4,6 +4,27 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261014-2330
+
+### Fixed
+- **Blue laser mode did nothing when you picked it.** The Scan Mode box was
+  usable before the scanner was connected — and connecting can take up to a
+  minute when the scanner has to reboot. Picking blue laser in that window
+  was silently rejected and the box snapped back to Infrared, which looked
+  like the feature simply did not work.
+  - The scanner controls (scan mode, lights, exposure) are now greyed out
+    until the scanner is actually connected, and say so.
+  - They also grey out while connecting, and again when you disconnect.
+- Found by driving the real window — pressing Connect and changing the box —
+  rather than the protocol underneath it, which is why the earlier round of
+  testing missed it. Verified: two full round trips through the window,
+  infrared -> blue laser -> infrared, both clean.
+
+### Added
+- `all3dscan --gui-mode-test` drives the actual window (Connect, then the
+  Scan Mode box) and reports what the widgets do, so this class of bug is
+  reproducible without clicking.
+
 ## Alpha-v20261014-2300
 
 ### Fixed

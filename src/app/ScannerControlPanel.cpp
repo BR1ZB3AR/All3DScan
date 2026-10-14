@@ -254,6 +254,10 @@ void ScannerControlPanel::refreshFromProtocol() {
     if (switchingMode_) {
         return; // keep the "switching…" message
     }
+    if (proto_->state() == protocol::ConnectionState::Disconnected) {
+        statusLabel_->setText(tr("Connect the scanner to use these controls."));
+        return;
+    }
     if (proto_->supportsLight(protocol::Light::Projector)) {
         statusLabel_->setText(
             state.mode == protocol::ScanMode::BlueLaser
@@ -268,14 +272,19 @@ void ScannerControlPanel::refreshFromProtocol() {
 void ScannerControlPanel::applyEnabledState() {
     const auto caps = proto_ ? proto_->controlCapabilities()
                              : protocol::ScannerControlCapabilities{};
-    const bool busy = switchingMode_;
-    const bool lights = proto_ && proto_->supportsLight(protocol::Light::Projector);
-    modeBox_->setEnabled(caps.scanMode && !busy);
-    exposureSlider_->setEnabled(caps.exposure && !busy);
-    emittersOffBtn_->setEnabled(caps.emitterOff && !busy);
-    projectorBtn_->setEnabled(lights && !busy);
-    fillLightBtn_->setEnabled(lights && !busy);
-    fillSlider_->setEnabled(lights && !busy);
+    // Every one of these talks to the scanner, so none of them may be offered
+    // before it is actually connected: the window used to let you pick a scan
+    // mode while Connect was still running, and the choice was silently
+    // reverted.
+    const bool live =
+        proto_ && proto_->state() != protocol::ConnectionState::Disconnected && !switchingMode_;
+    const bool lights = live && proto_->supportsLight(protocol::Light::Projector);
+    modeBox_->setEnabled(live && caps.scanMode);
+    exposureSlider_->setEnabled(live && caps.exposure);
+    emittersOffBtn_->setEnabled(live && caps.emitterOff);
+    projectorBtn_->setEnabled(lights);
+    fillLightBtn_->setEnabled(lights);
+    fillSlider_->setEnabled(lights);
 }
 
 } // namespace revoscan::app

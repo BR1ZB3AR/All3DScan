@@ -1,5 +1,7 @@
 #include "ScannerController.h"
 
+#include <cstdio>
+
 #include <QByteArray>
 
 #include <algorithm>
@@ -193,8 +195,9 @@ void ScannerController::setScanModeAsync(protocol::ScanMode mode) {
             [this, ok, wasStreaming] {
                 switchingMode_ = false;
                 if (!ok) {
-                    emit errorOccurred(
-                        protocolError(*proto_, tr("Failed to change scan mode")));
+                    const QString why = protocolError(*proto_, tr("Failed to change scan mode"));
+                    std::fprintf(stderr, "[scan-mode] %s\n", why.toStdString().c_str());
+                    emit errorOccurred(why);
                 }
                 if (wasStreaming) {
                     // setScanMode restores streaming itself when it reopens

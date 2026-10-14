@@ -3,6 +3,8 @@
 #include <QDir>
 #include <QIcon>
 #include <QTimer>
+#include <QPushButton>
+#include <QComboBox>
 
 #include <algorithm>
 #include <chrono>
@@ -638,7 +640,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261014-2300");
+    QApplication::setApplicationVersion("Alpha-v20261014-2330");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
@@ -657,6 +659,95 @@ int main(int argc, char** argv) {
 
     revoscan::app::MainWindow window;
     window.show();
+    // --gui-mode-test: drive the real window the way a user does — press
+    // Connect, then pick "Blue laser speckle" in the Scan Mode box — and
+    // report what the widgets actually do. Exercises the panel -> MainWindow
+    // -> ScannerController chain that a protocol-level test cannot reach.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) != "--gui-mode-test") {
+            continue;
+        }
+        QTimer::singleShot(500, &window, [&window] {
+            auto pump = [](int ms) {
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+                while (std::chrono::steady_clock::now() < until) {
+                    QApplication::processEvents(QEventLoop::AllEvents, 10);
+                }
+            };
+            auto* combo = window.findChild<QComboBox*>();
+            const auto boxes = window.findChildren<QComboBox*>();
+            QComboBox* modeBox = nullptr;
+            for (auto* b : boxes) {
+                for (int k = 0; k < b->count(); ++k) {
+                    if (b->itemText(k).contains("laser", Qt::CaseInsensitive)) {
+                        modeBox = b;
+                    }
+                }
+            }
+            (void)combo;
+            if (!modeBox) {
+                std::cout << "FAIL: no Scan Mode box found in the window\n";
+                QApplication::quit();
+                return;
+            }
+            std::cout << "Scan Mode box: enabled=" << modeBox->isEnabled()
+                      << " items=" << modeBox->count() << " current=\""
+                      << modeBox->currentText().toStdString() << "\"\n";
+
+            QPushButton* connectBtn = nullptr;
+            for (auto* b : window.findChildren<QPushButton*>()) {
+                if (b->text().compare("Connect", Qt::CaseInsensitive) == 0) {
+                    connectBtn = b;
+                }
+            }
+            if (!connectBtn) {
+                std::cout << "FAIL: no Connect button\n";
+                QApplication::quit();
+                return;
+            }
+            std::cout << "pressing Connect…\n";
+            connectBtn->click();
+            for (int t = 0; t < 180 && connectBtn->text().compare("Disconnect", Qt::CaseInsensitive) != 0; ++t) {
+                pump(1000);
+            }
+            std::cout << "after connect: button=\"" << connectBtn->text().toStdString()
+                      << "\" modeBox enabled=" << modeBox->isEnabled() << "\n";
+            pump(3000);
+
+            int blueIndex = -1;
+            for (int k = 0; k < modeBox->count(); ++k) {
+                if (modeBox->itemText(k).contains("laser", Qt::CaseInsensitive)) {
+                    blueIndex = k;
+                }
+            }
+            std::cout << "selecting item " << blueIndex << " (\""
+                      << modeBox->itemText(blueIndex).toStdString() << "\")\n";
+            modeBox->setCurrentIndex(blueIndex);
+            for (int t = 0; t < 90; ++t) {
+                pump(1000);
+                if (modeBox->isEnabled()) {
+                    break; // re-enabled once the switch reported back
+                }
+            }
+            std::cout << "after selecting: current=\"" << modeBox->currentText().toStdString()
+                      << "\" enabled=" << modeBox->isEnabled() << "\n";
+            pump(3000);
+            std::cout << "selecting item 0 (back to infrared)…\n";
+            modeBox->setCurrentIndex(0);
+            pump(1000);
+            std::cout << "  during switch: enabled=" << modeBox->isEnabled() << "\n";
+            for (int t = 0; t < 120; ++t) {
+                pump(1000);
+                if (modeBox->isEnabled()) {
+                    break;
+                }
+            }
+            std::cout << "after switching back: current=\"" << modeBox->currentText().toStdString()
+                      << "\" enabled=" << modeBox->isEnabled() << "\n";
+            pump(2000);
+            QApplication::quit();
+        });
+    }
     // --screenshot <file.png>: render the main window itself (QWidget::grab,
     // nothing else on screen) after startup and exit. For docs / UI checks.
     for (int i = 1; i + 1 < argc; ++i) {

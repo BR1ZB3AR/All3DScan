@@ -1295,12 +1295,18 @@ void MainWindow::onConnectToggle() {
         connLabel_->setText(tr("● Connecting… (up to ~45 s if the scanner has to reboot)"));
         connLabel_->setStyleSheet("color:#d0a24c;");
         controller_->connectDeviceAsync();
+        if (scannerControls_) {
+            scannerControls_->refreshFromProtocol();
+        }
         return;
     }
     controller_->disconnectDevice();
     connected_ = false;
     streaming_ = false;
     scanning_ = false;
+    if (scannerControls_) {
+        scannerControls_->refreshFromProtocol(); // grey the scanner controls out
+    }
     connectBtn_->setText(tr("Connect"));
     connLabel_->setText(tr("● Disconnected"));
     connLabel_->setStyleSheet("color:#d95c5c;");
@@ -1309,7 +1315,8 @@ void MainWindow::onConnectToggle() {
 
 void MainWindow::onConnectFinished(bool ok) {
     connected_ = ok;
-    if (connected_ && scannerControls_) {
+    if (scannerControls_) {
+        // Also on failure: the panel must stop offering scanner controls.
         scannerControls_->bindProtocol(controller_->protocol());
     }
     streaming_ = connected_ && controller_->startScan();
