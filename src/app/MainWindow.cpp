@@ -479,6 +479,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     scannerControls_->bindProtocol(controller_->protocol());
     connect(scannerControls_, &ScannerControlPanel::controlError, this, &MainWindow::onError);
+    // A mode change resets and reopens the protocol, so the controller runs it
+    // with frame polling suspended, like connect.
+    connect(scannerControls_, &ScannerControlPanel::scanModeRequested, this, [this](int mode) {
+        if (!connected_) {
+            scannerControls_->finishModeChange(false, tr("Connect the scanner first"));
+            return;
+        }
+        controller_->setScanModeAsync(static_cast<protocol::ScanMode>(mode));
+    });
+    connect(controller_.get(), &ScannerController::scanModeFinished, this, [this](bool ok) {
+        scannerControls_->finishModeChange(ok);
+        updateControlStates();
+    });
     connect(editPanel_, &EditPanel::documentEdited, this, &MainWindow::onDocumentUpdated);
     connect(editPanel_, &EditPanel::editError, this, &MainWindow::onError);
 

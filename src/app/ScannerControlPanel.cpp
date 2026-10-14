@@ -184,28 +184,13 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
     applyEnabledState();
 }
 
-ScannerControlPanel::~ScannerControlPanel() {
-    if (modeThread_.joinable()) {
-        modeThread_.join();
-    }
-}
-
 void ScannerControlPanel::startModeChange(protocol::ScanMode mode) {
-    if (modeThread_.joinable()) {
-        modeThread_.join();
-    }
     switchingMode_ = true;
     applyEnabledState();
     statusLabel_->setText(mode == protocol::ScanMode::BlueLaser
                               ? tr("Switching to blue laser speckle…")
                               : tr("Back to infrared: the scanner reboots, about 40 seconds…"));
-    auto* proto = proto_;
-    modeThread_ = std::thread([this, proto, mode] {
-        const bool ok = proto->setScanMode(mode);
-        const QString error = ok ? QString() : QString::fromStdString(proto->lastError());
-        QMetaObject::invokeMethod(
-            this, [this, ok, error] { finishModeChange(ok, error); }, Qt::QueuedConnection);
-    });
+    emit scanModeRequested(static_cast<int>(mode));
 }
 
 void ScannerControlPanel::finishModeChange(bool ok, const QString& error) {

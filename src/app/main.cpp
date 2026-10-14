@@ -18,6 +18,7 @@
 #include <string_view>
 
 #include "MainWindow.h"
+#include "ScannerController.h"
 #include "bridge/RustBridge.h"
 #include "decoder/Pop4DepthDecoder.h"
 #include "document/ScanDocument.h"
@@ -155,6 +156,73 @@ int pop4ModeTest(const char* outDir) {
     scanner->stopStream();
     scanner->disconnect();
     return entered && restored ? 0 : 3;
+}
+
+// Exercises the exact path the GUI uses — ScannerController with frame
+// polling running — rather than the protocol on its own, so a mode switch
+// that races the poll timer shows up here instead of only in the app.
+//   all3dscan --pop4-mode-cycle
+int pop4ModeCycle() {
+    int argc = 0;
+    QApplication app(argc, nullptr); // the controller needs a Qt event loop
+    revoscan::app::ScannerController controller(revoscan::protocol::makeRevopointPop4Protocol());
+    int frames = 0;
+    QObject::connect(&controller, &revoscan::app::ScannerController::frameReady,
+                     [&] { ++frames; });
+    QObject::connect(&controller, &revoscan::app::ScannerController::errorOccurred,
+                     [](const QString& e) { std::cout << "  error: " << e.toStdString() << '\n'; });
+    if (!controller.connectDevice()) {
+        std::cerr << "connect failed\n";
+        return 2;
+    }
+    if (!controller.startScan()) {
+        std::cerr << "startScan failed\n";
+        return 3;
+    }
+    auto pump = [&](int ms) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < until) {
+            app.processEvents(QEventLoop::AllEvents, 10);
+        }
+    };
+    auto switchTo = [&](revoscan::protocol::ScanMode mode, const char* name) {
+        bool done = false;
+        bool ok = false;
+        QMetaObject::Connection c = QObject::connect(
+            &controller, &revoscan::app::ScannerController::scanModeFinished,
+            [&](bool r) { ok = r; done = true; });
+        const int before = frames;
+        const auto t0 = std::chrono::steady_clock::now();
+        controller.setScanModeAsync(mode);
+        while (!done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(120)) {
+            app.processEvents(QEventLoop::AllEvents, 10);
+        }
+        QObject::disconnect(c);
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << name << ": " << (done ? (ok ? "ok" : "FAILED") : "TIMED OUT") << " in "
+                  << secs << " s (frames during switch: " << frames - before << ")" << std::endl;
+        pump(4000);
+        std::cout << "    protocol state after: "
+                  << static_cast<int>(controller.protocol()->state())
+                  << " (2=streaming), decode: "
+                  << controller.protocol()->depthDecodeStats().validFraction() * 100 << "% valid"
+                  << std::endl;
+        return done && ok;
+    };
+    pump(2000);
+    std::cout << "streaming before switch: " << frames << " frames\n";
+    const int a = frames;
+    const bool toBlue = switchTo(revoscan::protocol::ScanMode::BlueLaser, "-> blue laser speckle");
+    pump(4000);
+    std::cout << "frames after entering speckle: " << frames - a << '\n';
+    const int b = frames;
+    const bool toIr = switchTo(revoscan::protocol::ScanMode::StructuredLight, "-> infrared");
+    pump(4000);
+    std::cout << "frames after restoring infrared: " << frames - b << '\n';
+    controller.stopScan();
+    controller.disconnectDevice();
+    return toBlue && toIr ? 0 : 4;
 }
 
 int probePop4() {
@@ -520,6 +588,9 @@ int main(int argc, char** argv) {
     std::cout << "All3DScan Rust Core v" << revoscan::bridge::RustBridge::getVersion() << " initialized.\n";
 
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--pop4-mode-cycle") {
+            return pop4ModeCycle();
+        }
         if (std::string_view(argv[i]) == "--pop4-mode-test" && i + 1 < argc) {
             return pop4ModeTest(argv[i + 1]);
         }
@@ -567,7 +638,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261014-2219");
+    QApplication::setApplicationVersion("Alpha-v20261014-2300");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme

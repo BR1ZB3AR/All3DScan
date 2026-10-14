@@ -140,9 +140,12 @@ bool ScannerController::connectDevice() {
 }
 
 ScannerController::~ScannerController() {
-    // The worker uses proto_; never let it outlive the controller.
+    // The workers use proto_; never let them outlive the controller.
     if (connectThread_.joinable()) {
         connectThread_.join();
+    }
+    if (modeThread_.joinable()) {
+        modeThread_.join();
     }
 }
 
@@ -167,6 +170,41 @@ void ScannerController::connectDeviceAsync() {
                     emit errorOccurred(protocolError(*proto_, tr("Failed to connect to scanner")));
                 }
                 emit connectFinished(ok);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void ScannerController::setScanModeAsync(protocol::ScanMode mode) {
+    if (connecting_ || switchingMode_) {
+        return;
+    }
+    if (modeThread_.joinable()) {
+        modeThread_.join();
+    }
+    switchingMode_ = true;
+    const bool wasStreaming = proto_->state() == protocol::ConnectionState::Streaming;
+    pollTimer_.stop(); // nothing may touch the protocol while the worker owns it
+    protocol::IScannerProtocol* proto = proto_.get();
+    modeThread_ = std::thread([this, proto, mode, wasStreaming] {
+        const bool ok = proto->setScanMode(mode);
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok, wasStreaming] {
+                switchingMode_ = false;
+                if (!ok) {
+                    emit errorOccurred(
+                        protocolError(*proto_, tr("Failed to change scan mode")));
+                }
+                if (wasStreaming) {
+                    // setScanMode restores streaming itself when it reopens
+                    // the capture; make sure it is really running either way.
+                    if (proto_->state() != protocol::ConnectionState::Streaming) {
+                        (void)proto_->startStream();
+                    }
+                    pollTimer_.start();
+                }
+                emit scanModeFinished(ok);
             },
             Qt::QueuedConnection);
     });
@@ -222,8 +260,8 @@ bool ScannerController::captureSingleFrame() {
 }
 
 void ScannerController::poll() {
-    if (connecting_) {
-        return; // the connect worker owns the protocol until it reports back
+    if (connecting_ || switchingMode_) {
+        return; // a worker owns the protocol until it reports back
     }
     auto frame = proto_->readFrame(0);
     if (!frame) {

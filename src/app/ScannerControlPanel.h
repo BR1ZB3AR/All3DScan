@@ -1,8 +1,5 @@
 #pragma once
 
-#include <atomic>
-#include <thread>
-
 #include <QWidget>
 
 #include "protocol/ScannerProtocol.h"
@@ -21,7 +18,7 @@ class ScannerControlPanel : public QWidget {
 public:
     explicit ScannerControlPanel(QWidget* parent = nullptr);
 
-    ~ScannerControlPanel() override;
+
 
     void bindProtocol(protocol::IScannerProtocol* proto);
     void refreshFromProtocol();
@@ -29,13 +26,21 @@ public:
 signals:
     void controlsChanged();
     void controlError(const QString& message);
+    // The panel cannot safely drive a mode change itself: the protocol is
+    // reset underneath and frame polling must stop first, so MainWindow runs
+    // it through ScannerController and calls finishModeChange().
+    void scanModeRequested(int mode);
 
 private:
     void applyEnabledState();
     // Mode changes can reboot the scanner (~40 s), so they run off the UI
     // thread with every control disabled meanwhile.
     void startModeChange(protocol::ScanMode mode);
-    void finishModeChange(bool ok, const QString& error);
+
+public:
+    void finishModeChange(bool ok, const QString& error = {});
+
+private:
     QWidget* makeSliderRow(const QString& label, QSlider*& slider, QLabel*& valueLabel);
     void updateSliderValueLabel(QSlider* slider, QLabel* valueLabel);
 
@@ -54,7 +59,6 @@ private:
     QPushButton* fillLightBtn_ = nullptr;
     QSlider* fillSlider_ = nullptr;
     QLabel* fillValue_ = nullptr;
-    std::thread modeThread_;
     bool switchingMode_ = false;
 };
 

@@ -4,6 +4,28 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261014-2300
+
+### Fixed
+- **Blue laser mode did nothing when you selected it.** Two causes, both
+  found by driving the same code path the window uses:
+  - The scanner's command channel is not ready for the first few seconds
+    after it attaches — it answers "extension unit not found" even though
+    the camera is already streaming. The mode and light commands are now
+    retried for a few seconds instead of failing on the first try.
+  - The mode change ran on its own thread while the app kept reading frames
+    from the scanner, and switching back closes and reopens the camera
+    underneath. Mode changes now suspend frame polling for their duration,
+    exactly as Connect already did.
+- Verified end to end on hardware, three times in a row: switching to blue
+  laser is immediate and keeps streaming, and switching back restores
+  infrared in about 45 s with frames resuming.
+
+### Added
+- `all3dscan --pop4-mode-cycle` drives a full mode switch through the real
+  controller (with frame polling running), so this class of problem shows up
+  in a test instead of only in the app.
+
 ## Alpha-v20261014-2219
 
 ### Added

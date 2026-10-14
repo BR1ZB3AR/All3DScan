@@ -129,6 +129,7 @@ public:
             return false;
         }
 
+        captureNode_ = *node;
         if (!capture_.open(*node,
                            V4L2_PIX_FMT_Y16,
                            captureWidth_,
@@ -501,6 +502,7 @@ private:
         }
     }
 
+    std::string captureNode_;                   // which /dev/video* depth node
     std::optional<decoder::StereoRig> blueRig_; // /data/camparam_blue, if present
     // Indexed by Light (Projector, FillLight, IrLed). Arming leaves the
     // projector on and the fill light off.
@@ -530,6 +532,7 @@ private:
             lastError_ = "POP4 depth capture node did not reappear";
             return false;
         }
+        captureNode_ = *node;
         if (!capture_.open(*node, V4L2_PIX_FMT_Y16, captureWidth_, captureHeight_)) {
             lastError_ = capture_.lastError();
             return false;
@@ -772,9 +775,23 @@ private:
             std::array<uint8_t, 60> buf{};
             std::memcpy(buf.data(), cmds[i].data(), std::min(cmds[i].size(), buf.size() - 1));
             std::string error;
-            if (!usb::uvcExtensionSetCur(capture_.fd(), pop4::kXuUnitId, pop4::kSettingsSelector,
-                                         buf.data(), static_cast<uint16_t>(buf.size()), &error)) {
-                lastError_ = "POP4 command \"" + cmds[i] + "\" failed: " + error;
+            // For the first seconds after the scanner is (re)attached, uvcvideo
+            // has not yet built the chain that carries extension unit 4 and
+            // answers ENOENT. These are idempotent register writes, so retry
+            // briefly instead of failing the user's click.
+            bool sent = false;
+            for (int attempt = 0; attempt < 20 && !sent; ++attempt) {
+                sent = usb::uvcExtensionSetCur(capture_.fd(), pop4::kXuUnitId,
+                                               pop4::kSettingsSelector, buf.data(),
+                                               static_cast<uint16_t>(buf.size()), &error);
+                if (!sent) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+            }
+            if (!sent) {
+                lastError_ = "POP4 command \"" + cmds[i] + "\" failed on " +
+                             (captureNode_.empty() ? "the depth node" : captureNode_) + ": " +
+                             error;
                 return false;
             }
             if (std::getenv("ALL3DSCAN_POP4_DEBUG")) {

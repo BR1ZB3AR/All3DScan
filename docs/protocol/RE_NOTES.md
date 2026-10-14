@@ -110,6 +110,16 @@ run off the UI thread. A rebooting POP4 enumerates, drops and re-enumerates
 several times before settling, so the reset path retries the arm until it
 sticks rather than opening once.
 
+**The XU command channel is not ready the moment the scanner attaches.** For
+the first seconds after connect (and after any re-enumeration) uvcvideo has
+not finished building the chain that carries extension unit 4, and
+`UVCIOC_CTRL_QUERY` answers `ENOENT` ("Extension unit 4 not found"), even
+though the depth node is open and streaming. Probing the nodes directly shows
+unit 4 appearing on the depth and RGB nodes a moment later (`GET_LEN` = 60).
+Every command is an idempotent register write, so `sendDeviceCommands` retries
+for up to 5 s instead of failing. Without that, a mode or light change clicked
+right after connecting silently failed.
+
 Not found: how to select the vendor's `surface` / `speckle_stripe` accuracy
 modes as such, and what the always-on speckle emitter's controls are.
 `LASER_SPECKLE_MODE` in `libcameraSdk.so` is gated to camera type 0x19

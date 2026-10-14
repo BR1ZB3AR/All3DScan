@@ -27,6 +27,12 @@ public:
     // connectFinished() on the GUI thread. No-op while one is in flight.
     void connectDeviceAsync();
     bool isConnecting() const { return connecting_; }
+    // Switches the scanner's depth mode on a worker thread. Returning to
+    // infrared reboots the device (~40 s), and the protocol is reset and
+    // reopened underneath, so frame polling is suspended until it reports
+    // back — exactly as connectDeviceAsync() does.
+    void setScanModeAsync(protocol::ScanMode mode);
+    bool isBusy() const { return connecting_ || switchingMode_; }
     void disconnectDevice();
     bool startScan();
     void stopScan();
@@ -60,6 +66,7 @@ signals:
     void connected();
     void disconnected();
     void connectFinished(bool ok);
+    void scanModeFinished(bool ok);
     void frameReady(const pointcloud::PointCloud& cloud);
     void metricFrameReady(const pointcloud::PointCloud& cloud, quint64 timestampUs);
     void previewFrameReady(const pointcloud::PointCloud& cloud, quint64 timestampUs);
@@ -81,6 +88,8 @@ private:
     std::unique_ptr<protocol::IScannerProtocol> proto_;
     std::thread connectThread_;
     bool connecting_ = false;
+    bool switchingMode_ = false;
+    std::thread modeThread_;
     QTimer pollTimer_;
     pointcloud::PointCloud lastCloud_;
     protocol::RawFrame lastMetricDepth_;
