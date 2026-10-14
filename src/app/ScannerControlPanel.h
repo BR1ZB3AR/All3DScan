@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <thread>
+
 #include <QWidget>
 
 #include "protocol/ScannerProtocol.h"
@@ -18,6 +21,8 @@ class ScannerControlPanel : public QWidget {
 public:
     explicit ScannerControlPanel(QWidget* parent = nullptr);
 
+    ~ScannerControlPanel() override;
+
     void bindProtocol(protocol::IScannerProtocol* proto);
     void refreshFromProtocol();
 
@@ -27,6 +32,10 @@ signals:
 
 private:
     void applyEnabledState();
+    // Mode changes can reboot the scanner (~40 s), so they run off the UI
+    // thread with every control disabled meanwhile.
+    void startModeChange(protocol::ScanMode mode);
+    void finishModeChange(bool ok, const QString& error);
     QWidget* makeSliderRow(const QString& label, QSlider*& slider, QLabel*& valueLabel);
     void updateSliderValueLabel(QSlider* slider, QLabel* valueLabel);
 
@@ -41,6 +50,12 @@ private:
     QLabel* exposureValue_ = nullptr;
     QPushButton* emittersOffBtn_ = nullptr;
     QLabel* statusLabel_ = nullptr;
+    QPushButton* projectorBtn_ = nullptr;
+    QPushButton* fillLightBtn_ = nullptr;
+    QSlider* fillSlider_ = nullptr;
+    QLabel* fillValue_ = nullptr;
+    std::thread modeThread_;
+    bool switchingMode_ = false;
 };
 
 } // namespace revoscan::app

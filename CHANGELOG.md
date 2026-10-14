@@ -4,6 +4,39 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261014-2219
+
+### Added
+- **The scanner's built-in lights are now controllable**, using the
+  scanner's own commands (recovered from the RevoScan Android SDK and
+  checked against the hardware — see `docs/protocol/RE_NOTES.md`):
+  - **Pattern projector** on/off. This is the infrared projector that draws
+    the scan pattern; switching it off makes the pattern vanish from the
+    camera images.
+  - **Fill light** on/off with a brightness slider. These are the white LEDs
+    for the colour camera; RevoScan turns them on for marker scanning.
+  - "Emitters Off" now really turns both off.
+- **Blue laser speckle mode** (Scan Mode -> "Blue laser speckle"). The POP4
+  has a second, stronger projector with its own factory calibration on the
+  device (`/data/camparam_blue`), which the app now reads and caches. In
+  this mode the projected pattern is **62% stronger** and the scanner
+  returns **about 20-30% more depth points** per frame.
+  - Switching back to infrared reboots the scanner (~40 s) — that is the
+    only way back that works. It runs in the background, so the app stays
+    responsive, and the controls are disabled while it happens.
+- `all3dscan --pop4-lights-test <dir>` and `--pop4-mode-test <dir>` record
+  what each light and mode actually does, for future work.
+
+### Fixed
+- **Connect failed if you pressed it too soon after the previous session.**
+  The scanner drops off USB and re-enumerates after every session, and its
+  permissions land a moment later still; the app now waits for it instead of
+  giving up. Reconnecting after a USB reset is also retried until the
+  scanner settles, rather than once.
+- The controls that were never confirmed against the hardware (alignment
+  light, illumination and laser sliders) are hidden instead of looking
+  functional.
+
 ## Alpha-v20261013-2327
 
 ### Added

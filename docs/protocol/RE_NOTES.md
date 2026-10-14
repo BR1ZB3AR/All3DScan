@@ -52,6 +52,69 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Lights, projector and blue-laser speckle mode (2026-10-14)
+
+All of this was measured on a live POP4 (`--pop4-lights-test`,
+`--pop4-mode-test`), not just read out of the SDK. "Effect" is the change in
+local pattern contrast (std of image minus its 5x5 box mean) of the packed
+sub-images; images 4 and 9 are the ones the depth decoder matches on.
+
+| What | Command (XU4 selector 7) | Measured effect |
+|---|---|---|
+| Pattern projector on/off | `echo s 0xb04 1\|0 >/dev/rk_preisp` | Pattern contrast in images 0–3 / 5–8 collapses 3957 -> 517 when off; **images 4 and 9 do not change at all**. Infrared: toggling it is invisible to the colour camera (B/R 1.025 vs 1.022). On after arming. |
+| Fill light on | `0xb03 1`, `0xb02 1`, `0xb12 255` | Scene brightness +10% in all IR images; colour camera blue-shifts (B/R 1.04 -> 1.30). White/blue LEDs for the texture camera. |
+| Fill light off | `0xb03 0` | Returns to ambient. |
+| Fill light level | `0xb12 <0..255>` | Monotonic; 60 vs 255 clearly differs. |
+| Projector ("laser") level | `0x48d <0..255>` | **No measurable effect** in the default mode at any of 40/128/255. |
+| IR LED rail | `0xb01 1\|0`, level `0xb07` | Accepted, **no measurable effect** on a POP4. |
+
+Source for the command forms: `cs::Camera::ledAndLaserCtrl`
+(`lib3DCamera.so` @0x630fd4) dispatches on (ledid, ctrltype): ledid 0 = IR
+LED, 1 = RGB LED, 2 = laser; ctrltype 0/2 = on, 3 = off, 4 = luminance. The
+0xb12 255 in the fill-light sequence is the POP_4 / POP_4_PRO branch
+(@0x631884 tests camera type 0x20 / 0x21).
+
+**The depth images are not lit by the switchable projector.** Images 4 and 9
+keep their speckle whatever `0xb04` does, so depth yield is unchanged by it
+(9.03% vs 9.13% valid). There is a second, always-on speckle emitter.
+
+### Blue-laser speckle mode
+
+`cs::Camera::setSpeckleMode` (@0x63725c) is gated to camera types **0x20 /
+0x21 — POP_4 and POP_4_PRO only** — and sends:
+
+```
+echo s 0x3001 12 > /dev/rk_preisp     # enter speckle mode
+echo s 0x48d 180 > /dev/rk_preisp     # laserLuminance from the POP4 presets
+```
+
+Measured: pattern contrast of the depth images jumps **6463 -> 10456 (+62%)**
+and image 0 doubles (4006 -> 8551). Decoded depth yields **+21 to +30% more
+valid points** (9.7% -> 11.9% of frame). The scanner carries a matching
+second factory calibration at `/data/camparam_blue/camparam.yaml` (same
+`deviceID`, calibrated 12 s after the infrared one, different focal lengths
+and distortion — the two light sources have different wavelengths). The app
+prefetches it at connect and caches it as `<deviceID>-blue.yaml`.
+
+`resources/param_pop4.json` agrees: `laserLuminance` 180 appears only under
+accuracy modes `speckle` and `speckle_stripe` (exposure 200–1400 us, gain
+2–6), never under `surface` (exposure 3000–5400, what we use by default);
+`fillLightLuminance` 128 appears only under the `marker` presets.
+
+**Leaving speckle mode needs a reboot.** `echo s 0x3001 7` is the vendor's
+*other* POP4 mode value (laser line, @0x635410); sending it leaves the
+projector dead — all images drop to noise (contrast 460/300) — and re-arming
+with CS10+CS7 does not revive it. Only a USB reset does. `setScanMode` back
+to infrared therefore does reset + re-arm + reopen, which takes ~40 s and is
+run off the UI thread. A rebooting POP4 enumerates, drops and re-enumerates
+several times before settling, so the reset path retries the arm until it
+sticks rather than opening once.
+
+Not found: how to select the vendor's `surface` / `speckle_stripe` accuracy
+modes as such, and what the always-on speckle emitter's controls are.
+`LASER_SPECKLE_MODE` in `libcameraSdk.so` is gated to camera type 0x19
+(TRACER_R1), not POP4.
+
 ## Device command channel, fringe exposures and open questions (2026-10-13)
 
 **Corrections to the 2026-10-12 section below.** (1) Exposures 0–3 / 5–8

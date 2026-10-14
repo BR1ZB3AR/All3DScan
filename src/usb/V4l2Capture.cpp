@@ -8,6 +8,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/uvcvideo.h>
+#include <linux/usb/video.h>
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -238,6 +240,25 @@ void V4l2Capture::setError(const std::string& operation) {
     std::ostringstream message;
     message << operation << ": " << std::strerror(errno);
     lastError_ = message.str();
+}
+
+bool uvcExtensionSetCur(int fd, uint8_t unit, uint8_t selector, const uint8_t* data,
+                        uint16_t size, std::string* error) {
+    std::vector<uint8_t> buf(data, data + size);
+    uvc_xu_control_query q{};
+    q.unit = unit;
+    q.selector = selector;
+    q.query = UVC_SET_CUR;
+    q.size = size;
+    q.data = buf.data();
+    if (fd < 0 || ::ioctl(fd, UVCIOC_CTRL_QUERY, &q) != 0) {
+        if (error) {
+            *error = std::string("UVCIOC_CTRL_QUERY SET_CUR failed: ") +
+                     (fd < 0 ? "no open video node" : std::strerror(errno));
+        }
+        return false;
+    }
+    return true;
 }
 
 bool V4l2Capture::open(const std::string& path,

@@ -1,10 +1,12 @@
 #include "ScannerControlPanel.h"
 
+#include <QApplication>
 #include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QSlider>
+#include <QMetaObject>
 #include <QVBoxLayout>
 
 namespace revoscan::app {
@@ -65,22 +67,45 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
     modeV->setSpacing(4);
     modeV->addWidget(new QLabel(tr("Scan Mode"), this));
     modeBox_ = new QComboBox(this);
-    modeBox_->addItem(tr("Structured Light"),
+    modeBox_->addItem(tr("Infrared (default)"),
                       static_cast<int>(protocol::ScanMode::StructuredLight));
-    modeBox_->addItem(tr("Blue Laser"), static_cast<int>(protocol::ScanMode::BlueLaser));
+    modeBox_->addItem(tr("Blue laser speckle (sharper, experimental)"),
+                      static_cast<int>(protocol::ScanMode::BlueLaser));
+    modeBox_->setToolTip(
+        tr("Blue laser speckle projects a much stronger pattern (about 20% more\n"
+           "depth points). Switching back to infrared reboots the scanner and\n"
+           "takes about 40 seconds."));
     modeV->addWidget(modeBox_);
     root->addWidget(modeSection);
 
-    // Section: Alignment Light
+    // Section: built-in lights (verified device commands)
+    auto* lightsLabel = new QLabel(tr("Lights"), this);
+    lightsLabel->setObjectName("FieldLabel");
+    root->addWidget(lightsLabel);
+
+    projectorBtn_ = new QPushButton(tr("Pattern projector"), this);
+    projectorBtn_->setCheckable(true);
+    projectorBtn_->setToolTip(tr("The infrared projector that draws the scan pattern."));
+    root->addWidget(projectorBtn_);
+
+    fillLightBtn_ = new QPushButton(tr("Fill light"), this);
+    fillLightBtn_->setCheckable(true);
+    fillLightBtn_->setToolTip(
+        tr("White LEDs for the colour camera. RevoScan turns these on for\n"
+           "marker scanning."));
+    root->addWidget(fillLightBtn_);
+
+    root->addWidget(makeSliderRow(tr("Fill light brightness"), fillSlider_, fillValue_));
+
+    // Keep the alignment guide / CS7 rows hidden: unlike the above they are
+    // not confirmed against the scanner.
     alignBtn_ = new QPushButton(tr("Alignment Light"), this);
     alignBtn_->setCheckable(true);
-    root->addWidget(alignBtn_);
-
-    // Section: Illumination
-    root->addWidget(makeSliderRow(tr("Illumination"), illumSlider_, illumValue_));
-
-    // Section: Scan Laser
-    root->addWidget(makeSliderRow(tr("Scan Laser"), laserSlider_, laserValue_));
+    alignBtn_->hide();
+    illumSlider_ = new QSlider(Qt::Horizontal, this);
+    illumSlider_->hide();
+    laserSlider_ = new QSlider(Qt::Horizontal, this);
+    laserSlider_->hide();
 
     // Section: Exposure
     root->addWidget(makeSliderRow(tr("Exposure"), exposureSlider_, exposureValue_));
@@ -98,12 +123,28 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
 
     // Connections
     connect(modeBox_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (!proto_ || switchingMode_) return;
+        startModeChange(static_cast<protocol::ScanMode>(modeBox_->currentData().toInt()));
+    });
+    connect(projectorBtn_, &QPushButton::toggled, this, [this](bool on) {
         if (!proto_) return;
-        const auto mode = static_cast<protocol::ScanMode>(modeBox_->currentData().toInt());
-        if (!proto_->setScanMode(mode)) {
+        if (!proto_->setLight(protocol::Light::Projector, on)) {
             emit controlError(QString::fromStdString(proto_->lastError()));
         }
-        emit controlsChanged();
+        refreshFromProtocol();
+    });
+    connect(fillLightBtn_, &QPushButton::toggled, this, [this](bool on) {
+        if (!proto_) return;
+        if (!proto_->setLight(protocol::Light::FillLight, on)) {
+            emit controlError(QString::fromStdString(proto_->lastError()));
+        }
+        refreshFromProtocol();
+    });
+    connect(fillSlider_, &QSlider::sliderReleased, this, [this]() {
+        if (!proto_) return;
+        if (!proto_->setLightLevel(protocol::Light::FillLight, fillSlider_->value())) {
+            emit controlError(QString::fromStdString(proto_->lastError()));
+        }
     });
     connect(alignBtn_, &QPushButton::toggled, this, [this](bool on) {
         if (!proto_) return;
@@ -143,6 +184,39 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
     applyEnabledState();
 }
 
+ScannerControlPanel::~ScannerControlPanel() {
+    if (modeThread_.joinable()) {
+        modeThread_.join();
+    }
+}
+
+void ScannerControlPanel::startModeChange(protocol::ScanMode mode) {
+    if (modeThread_.joinable()) {
+        modeThread_.join();
+    }
+    switchingMode_ = true;
+    applyEnabledState();
+    statusLabel_->setText(mode == protocol::ScanMode::BlueLaser
+                              ? tr("Switching to blue laser speckle…")
+                              : tr("Back to infrared: the scanner reboots, about 40 seconds…"));
+    auto* proto = proto_;
+    modeThread_ = std::thread([this, proto, mode] {
+        const bool ok = proto->setScanMode(mode);
+        const QString error = ok ? QString() : QString::fromStdString(proto->lastError());
+        QMetaObject::invokeMethod(
+            this, [this, ok, error] { finishModeChange(ok, error); }, Qt::QueuedConnection);
+    });
+}
+
+void ScannerControlPanel::finishModeChange(bool ok, const QString& error) {
+    switchingMode_ = false;
+    if (!ok) {
+        emit controlError(error.isEmpty() ? tr("Scan mode change failed") : error);
+    }
+    refreshFromProtocol();
+    emit controlsChanged();
+}
+
 void ScannerControlPanel::bindProtocol(protocol::IScannerProtocol* proto) {
     proto_ = proto;
     refreshFromProtocol();
@@ -179,30 +253,44 @@ void ScannerControlPanel::refreshFromProtocol() {
             valueLbl->setText(QStringLiteral("%1%").arg(pct));
         }
     };
-    setSlider(illumSlider_, illumValue_, state.illuminationPower);
-    setSlider(laserSlider_, laserValue_, state.laserPower);
     setSlider(exposureSlider_, exposureValue_, state.exposure);
 
-    if (caps.scanMode || caps.alignmentGuide || caps.illuminationPower ||
-        caps.laserPower || caps.exposure) {
+    if (proto_->supportsLight(protocol::Light::Projector)) {
+        fillSlider_->setRange(0, 255);
+        projectorBtn_->blockSignals(true);
+        projectorBtn_->setChecked(proto_->lightIsOn(protocol::Light::Projector));
+        projectorBtn_->blockSignals(false);
+        fillLightBtn_->blockSignals(true);
+        fillLightBtn_->setChecked(proto_->lightIsOn(protocol::Light::FillLight));
+        fillLightBtn_->blockSignals(false);
+        setSlider(fillSlider_, fillValue_, proto_->lightLevel(protocol::Light::FillLight));
+    }
+
+    if (switchingMode_) {
+        return; // keep the "switching…" message
+    }
+    if (proto_->supportsLight(protocol::Light::Projector)) {
         statusLabel_->setText(
-            tr("POP4 Projector, Flash Light & Blue Laser Controls Active (CS7/CS10 UVC XU)."));
+            state.mode == protocol::ScanMode::BlueLaser
+                ? tr("Blue laser speckle mode, using the scanner's blue calibration.")
+                : tr("Infrared mode. The projector and fill light are the scanner's own."));
     } else {
         statusLabel_->setText(
-            tr("POP4 lighting / blue-laser controls need USBPcap-confirmed "
-               "commands (see docs/protocol/USBCAP_CHECKLIST.md)"));
+            tr("Lighting controls need a connected POP4."));
     }
 }
 
 void ScannerControlPanel::applyEnabledState() {
     const auto caps = proto_ ? proto_->controlCapabilities()
                              : protocol::ScannerControlCapabilities{};
-    modeBox_->setEnabled(caps.scanMode);
-    alignBtn_->setEnabled(caps.alignmentGuide);
-    illumSlider_->setEnabled(caps.illuminationPower);
-    laserSlider_->setEnabled(caps.laserPower);
-    exposureSlider_->setEnabled(caps.exposure);
-    emittersOffBtn_->setEnabled(caps.emitterOff);
+    const bool busy = switchingMode_;
+    const bool lights = proto_ && proto_->supportsLight(protocol::Light::Projector);
+    modeBox_->setEnabled(caps.scanMode && !busy);
+    exposureSlider_->setEnabled(caps.exposure && !busy);
+    emittersOffBtn_->setEnabled(caps.emitterOff && !busy);
+    projectorBtn_->setEnabled(lights && !busy);
+    fillLightBtn_->setEnabled(lights && !busy);
+    fillSlider_->setEnabled(lights && !busy);
 }
 
 } // namespace revoscan::app

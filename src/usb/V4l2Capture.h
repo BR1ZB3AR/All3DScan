@@ -36,6 +36,12 @@ std::optional<std::string> findV4l2CaptureNodeNamed(uint16_t vendorId,
 // attempted successfully.
 bool rebindUvcvideoForUsbDevice(uint16_t vendorId, uint16_t productId);
 
+// UVC extension-unit SET_CUR through uvcvideo (UVCIOC_CTRL_QUERY) on an
+// open video node. Unlike a raw libusb control transfer it needs no driver
+// detach, so it works while the node is streaming.
+bool uvcExtensionSetCur(int fd, uint8_t unit, uint8_t selector, const uint8_t* data,
+                        uint16_t size, std::string* error = nullptr);
+
 class V4l2Capture {
 public:
     V4l2Capture() = default;

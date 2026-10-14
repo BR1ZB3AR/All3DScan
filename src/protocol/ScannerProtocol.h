@@ -127,6 +127,20 @@ struct DepthDecodeStats {
     }
 };
 
+// The scanner's built-in light sources, named for what they were measured to
+// do on a POP4 (2026-10-14), not for what the vendor SDK calls them.
+enum class Light {
+    // Draws the scan pattern. Infrared: toggling it changes the projected
+    // pattern in the depth images but nothing in the colour camera.
+    Projector,
+    // White/blue LEDs lighting the scene for the colour camera. RevoScan
+    // turns these on for marker scanning.
+    FillLight,
+    // The SDK's separate "IR LED" rail. It exists in the command set but has
+    // no measurable effect on a POP4; kept so the mapping stays documented.
+    IrLed,
+};
+
 enum class ConnectionState {
     Disconnected,
     Connected,
@@ -168,6 +182,13 @@ public:
     virtual bool setLaserPower(int) { return false; }
     virtual bool setExposure(int) { return false; }
     virtual bool emittersOff() { return false; }
+
+    // Built-in lights. Level is 0..255. Only sent while connected.
+    virtual bool supportsLight(Light) const { return false; }
+    virtual bool setLight(Light, bool /*on*/) { return false; }
+    virtual bool setLightLevel(Light, int /*level*/) { return false; }
+    virtual bool lightIsOn(Light) const { return false; }
+    virtual int lightLevel(Light) const { return 0; }
 
     // Working-distance hint (millimetres) for backends that decode depth from
     // a bounded disparity/phase search (e.g. POP4 stereo phase matching). The

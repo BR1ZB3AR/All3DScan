@@ -36,6 +36,9 @@ constexpr int kControlTimeoutMs = 500;
 constexpr int kExposureMin = 500;
 constexpr int kExposureMax = 6000;
 constexpr int kExposureDefault = 3000;
+// RevoScan's POP4 "speckle" presets run a far shorter exposure than the
+// "surface" ones (200-1400 us vs 3000-5400): resources/param_pop4.json.
+constexpr int kSpeckleExposure = 1400;
 constexpr int kIllumMin = 0;
 constexpr int kIllumMax = 255;
 constexpr int kIllumDefault = 130;
@@ -77,6 +80,16 @@ public:
         disconnect();
         lastError_.clear();
         loadCalibration();
+
+        // The scanner re-enumerates after a session (and after any USB
+        // reset), and the udev ACL lands a moment later still. Connecting in
+        // that window used to fail outright; wait for it to come back.
+        waitForDevice(std::chrono::seconds(20));
+
+        // Blue-laser speckle mode uses its own factory calibration. Read it
+        // now, while nothing is streaming: a device file read detaches
+        // uvcvideo, so it must never happen mid-stream.
+        blueRig_ = loadRig("/data/camparam_blue/camparam.yaml", "-blue");
 
         // At most one USB reset per connect: every reset reboots the POP4,
         // and stacking them (as the old 1.5 s retry did) caused reset storms.
@@ -274,18 +287,46 @@ public:
 
     ScannerControlState controlState() const override { return controls_; }
 
+    // Blue-laser speckle mode vs the default IR structured-light mode. The
+    // commands are POP4-specific and verified against the vendor SDK; the
+    // exposure/gain pairing follows RevoScan's own POP4 presets (speckle mode
+    // is much shorter-exposure than surface mode).
     bool setScanMode(ScanMode mode) override {
-        controls_.mode = mode;
-        if (mode == ScanMode::BlueLaser) {
-            controls_.laserPower = 255;
-            controls_.illuminationPower = 255;
-            controls_.exposure = 4500;
-        } else {
-            controls_.laserPower = kLaserDefault;
-            controls_.illuminationPower = kIllumDefault;
-            controls_.exposure = kExposureDefault;
+        if (mode == controls_.mode) {
+            return true;
         }
-        return applyCs7Settings();
+        if (mode == ScanMode::BlueLaser) {
+            if (!blueRig_) {
+                lastError_ = "this POP4 has no /data/camparam_blue calibration";
+                return false;
+            }
+            if (!sendDeviceCommands(pop4::scanModeCommands(mode))) {
+                return false;
+            }
+            // Blue-laser speckle is a different light source with its own
+            // factory calibration (prefetched at connect).
+            decoder_.setStereoRig(*blueRig_);
+            calibration_ = *decoder_.factoryCalibration();
+            controls_.mode = mode;
+            controls_.exposure = kSpeckleExposure;
+            return true;
+        }
+        // Leaving speckle mode: "echo s 0x3001 7" (the vendor's other POP4
+        // mode value) leaves the projector dead and re-arming does not revive
+        // it — only a device reboot does. Verified on hardware 2026-10-14.
+        const bool wasStreaming = state_ == ConnectionState::Streaming;
+        stopStream();
+        capture_.close();
+        if (!resetAndRearm()) {
+            return false;
+        }
+        loadCalibration();
+        controls_.mode = mode;
+        controls_.exposure = kExposureDefault;
+        if (!reopenCapture(wasStreaming)) {
+            return false;
+        }
+        return true;
     }
 
     bool setAlignmentGuide(bool on) override {
@@ -316,10 +357,41 @@ public:
     }
 
     bool emittersOff() override {
-        controls_.emittersOn = false;
-        controls_.illuminationPower = 0;
-        controls_.laserPower = 0;
-        return applyCs7Settings();
+        // Verified device commands: projector off + fill light off.
+        bool ok = sendDeviceCommands(pop4::lightSwitchCommands(Light::Projector, false));
+        ok = sendDeviceCommands(pop4::lightSwitchCommands(Light::FillLight, false)) && ok;
+        controls_.emittersOn = !ok ? controls_.emittersOn : false;
+        return ok;
+    }
+
+    bool supportsLight(Light) const override { return true; }
+
+    bool setLight(Light light, bool on) override {
+        if (!sendDeviceCommands(pop4::lightSwitchCommands(light, on))) {
+            return false;
+        }
+        lightOn_[static_cast<size_t>(light)] = on;
+        if (light == Light::FillLight && on) {
+            lightLevel_[static_cast<size_t>(light)] = 255; // the on sequence sets 0xb12 255
+        }
+        return true;
+    }
+
+    bool setLightLevel(Light light, int level) override {
+        const int clamped = std::clamp(level, 0, 255);
+        if (!sendDeviceCommands({pop4::lightLevelCommand(light, clamped)})) {
+            return false;
+        }
+        lightLevel_[static_cast<size_t>(light)] = clamped;
+        return true;
+    }
+
+    bool lightIsOn(Light light) const override {
+        return lightOn_[static_cast<size_t>(light)];
+    }
+
+    int lightLevel(Light light) const override {
+        return lightLevel_[static_cast<size_t>(light)];
     }
 
     std::string backendName() const override {
@@ -343,11 +415,28 @@ private:
     //     under $XDG_CONFIG_HOME/All3DScan/camparam/<deviceID>.yaml)
     //  3. the most recent cached file
     //  4. the approximate FOV/baseline model (legacy fitted rectification)
-    void loadCalibration() {
+    // `devicePath` selects which factory calibration to load: the default IR
+    // one, or /data/camparam_blue/camparam.yaml for blue-laser speckle mode
+    // (the two are calibrated at different wavelengths, so they have different
+    // focal lengths and distortion). `tag` keeps their caches apart.
+    void loadCalibration(const std::string& devicePath = "/data/camparam/camparam.yaml",
+                         const std::string& tag = "") {
+        if (auto rig = loadRig(devicePath, tag)) {
+            decoder_.setStereoRig(*rig);
+            calibration_ = *decoder_.factoryCalibration();
+        } else {
+            decoder_.clearStereoRig();
+            calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
+        }
+    }
+
+    std::optional<decoder::StereoRig> loadRig(const std::string& devicePath,
+                                              const std::string& tag) {
         namespace fs = std::filesystem;
         std::optional<decoder::StereoRig> rig;
         std::string note;
-        if (const char* env = std::getenv("ALL3DSCAN_CAMPARAM")) {
+        if (const char* env = std::getenv(tag.empty() ? "ALL3DSCAN_CAMPARAM"
+                                                      : "ALL3DSCAN_CAMPARAM_BLUE")) {
             rig = decoder::loadCamparamFile(env, &note);
         }
         const char* xdg = std::getenv("XDG_CONFIG_HOME");
@@ -357,13 +446,13 @@ private:
                                              : fs::path();
         if (!rig) {
             std::string err;
-            if (const auto bytes = pop4::readDeviceFile("/data/camparam/camparam.yaml", &err)) {
+            if (const auto bytes = pop4::readDeviceFile(devicePath, &err)) {
                 const std::string text(bytes->begin(), bytes->end());
                 rig = decoder::parseCamparamYaml(text, &note);
                 if (rig && !cacheDir.empty() && !rig->deviceId.empty()) {
                     std::error_code ec;
                     fs::create_directories(cacheDir, ec);
-                    std::ofstream(cacheDir / (rig->deviceId + ".yaml"), std::ios::binary) << text;
+                    std::ofstream(cacheDir / (rig->deviceId + tag + ".yaml"), std::ios::binary) << text;
                 }
             }
         }
@@ -372,6 +461,13 @@ private:
             fs::path newest;
             fs::file_time_type newestTime{};
             for (const auto& e : fs::directory_iterator(cacheDir, ec)) {
+                // Only consider caches of the same kind (IR vs blue).
+                const bool isBlue = e.path().stem().string().size() > 5 &&
+                                    e.path().stem().string().rfind("-blue") ==
+                                        e.path().stem().string().size() - 5;
+                if (isBlue != !tag.empty()) {
+                    continue;
+                }
                 if (e.path().extension() == ".yaml" && (newest.empty() || e.last_write_time() > newestTime)) {
                     newest = e.path();
                     newestTime = e.last_write_time();
@@ -381,13 +477,7 @@ private:
                 rig = decoder::loadCamparamFile(newest.string(), &note);
             }
         }
-        if (rig) {
-            decoder_.setStereoRig(*rig);
-            calibration_ = *decoder_.factoryCalibration();
-        } else {
-            decoder_.clearStereoRig();
-            calibration_ = decoder::makeApproximatePop4FullFieldCalibration();
-        }
+        return rig;
     }
 
     // ALL3DSCAN_POP4_DUMP_DIR=<dir> writes the first ALL3DSCAN_POP4_DUMP_MAX
@@ -411,6 +501,12 @@ private:
         }
     }
 
+    std::optional<decoder::StereoRig> blueRig_; // /data/camparam_blue, if present
+    // Indexed by Light (Projector, FillLight, IrLed). Arming leaves the
+    // projector on and the fill light off.
+    std::array<bool, 3> lightOn_{{true, false, false}};
+    std::array<int, 3> lightLevel_{{180, 255, 255}};
+
     std::array<uint8_t, 60> currentSettingsPayload() const {
         return pop4::makeSettingsPayload(
             1,
@@ -421,25 +517,21 @@ private:
     }
 
     bool reopenCapture(bool wasStreaming) {
-        auto node = usb::findV4l2CaptureNode(
-            pop4::kVendorId,
-            pop4::kProductId,
-            V4L2_PIX_FMT_Y16,
-            captureWidth_,
-            captureHeight_);
-        if (!node && captureHeight_ == pop4::kCaptureHeightPacked) {
-            node = usb::findV4l2CaptureNode(
-                pop4::kVendorId,
-                pop4::kProductId,
-                V4L2_PIX_FMT_Y16,
-                pop4::kCaptureWidth,
-                pop4::kCaptureHeightFallback);
-            if (node) {
-                captureHeight_ = pop4::kCaptureHeightFallback;
-            }
+        // After a device reboot the /dev/video* nodes take a moment to come
+        // back (and may need a uvcvideo rebind), so use the same retrying
+        // search connect() does rather than looking exactly once.
+        captureWidth_ = pop4::kCaptureWidth;
+        std::optional<std::string> node = findDepthCaptureNode();
+        if (!node) {
+            usb::rebindUvcvideoForUsbDevice(pop4::kVendorId, pop4::kProductId);
+            node = findDepthCaptureNode();
         }
-        if (!node || captureHeight_ == 0 ||
-            !capture_.open(*node, V4L2_PIX_FMT_Y16, captureWidth_, captureHeight_)) {
+        if (!node || captureHeight_ == 0) {
+            lastError_ = "POP4 depth capture node did not reappear";
+            return false;
+        }
+        if (!capture_.open(*node, V4L2_PIX_FMT_Y16, captureWidth_, captureHeight_)) {
+            lastError_ = capture_.lastError();
             return false;
         }
         if (wasStreaming) {
@@ -523,23 +615,56 @@ private:
 
     // Port-resets the POP4, waits for it to reboot and re-enumerate (~37 s
     // measured), lets udev apply access ACLs, then arms again.
+    // Polls until the device can be opened (it is absent while it reboots
+    // and root-only for a moment after that). Returns false on timeout.
+    // Opens the scanner, waiting while it is absent or still root-only. A
+    // rebooting POP4 enumerates, drops and enumerates again several times, so
+    // this leaves the handle OPEN on success: closing and reopening in
+    // between used to lose that race.
+    bool openWithin(std::chrono::seconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+
+    bool waitForDevice(std::chrono::seconds timeout) {
+        if (!openWithin(timeout)) {
+            return false;
+        }
+        usb_.close();
+        return true;
+    }
+
     bool resetAndRearm() {
         usb_.close();
-        if (!usb_.open(pop4::kVendorId, pop4::kProductId)) {
+        if (!openWithin(std::chrono::seconds(60))) {
             lastError_ = "Revopoint POP4 2207:110c not found or permission denied";
             return false;
         }
         usb_.resetDevice();
+        usb_.close();
         std::this_thread::sleep_for(std::chrono::seconds(3));
-        for (int waited = 3; waited < 60; ++waited) {
-            if (usb_.open(pop4::kVendorId, pop4::kProductId)) {
+        // The device reboots (~40 s) and may flap on the bus before it
+        // settles, so keep retrying the arm until it sticks.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (openWithin(std::chrono::seconds(10))) {
                 usb_.close();
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // udev ACLs
-                return armProjector();
+                std::this_thread::sleep_for(std::chrono::seconds(2)); // udev ACL
+                if (armProjector()) {
+                    return true;
+                }
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
-        lastError_ = "POP4 did not come back within 60 s after a USB reset";
+        lastError_ = "POP4 did not come back after a USB reset";
         return false;
     }
 
@@ -633,6 +758,33 @@ private:
                                             buf.size(),
                                             1000);
         return rc == static_cast<int>(buf.size());
+    }
+
+    // Sends scanner shell commands in order, pausing like the SDK does. While
+    // connected the depth node is open, so they go through uvcvideo and also
+    // work mid-stream; nothing is sent when disconnected.
+    bool sendDeviceCommands(const std::vector<std::string>& cmds) {
+        if (!capture_.isOpen()) {
+            lastError_ = "POP4 is not connected";
+            return false;
+        }
+        for (size_t i = 0; i < cmds.size(); ++i) {
+            std::array<uint8_t, 60> buf{};
+            std::memcpy(buf.data(), cmds[i].data(), std::min(cmds[i].size(), buf.size() - 1));
+            std::string error;
+            if (!usb::uvcExtensionSetCur(capture_.fd(), pop4::kXuUnitId, pop4::kSettingsSelector,
+                                         buf.data(), static_cast<uint16_t>(buf.size()), &error)) {
+                lastError_ = "POP4 command \"" + cmds[i] + "\" failed: " + error;
+                return false;
+            }
+            if (std::getenv("ALL3DSCAN_POP4_DEBUG")) {
+                std::fprintf(stderr, "[POP4] device cmd \"%s\" -> ok\n", cmds[i].c_str());
+            }
+            if (i + 1 < cmds.size()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        return true;
     }
 
     // EXPERIMENTAL: the SDK's cs::Camera::setFringePattern sends exactly
@@ -760,6 +912,43 @@ std::array<uint8_t, 60> makeSettingsPayload(int32_t gain,
 
 } // namespace pop4
 
+std::vector<std::string> pop4::lightSwitchCommands(Light light, bool on) {
+    switch (light) {
+    case Light::Projector:
+        // ledAndLaserCtrl ledid 2 ("laser") -> cs helper @0x648920.
+        return {on ? "echo s 0xb04 1 > /dev/rk_preisp" : "echo s 0xb04 0 > /dev/rk_preisp"};
+    case Light::FillLight:
+        // ledid 1 ("RGB led") ctrltype 0; POP_4/POP_4_PRO also set 0xb12 255.
+        if (on) {
+            return {"echo s 0xb03 1 > /dev/rk_preisp", "echo s 0xb02 1 > /dev/rk_preisp",
+                    "echo s 0xb12 255 > /dev/rk_preisp"};
+        }
+        return {"echo s 0xb03 0 > /dev/rk_preisp"};
+    case Light::IrLed:
+        // ledid 0 ("IR led"). Accepted by the scanner, no measurable effect.
+        return {on ? "echo s 0xb01 1 > /dev/rk_preisp" : "echo s 0xb01 0 > /dev/rk_preisp"};
+    }
+    return {};
+}
+
+std::vector<std::string> pop4::scanModeCommands(ScanMode mode) {
+    if (mode == ScanMode::BlueLaser) {
+        return {"echo s 0x3001 12 > /dev/rk_preisp", "echo s 0x48d 180 > /dev/rk_preisp"};
+    }
+    return {"echo s 0x3001 7 > /dev/rk_preisp"};
+}
+
+std::string pop4::lightLevelCommand(Light light, int level) {
+    // Laser luminance 0x48d, RGB led 0xb12, IR led 0xb07 (cs helpers @0x64912c,
+    // @0x6492b4, @0x649770). Only 0xb12 has a measurable effect on a POP4 in
+    // the default infrared mode.
+    const char* reg = light == Light::Projector  ? "0x48d"
+                      : light == Light::FillLight ? "0xb12"
+                                                  : "0xb07";
+    return "echo s " + std::string(reg) + " " + std::to_string(std::clamp(level, 0, 255)) +
+           " > /dev/rk_preisp";
+}
+
 std::optional<std::vector<uint8_t>> pop4::readDeviceFile(const std::string& path,
                                                          std::string* error,
                                                          size_t maxBytes) {
@@ -773,8 +962,13 @@ std::optional<std::vector<uint8_t>> pop4::readDeviceFile(const std::string& path
         return fail("device path must be 1-58 characters");
     }
     usb::UsbDevice dev;
-    if (!dev.open(kVendorId, kProductId)) {
-        return fail("Revopoint POP4 2207:110c not found or permission denied");
+    // The scanner is absent while it re-enumerates after a session, and
+    // root-only for a moment after that; wait rather than fail outright.
+    for (int waited = 0; !dev.open(kVendorId, kProductId); ++waited) {
+        if (waited >= 40) {
+            return fail("Revopoint POP4 2207:110c not found or permission denied");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     bool detached = false;
     if (dev.kernelDriverActive(kDepthInterface) == 1) {

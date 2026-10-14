@@ -57,6 +57,13 @@ post-scan edit tools with undo/redo, and metric-safe PLY/OBJ/STL export.
 the real lens, rectification and 118.6 mm baseline, so depth is in true
 millimetres. See `docs/protocol/RE_NOTES.md` (2026-10-13).
 
+**The scanner's lights and its blue laser work.** The pattern projector and
+the fill light can be switched from the Scanner Controls panel, and Scan Mode
+offers blue laser speckle, which projects a much stronger pattern and returns
+20-30% more depth points. Switching back to infrared reboots the scanner
+(~40 s). The commands and what each one measurably does are in
+`docs/protocol/RE_NOTES.md` (2026-10-14).
+
 **Scans align themselves.** Each frame is aligned to the model as you scan,
 from a predicted motion, and fused only if most of it lands on the
 already-scanned surface (within 4 mm). If tracking is lost, move back over an

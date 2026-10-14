@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "protocol/ScannerProtocol.h"
+
 namespace revoscan::protocol::pop4 {
 
 constexpr uint16_t kVendorId = 0x2207;
@@ -42,5 +44,24 @@ std::array<uint8_t, 60> makeSettingsPayload(int32_t gain = 1,
 std::optional<std::vector<uint8_t>> readDeviceFile(const std::string& path,
                                                    std::string* error = nullptr,
                                                    size_t maxBytes = 8u << 20);
+
+// Scanner shell commands (sent on XU4 selector 7) that switch the built-in
+// lights. These are exactly what the vendor SDK's cs::Camera::ledAndLaserCtrl
+// (RevoScan 6.0.2.4 lib3DCamera.so @0x630fd4) sends for POP_4 / POP_4_PRO
+// (camera types 0x20/0x21), which its support check (@0x63c4ec) allows:
+//   blue laser  on: 0xb04 1                    off: 0xb04 0
+//   fill light  on: 0xb03 1, 0xb02 1, 0xb12 255  off: 0xb03 0
+//   IR projector on: 0xb01 1                   off: 0xb01 0
+// and the levels (0..255): laser 0x48d, fill light 0xb12, IR 0xb07.
+std::vector<std::string> lightSwitchCommands(Light light, bool on);
+
+// Depth-mode switch. cs::Camera::setSpeckleMode (lib3DCamera.so @0x63725c) is
+// gated to camera types 0x20/0x21 (POP_4 / POP_4_PRO) and sends
+// "echo s 0x3001 12"; the normal mode for the same types is "echo s 0x3001 7"
+// (@0x635410). RevoScan's own POP4 presets pair speckle mode with
+// laserLuminance 180 (resources/param_pop4.json, accuracymode "speckle"), and
+// the matching factory calibration is /data/camparam_blue/camparam.yaml.
+std::vector<std::string> scanModeCommands(ScanMode mode);
+std::string lightLevelCommand(Light light, int level);
 
 } // namespace revoscan::protocol::pop4

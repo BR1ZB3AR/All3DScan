@@ -10,6 +10,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <filesystem>
 #include <iostream>
 #include <iterator>
 #include <vector>
@@ -30,6 +32,130 @@
 #include "protocol/ScannerProtocol.h"
 
 namespace {
+
+// Switches each built-in light while streaming and records what the cameras
+// see: raw frames (per-step index ranges in steps.txt) and one colour JPEG
+// per step. Ends with the laser and fill light off.
+//   all3dscan --pop4-lights-test <outdir>
+int pop4LightsTest(const char* outDir) {
+    using revoscan::protocol::Light;
+    std::filesystem::create_directories(outDir);
+    ::setenv("ALL3DSCAN_POP4_DUMP_DIR", outDir, 1);
+    ::setenv("ALL3DSCAN_POP4_DUMP_MAX", "2000", 1);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::ofstream steps(std::string(outDir) + "/steps.txt");
+    int frameIndex = 0;
+    auto run = [&](const std::string& name, const std::function<bool()>& action, int frames) {
+        const bool ok = action();
+        std::cout << name << ": " << (ok ? "ok" : "FAILED " + scanner->lastError()) << std::endl;
+        const int first = frameIndex;
+        for (int i = 0; i < frames; ++i) {
+            if (scanner->readFrame(3000)) {
+                ++frameIndex;
+            }
+        }
+        steps << name << ' ' << first << ' ' << frameIndex - 1 << ' ' << (ok ? "ok" : "failed") << '\n';
+        steps.flush();
+        // The colour node queues old frames: drain it so the image is current.
+        std::optional<std::vector<uint8_t>> latest;
+        for (int i = 0; i < 6; ++i) {
+            if (auto jpeg = scanner->readRgbJpegPreview(i == 0 ? 500 : 80)) {
+                latest = std::move(jpeg);
+            }
+        }
+        if (latest) {
+            std::ofstream(std::string(outDir) + "/" + name + ".jpg", std::ios::binary)
+                .write(reinterpret_cast<const char*>(latest->data()),
+                       static_cast<std::streamsize>(latest->size()));
+        }
+    };
+    auto level = [&](const char* name, Light light, int v, int frames = 16) {
+        run(name, [&, light, v] { return scanner->setLightLevel(light, v); }, frames);
+    };
+    run("baseline", [] { return true; }, 30);
+    // Projector ("laser", 0xb04) and its brightness (0x48d).
+    run("proj_on", [&] { return scanner->setLight(Light::Projector, true); }, 16);
+    level("proj_lum_255", Light::Projector, 255);
+    level("proj_lum_128", Light::Projector, 128);
+    level("proj_lum_40", Light::Projector, 40);
+    level("proj_lum_255b", Light::Projector, 255);
+    run("proj_off", [&] { return scanner->setLight(Light::Projector, false); }, 16);
+    run("proj_on2", [&] { return scanner->setLight(Light::Projector, true); }, 16);
+    // IR emitter (0xb01) and its brightness (0xb07) — candidate for the
+    // speckle pattern the depth decode actually matches on.
+    level("ir_lum_255", Light::IrLed, 255);
+    level("ir_lum_128", Light::IrLed, 128);
+    level("ir_lum_40", Light::IrLed, 40);
+    level("ir_lum_255b", Light::IrLed, 255);
+    run("ir_off", [&] { return scanner->setLight(Light::IrLed, false); }, 16);
+    run("ir_on", [&] { return scanner->setLight(Light::IrLed, true); }, 16);
+    // White/colour LED for the texture camera (0xb03/0xb02) + level (0xb12).
+    run("fill_on", [&] { return scanner->setLight(Light::FillLight, true); }, 16);
+    level("fill_lum_60", Light::FillLight, 60);
+    level("fill_lum_255", Light::FillLight, 255);
+    run("fill_off", [&] { return scanner->setLight(Light::FillLight, false); }, 16);
+    scanner->stopStream();
+    scanner->disconnect();
+    return 0;
+}
+
+// Switches the POP4 into blue-laser speckle mode and back, recording what
+// both cameras see in each state. Always restores the default IR mode.
+//   all3dscan --pop4-mode-test <outdir>
+int pop4ModeTest(const char* outDir) {
+    using revoscan::protocol::ScanMode;
+    std::filesystem::create_directories(outDir);
+    ::setenv("ALL3DSCAN_POP4_DUMP_DIR", outDir, 1);
+    ::setenv("ALL3DSCAN_POP4_DUMP_MAX", "2000", 1);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::ofstream steps(std::string(outDir) + "/steps.txt");
+    int frameIndex = 0;
+    auto capture = [&](const std::string& name, int frames) {
+        const int first = frameIndex;
+        for (int i = 0; i < frames; ++i) {
+            if (scanner->readFrame(3000)) {
+                ++frameIndex;
+            }
+        }
+        steps << name << ' ' << first << ' ' << frameIndex - 1 << " ok\n";
+        steps.flush();
+        std::optional<std::vector<uint8_t>> latest;
+        for (int i = 0; i < 6; ++i) {
+            if (auto jpeg = scanner->readRgbJpegPreview(i == 0 ? 500 : 80)) {
+                latest = std::move(jpeg);
+            }
+        }
+        if (latest) {
+            std::ofstream(std::string(outDir) + "/" + name + ".jpg", std::ios::binary)
+                .write(reinterpret_cast<const char*>(latest->data()),
+                       static_cast<std::streamsize>(latest->size()));
+        }
+        std::cout << name << ": " << (frameIndex - first) << " frames" << std::endl;
+    };
+    capture("ir_mode", 25);
+    const bool entered = scanner->setScanMode(ScanMode::BlueLaser);
+    std::cout << "enter blue-laser speckle mode: "
+              << (entered ? "ok" : "FAILED " + scanner->lastError()) << std::endl;
+    if (entered) {
+        capture("speckle_mode", 25);
+    }
+    // Always go back, whatever happened above.
+    const bool restored = scanner->setScanMode(ScanMode::StructuredLight);
+    std::cout << "restore IR mode: " << (restored ? "ok" : "FAILED " + scanner->lastError())
+              << std::endl;
+    capture("ir_mode_restored", 25);
+    scanner->stopStream();
+    scanner->disconnect();
+    return entered && restored ? 0 : 3;
+}
 
 int probePop4() {
     auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
@@ -394,6 +520,12 @@ int main(int argc, char** argv) {
     std::cout << "All3DScan Rust Core v" << revoscan::bridge::RustBridge::getVersion() << " initialized.\n";
 
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--pop4-mode-test" && i + 1 < argc) {
+            return pop4ModeTest(argv[i + 1]);
+        }
+        if (std::string_view(argv[i]) == "--pop4-lights-test" && i + 1 < argc) {
+            return pop4LightsTest(argv[i + 1]);
+        }
         if (std::string_view(argv[i]) == "--probe-pop4") {
             return probePop4();
         }
@@ -435,7 +567,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261013-2327");
+    QApplication::setApplicationVersion("Alpha-v20261014-2219");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
