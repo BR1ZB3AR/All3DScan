@@ -18,8 +18,14 @@ enum class DepthEncoding {
 };
 
 enum class ScanMode {
+    // The default: an infrared projector draws the pattern. Nothing visible.
     StructuredLight,
+    // The POP4's visible blue laser. Confirmed on hardware: blue lines appear
+    // in the colour camera and to the eye.
     BlueLaser,
+    // Infrared speckle mode: same invisible light, much stronger pattern,
+    // ~20-30% more depth points.
+    Speckle,
 };
 
 // One captured frame from the scanner. Depth is in millimeters, row-major,

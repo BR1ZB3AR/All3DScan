@@ -69,12 +69,15 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
     modeBox_ = new QComboBox(this);
     modeBox_->addItem(tr("Infrared (default)"),
                       static_cast<int>(protocol::ScanMode::StructuredLight));
-    modeBox_->addItem(tr("Blue laser speckle (sharper, experimental)"),
+    modeBox_->addItem(tr("Blue laser (visible)"),
                       static_cast<int>(protocol::ScanMode::BlueLaser));
+    modeBox_->addItem(tr("Infrared speckle (sharper)"),
+                      static_cast<int>(protocol::ScanMode::Speckle));
     modeBox_->setToolTip(
-        tr("Blue laser speckle projects a much stronger pattern (about 20% more\n"
-           "depth points). Switching back to infrared reboots the scanner and\n"
-           "takes about 40 seconds."));
+        tr("Blue laser: the scanner's visible blue laser lines.\n"
+           "Infrared speckle: invisible, but a much stronger pattern — about\n"
+           "20-30% more depth points.\n"
+           "Going back to infrared reboots the scanner (about 45 seconds)."));
     modeV->addWidget(modeBox_);
     root->addWidget(modeSection);
 
@@ -187,9 +190,10 @@ ScannerControlPanel::ScannerControlPanel(QWidget* parent) : QWidget(parent) {
 void ScannerControlPanel::startModeChange(protocol::ScanMode mode) {
     switchingMode_ = true;
     applyEnabledState();
-    statusLabel_->setText(mode == protocol::ScanMode::BlueLaser
-                              ? tr("Switching to blue laser speckle…")
-                              : tr("Back to infrared: the scanner reboots, about 40 seconds…"));
+    statusLabel_->setText(
+        mode == protocol::ScanMode::StructuredLight
+            ? tr("Back to infrared: the scanner reboots, about 45 seconds…")
+            : tr("Switching the scanner's projector…"));
     emit scanModeRequested(static_cast<int>(mode));
 }
 
@@ -259,10 +263,19 @@ void ScannerControlPanel::refreshFromProtocol() {
         return;
     }
     if (proto_->supportsLight(protocol::Light::Projector)) {
-        statusLabel_->setText(
-            state.mode == protocol::ScanMode::BlueLaser
-                ? tr("Blue laser speckle mode, using the scanner's blue calibration.")
-                : tr("Infrared mode. The projector and fill light are the scanner's own."));
+        switch (state.mode) {
+        case protocol::ScanMode::BlueLaser:
+            statusLabel_->setText(
+                tr("Blue laser on, using the scanner's blue calibration."));
+            break;
+        case protocol::ScanMode::Speckle:
+            statusLabel_->setText(tr("Infrared speckle: stronger pattern, nothing visible."));
+            break;
+        case protocol::ScanMode::StructuredLight:
+            statusLabel_->setText(
+                tr("Infrared mode. The projector and fill light are the scanner's own."));
+            break;
+        }
     } else {
         statusLabel_->setText(
             tr("Lighting controls need a connected POP4."));

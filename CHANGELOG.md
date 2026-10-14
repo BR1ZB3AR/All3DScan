@@ -4,6 +4,29 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261015-0010
+
+### Added
+- **The blue laser now actually projects.** Scan Mode -> "Blue laser
+  (visible)" lights the POP4's blue laser lines — visible to the eye and to
+  the scanner's own colour camera (measured: 0% blue pixels before, 24-27%
+  during). This is a genuinely different emitter from the infrared
+  projector, and it uses the scanner's blue factory calibration.
+  - What was missing before: the vendor's sequence has two halves, a mode
+    register *and* an "enter laser line group" command. The earlier build
+    sent only the first half, which selects the mode but leaves every
+    emitter off — so nothing came out.
+- Scan Mode now offers three choices, each saying what it really does:
+  - **Infrared (default)** — the normal invisible projector.
+  - **Blue laser (visible)** — the blue laser lines.
+  - **Infrared speckle (sharper)** — invisible, but a much stronger pattern
+    and 20-30% more depth points.
+
+### Fixed
+- The colour camera stayed dead after returning to infrared: that path
+  reboots the scanner, which also takes away the colour camera's device
+  node, and only the depth node was being reopened.
+
 ## Alpha-v20261014-2330
 
 ### Fixed

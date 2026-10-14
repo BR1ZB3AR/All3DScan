@@ -296,18 +296,17 @@ public:
         if (mode == controls_.mode) {
             return true;
         }
-        if (mode == ScanMode::BlueLaser) {
-            if (!blueRig_) {
-                lastError_ = "this POP4 has no /data/camparam_blue calibration";
-                return false;
-            }
+        if (mode != ScanMode::StructuredLight) {
             if (!sendDeviceCommands(pop4::scanModeCommands(mode))) {
                 return false;
             }
-            // Blue-laser speckle is a different light source with its own
-            // factory calibration (prefetched at connect).
-            decoder_.setStereoRig(*blueRig_);
-            calibration_ = *decoder_.factoryCalibration();
+            // The blue laser is a different wavelength from the infrared
+            // projector, so it has its own factory calibration (prefetched at
+            // connect). Speckle mode is still infrared and keeps the default.
+            if (mode == ScanMode::BlueLaser && blueRig_) {
+                decoder_.setStereoRig(*blueRig_);
+                calibration_ = *decoder_.factoryCalibration();
+            }
             controls_.mode = mode;
             controls_.exposure = kSpeckleExposure;
             return true;
@@ -537,11 +536,25 @@ private:
             lastError_ = capture_.lastError();
             return false;
         }
+        // The colour node is a different /dev/video* that the reboot also
+        // took away; without this the texture preview stays dead until the
+        // user reconnects.
+        rgbCapture_.stop();
+        rgbCapture_.close();
+        if (auto rgbNode = usb::findV4l2CaptureNodeNamed(pop4::kVendorId, pop4::kProductId,
+                                                         V4L2_PIX_FMT_MJPEG, 1280, 1024, "RGB")) {
+            if (!rgbCapture_.open(*rgbNode, V4L2_PIX_FMT_MJPEG, 1280, 1024, 2)) {
+                rgbCapture_.close(); // preview is optional
+            }
+        }
         if (wasStreaming) {
             if (!capture_.start()) {
                 lastError_ = capture_.lastError();
                 state_ = ConnectionState::Connected;
                 return false;
+            }
+            if (rgbCapture_.isOpen()) {
+                (void)rgbCapture_.start(); // optional, like startStream()
             }
             state_ = ConnectionState::Streaming;
         }
@@ -949,10 +962,29 @@ std::vector<std::string> pop4::lightSwitchCommands(Light light, bool on) {
 }
 
 std::vector<std::string> pop4::scanModeCommands(ScanMode mode) {
-    if (mode == ScanMode::BlueLaser) {
+    switch (mode) {
+    case ScanMode::BlueLaser:
+        return laserLineCommands(true);
+    case ScanMode::Speckle:
+        // cs::Camera::setSpeckleMode @0x63725c (POP_4 / POP_4_PRO only), with
+        // laserLuminance 180 from the vendor's own POP4 speckle presets.
         return {"echo s 0x3001 12 > /dev/rk_preisp", "echo s 0x48d 180 > /dev/rk_preisp"};
+    case ScanMode::StructuredLight:
+        break;
     }
-    return {"echo s 0x3001 7 > /dev/rk_preisp"};
+    // Returning to infrared is done by rebooting the scanner, not by a
+    // command: every mode register we know leaves an emitter off instead.
+    return {};
+}
+
+std::vector<std::string> pop4::laserLineCommands(bool on) {
+    if (on) {
+        return {"echo s 0x3001 7 > /dev/rk_preisp",
+                "echo s 0x3010 0x17 1 > /dev/rk_preisp",
+                "echo s 0xb04 1 > /dev/rk_preisp",
+                "echo s 0x48d 180 > /dev/rk_preisp"};
+    }
+    return {"echo s 0x3010 0x17 0 > /dev/rk_preisp"};
 }
 
 std::string pop4::lightLevelCommand(Light light, int level) {

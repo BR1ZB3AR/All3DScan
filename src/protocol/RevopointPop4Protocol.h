@@ -62,6 +62,14 @@ std::vector<std::string> lightSwitchCommands(Light light, bool on);
 // laserLuminance 180 (resources/param_pop4.json, accuracymode "speckle"), and
 // the matching factory calibration is /data/camparam_blue/camparam.yaml.
 std::vector<std::string> scanModeCommands(ScanMode mode);
+
+// The vendor's "laser line" path for POP_4 / POP_4_PRO (lib3DCamera.so
+// @0x635234): "echo s 0x3001 7" then the enter-laser-line-group command
+// "echo s 0x3010 0x17 1", plus the laser rail (ledid 2) and its luminance.
+// Verified on hardware 2026-10-14: this is what makes the POP4 project
+// visible blue laser lines. Sending only the 0x3001 7 half leaves every
+// emitter off, which is why an earlier attempt looked dead.
+std::vector<std::string> laserLineCommands(bool on);
 std::string lightLevelCommand(Light light, int level);
 
 } // namespace revoscan::protocol::pop4

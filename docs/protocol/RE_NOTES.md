@@ -78,6 +78,30 @@ LED, 1 = RGB LED, 2 = laser; ctrltype 0/2 = on, 3 = off, 4 = luminance. The
 keep their speckle whatever `0xb04` does, so depth yield is unchanged by it
 (9.03% vs 9.13% valid). There is a second, always-on speckle emitter.
 
+### The visible blue laser (2026-10-14, confirmed)
+
+The POP4 really does have a **visible blue laser**, and it is a different
+thing from speckle mode. It is the vendor's "laser line" path
+(`lib3DCamera.so` @0x635234, gated to camera types that include 0x20 / 0x21):
+
+```
+echo s 0x3001 7 > /dev/rk_preisp        # laser-line mode register
+echo s 0x3010 0x17 1 > /dev/rk_preisp   # "enter laser line group"
+echo s 0xb04 1 > /dev/rk_preisp         # laser rail on (ledAndLaserCtrl ledid 2)
+echo s 0x48d 180 > /dev/rk_preisp       # laserLuminance, from the POP4 presets
+```
+
+Measured with the scanner's own colour camera: **0.00% strongly-blue pixels
+before, 24-27% during** — bright blue laser lines across the scene, plainly
+visible to the eye too. The function takes an on/off flag; off also sends
+`echo s 0x3010 0x17 0`, which on its own does **not** extinguish the laser.
+Returning to infrared is the reboot path below.
+
+**Why an earlier attempt looked dead:** `echo s 0x3001 7` was used on its own
+as "back to infrared". That is only the first half of this sequence — it
+selects laser-line mode and leaves every emitter off, so all images collapse
+to noise. The missing half is the enter-laser-line-group command.
+
 ### Blue-laser speckle mode
 
 `cs::Camera::setSpeckleMode` (@0x63725c) is gated to camera types **0x20 /

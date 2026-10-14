@@ -89,15 +89,31 @@ TEST_CASE("POP4 light commands match the vendor SDK registers", "[pop4][lights]"
     }
 }
 
-TEST_CASE("POP4 scan mode commands match cs::Camera::setSpeckleMode", "[pop4][lights]") {
-    // setSpeckleMode @0x63725c is gated to camera types 0x20/0x21 (POP_4,
-    // POP_4_PRO) and sends 0x3001 12; RevoScan's POP4 speckle presets pair it
-    // with laserLuminance 180 (resources/param_pop4.json).
+TEST_CASE("POP4 scan mode commands match the vendor SDK", "[pop4][lights]") {
+    // Blue laser: the laser-line path @0x635234 — the mode register *and* the
+    // enter-laser-line-group command. Verified on hardware: this is what makes
+    // visible blue lines appear. Sending only "0x3001 7" leaves every emitter
+    // off, which is exactly how it looked broken before.
     const auto blue = protocol::pop4::scanModeCommands(protocol::ScanMode::BlueLaser);
-    REQUIRE(blue == std::vector<std::string>{"echo s 0x3001 12 > /dev/rk_preisp",
+    REQUIRE(blue == std::vector<std::string>{"echo s 0x3001 7 > /dev/rk_preisp",
+                                             "echo s 0x3010 0x17 1 > /dev/rk_preisp",
+                                             "echo s 0xb04 1 > /dev/rk_preisp",
                                              "echo s 0x48d 180 > /dev/rk_preisp"});
-    const auto ir = protocol::pop4::scanModeCommands(protocol::ScanMode::StructuredLight);
-    REQUIRE(ir == std::vector<std::string>{"echo s 0x3001 7 > /dev/rk_preisp"});
+    REQUIRE(blue == protocol::pop4::laserLineCommands(true));
+    REQUIRE(protocol::pop4::laserLineCommands(false) ==
+            std::vector<std::string>{"echo s 0x3010 0x17 0 > /dev/rk_preisp"});
+
+    // Infrared speckle: setSpeckleMode @0x63725c, gated to camera types
+    // 0x20/0x21 (POP_4, POP_4_PRO), with laserLuminance 180 from the vendor's
+    // own POP4 speckle presets (resources/param_pop4.json).
+    REQUIRE(protocol::pop4::scanModeCommands(protocol::ScanMode::Speckle) ==
+            std::vector<std::string>{"echo s 0x3001 12 > /dev/rk_preisp",
+                                     "echo s 0x48d 180 > /dev/rk_preisp"});
+
+    // Returning to infrared is a reboot, not a command: every mode register we
+    // know leaves an emitter off instead.
+    REQUIRE(protocol::pop4::scanModeCommands(protocol::ScanMode::StructuredLight).empty());
+
     for (const auto& cmd : blue) {
         REQUIRE(cmd.size() < 60);
     }

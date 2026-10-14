@@ -640,7 +640,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261014-2330");
+    QApplication::setApplicationVersion("Alpha-v20261015-0010");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
@@ -716,7 +716,7 @@ int main(int argc, char** argv) {
 
             int blueIndex = -1;
             for (int k = 0; k < modeBox->count(); ++k) {
-                if (modeBox->itemText(k).contains("laser", Qt::CaseInsensitive)) {
+                if (modeBox->itemText(k).contains("Blue laser", Qt::CaseInsensitive)) {
                     blueIndex = k;
                 }
             }

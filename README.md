@@ -59,9 +59,16 @@ millimetres. See `docs/protocol/RE_NOTES.md` (2026-10-13).
 
 **The scanner's lights and its blue laser work.** The pattern projector and
 the fill light can be switched from the Scanner Controls panel, and Scan Mode
-offers blue laser speckle, which projects a much stronger pattern and returns
-20-30% more depth points. Switching back to infrared reboots the scanner
-(~40 s). The commands and what each one measurably does are in
+offers three projectors:
+
+- **Infrared (default)** — the normal, invisible projector.
+- **Blue laser (visible)** — the POP4's blue laser lines, confirmed on
+  hardware with the scanner's own colour camera.
+- **Infrared speckle (sharper)** — invisible, but a much stronger pattern and
+  20-30% more depth points.
+
+Going back to infrared reboots the scanner (~45 s), which is the only way back
+that works. The commands and what each one measurably does are in
 `docs/protocol/RE_NOTES.md` (2026-10-14).
 
 **Scans align themselves.** Each frame is aligned to the model as you scan,
