@@ -81,6 +81,18 @@ The scanner carries its own ground truth, and it is cheap to ask:
 - `resources/param_pop4.json` — the vendor's own POP4 presets. Good for
   cross-checking a guess (it is what revealed `laserLuminance` and
   `fillLightLuminance`).
+- **REA + Ghidra** are installed for decompiling the vendor binaries:
+  - Ghidra 12.1.4 at `~/ghidra/ghidra_12.1.4_PUBLIC`, with its own JDK 21 at
+    `~/ghidra/jdk21` (the system Java is 17, which Ghidra 12.1 rejects; the
+    JDK is pinned in `support/launch.properties` as `JAVA_HOME_OVERRIDE` so
+    nothing system-wide changed).
+  - The REA MCP server carries `GHIDRA_INSTALL_DIR` and `JAVA_HOME` in its
+    registration. If the `rea` tools report no Ghidra provider, re-run
+    `GHIDRA_INSTALL_DIR=~/ghidra/ghidra_12.1.4_PUBLIC JAVA_HOME=~/ghidra/jdk21 npx rea-agents@latest setup --client claude_code --yes`
+    and restart. Claude cannot run that itself — it writes `~/.claude.json`.
+  - Prefer `procedure_pseudo_code` over hand-reading AArch64. Decompiled code
+    is still only what the vendor app *sends*; it never establishes what the
+    scanner does.
 - Scratchpad holds the throwaway analysis scripts (`disasm.py`, `xref.py`,
   `cmd_owners.py`) and the Python venv. **It is wiped on reboot** — Catch2 and
   the venv have to be rebuilt, which is why `build-test` sometimes fails to
