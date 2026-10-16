@@ -894,8 +894,19 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     // Factory calibration: camparam "L" is the block of images 0–4. The legacy
     // fitted model had the pair the other way round.
     const bool swap = swapCameras() != static_cast<bool>(rig_);
-    const int leftIdx = swap ? kRightSpeckle : kLeftSpeckle;
-    const int rightIdx = swap ? kLeftSpeckle : kRightSpeckle;
+    int leftIdx = swap ? kRightSpeckle : kLeftSpeckle;
+    int rightIdx = swap ? kLeftSpeckle : kRightSpeckle;
+    // ALL3DSCAN_POP4_PLANES=<left>,<right> overrides which packed sub-images
+    // are matched. Diagnostic only: in blue-laser mode the sub-frames carry
+    // different parts of the pattern, so the default speckle pair may not be
+    // the one that holds the laser lines.
+    if (const char* planes = std::getenv("ALL3DSCAN_POP4_PLANES")) {
+        int l = 0, r = 0;
+        if (std::sscanf(planes, "%d,%d", &l, &r) == 2 && l >= 0 && l < 10 && r >= 0 && r < 10) {
+            leftIdx = l;
+            rightIdx = r;
+        }
+    }
     const int leftAmbient = swap ? kRightAmbientFirst : kLeftAmbientFirst;
 
     protocol::ScannerCalibration cal = calibration_;

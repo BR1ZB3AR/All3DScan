@@ -52,6 +52,49 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Blue laser projects but cannot scan (2026-10-16)
+
+**Observed — the blue laser is visible but nearly useless to the depth
+decoder as it stands.** Measured on hardware against an unchanged scene
+(the infrared reference held at 27.8% across every run):
+
+| mode | median valid depth, 20 frames | range |
+|---|---|---|
+| infrared | **27.8%** | 27.4-28.1 |
+| blue laser, default exposure | 4.4% | 1.8-11.4 |
+| blue laser, exposure 3000 | 3.0% | 2.2-10.5 |
+| blue laser, exposure 4500 | 4.5% | 1.9-10.6 |
+
+**Exposure is not the problem.** An earlier 3-frame-per-step sample suggested
+3.7% -> 9.3% and that was sampling noise: per-frame yield in blue mode ranges
+1.8-11.4% whatever the exposure, so three samples carry no signal. Twenty
+frames per step show the exposures are indistinguishable. Nothing was shipped
+on the strength of the small sample; the constant written for it was reverted.
+
+**Tracking fails.** Replaying blue-laser frames through the normal pipeline
+(`--replay-dumps`, blue calibration) tracked 4-19 of 45 frames across runs
+versus 25 of 25 for infrared, with fused models of 61-12k points versus 123k.
+The spread between identical runs is itself a finding: at ~4% coverage the
+OpenMP floating-point reduction order in ICP is enough to flip the outcome,
+so blue-laser tracking is not merely poor but irreproducible.
+
+**Derived — the sub-image pair must be time-aligned.** In blue-laser mode
+planes 1, 3, 6 and 8 go flat (local contrast ~150 against ~4600 in infrared)
+while 0, 2, 5 and 7 carry the laser. Sweeping which pair is matched
+(`ALL3DSCAN_POP4_PLANES=<left>,<right>`, diagnostic only) gives: default
+(9,4) 2.93%, (7,2) 4.74%, (5,0) 3.03%, and the cross-slot pairs (7,4) and
+(9,2) collapse to ~0.6%. So a pair must come from the same time slot in the
+ten-image cycle, and (7,2) holds the laser better than the speckle default --
+but 4.74% still does not track.
+
+**Why, and what it would take.** The decoder is a dense speckle stereo matcher
+(census + SGM): it needs texture everywhere. A line laser only illuminates
+the lines, so per-frame coverage is bounded at a few percent by the pattern
+itself, not by tuning. Making the blue laser scan needs a different depth
+path: sub-pixel line-centre detection in both images, matching line segments
+along epipolar lines, triangulating those, and accumulating across a sweep.
+That is a new subsystem, not a parameter change. **Unresolved.**
+
 ## Speckle emitter search, and the laser-line off path (2026-10-16)
 
 Toolchain: REA + Ghidra 12.1.4 are now wired up (see CLAUDE.md), so vendor

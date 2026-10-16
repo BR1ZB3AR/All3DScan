@@ -280,6 +280,51 @@ int pop4Cs7Test(const char* outDir) {
     return 0;
 }
 
+// Sweeps exposure while the blue laser is on and records frames per step, to
+// find whether the dim blue-laser images are an exposure problem. Restores
+// infrared at the end.
+//   all3dscan --pop4-blue-exposure-test <outdir>
+int pop4BlueExposureTest(const char* outDir) {
+    using revoscan::protocol::ScanMode;
+    std::filesystem::create_directories(outDir);
+    ::setenv("ALL3DSCAN_POP4_DUMP_DIR", outDir, 1);
+    ::setenv("ALL3DSCAN_POP4_DUMP_MAX", "4000", 1);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::ofstream steps(std::string(outDir) + "/steps.txt");
+    int frameIndex = 0;
+    auto capture = [&](const std::string& name, int frames) {
+        const int first = frameIndex;
+        for (int i = 0; i < frames; ++i) {
+            if (scanner->readFrame(3000)) {
+                ++frameIndex;
+            }
+        }
+        steps << name << ' ' << first << ' ' << frameIndex - 1 << " ok\n";
+        steps.flush();
+        std::cout << name << ": " << (frameIndex - first) << " frames" << std::endl;
+    };
+    capture("ir_ref", 25);
+    std::cout << "blue laser: "
+              << (scanner->setScanMode(ScanMode::BlueLaser) ? "on" : "FAILED") << std::endl;
+    capture("blue_default", 45);
+    for (int exp : {3000, 4500}) {
+        const bool ok = scanner->setExposure(exp);
+        std::cout << "exposure " << exp << ": " << (ok ? "ok" : "FAILED " + scanner->lastError())
+                  << std::endl;
+        capture("blue_exp" + std::to_string(exp), 45);
+    }
+    std::cout << "restore: "
+              << (scanner->setScanMode(ScanMode::StructuredLight) ? "ok" : "FAILED") << std::endl;
+    capture("ir_restored", 20);
+    scanner->stopStream();
+    scanner->disconnect();
+    return 0;
+}
+
 int probePop4() {
     auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
     std::cout << "Backend: " << scanner->backendName() << '\n';
@@ -643,6 +688,9 @@ int main(int argc, char** argv) {
     std::cout << "All3DScan Rust Core v" << revoscan::bridge::RustBridge::getVersion() << " initialized.\n";
 
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--pop4-blue-exposure-test" && i + 1 < argc) {
+            return pop4BlueExposureTest(argv[i + 1]);
+        }
         if (std::string_view(argv[i]) == "--pop4-cs7-test" && i + 1 < argc) {
             return pop4Cs7Test(argv[i + 1]);
         }
