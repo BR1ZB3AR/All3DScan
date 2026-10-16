@@ -238,6 +238,48 @@ int pop4ModeCycle() {
     return toBlue && toIr ? 0 : 4;
 }
 
+// Sweeps the CS7 settings block's irLum field while streaming and records
+// raw frames per step, to measure whether that field drives the always-on
+// speckle emitter (the one the depth decoder matches on). Restores the
+// default value at the end.
+//   all3dscan --pop4-cs7-test <outdir>
+int pop4Cs7Test(const char* outDir) {
+    std::filesystem::create_directories(outDir);
+    ::setenv("ALL3DSCAN_POP4_DUMP_DIR", outDir, 1);
+    ::setenv("ALL3DSCAN_POP4_DUMP_MAX", "2000", 1);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::ofstream steps(std::string(outDir) + "/steps.txt");
+    int frameIndex = 0;
+    auto capture = [&](const std::string& name, int frames) {
+        const int first = frameIndex;
+        for (int i = 0; i < frames; ++i) {
+            if (scanner->readFrame(3000)) {
+                ++frameIndex;
+            }
+        }
+        steps << name << ' ' << first << ' ' << frameIndex - 1 << " ok\n";
+        steps.flush();
+        std::cout << name << ": " << (frameIndex - first) << " frames" << std::endl;
+    };
+    auto setIr = [&](const char* name, int v) {
+        const bool ok = scanner->setIlluminationPower(v);
+        std::cout << name << " (irLum=" << v << "): "
+                  << (ok ? "ok" : "FAILED " + scanner->lastError()) << std::endl;
+        capture(name, 25);
+    };
+    capture("baseline_130", 25);
+    setIr("ir0", 0);
+    setIr("ir255", 255);
+    setIr("restore_130", 130);
+    scanner->stopStream();
+    scanner->disconnect();
+    return 0;
+}
+
 int probePop4() {
     auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
     std::cout << "Backend: " << scanner->backendName() << '\n';
@@ -601,6 +643,9 @@ int main(int argc, char** argv) {
     std::cout << "All3DScan Rust Core v" << revoscan::bridge::RustBridge::getVersion() << " initialized.\n";
 
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--pop4-cs7-test" && i + 1 < argc) {
+            return pop4Cs7Test(argv[i + 1]);
+        }
         if (std::string_view(argv[i]) == "--pop4-mode-cycle") {
             return pop4ModeCycle();
         }

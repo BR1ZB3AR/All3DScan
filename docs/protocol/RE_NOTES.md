@@ -52,6 +52,35 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Speckle emitter search, and the laser-line off path (2026-10-16)
+
+Toolchain: REA + Ghidra 12.1.4 are now wired up (see CLAUDE.md), so vendor
+functions are read as decompiler output instead of hand-read AArch64.
+Decompiled code remains "what the app sends", never "what the scanner does".
+
+**Observed — CS7 `irLum` does not drive the speckle emitter.** Swept the CS7
+settings field to 0, 255 and back to 130 while streaming
+(`--pop4-cs7-test`); speckle contrast in the depth images stayed flat
+(img4 local contrast 8287 / 8270 / 8270 / 8281, img9 similar). Combined with
+the earlier sweeps (0xb04, 0xb01, 0xb07, 0x48d, 0xb12 — all no effect on
+images 4/9), every emitter control we are willing to send is now excluded.
+The speckle emitter appears firmware-driven, tied to streaming itself.
+**Unresolved.** Next safe avenue: map the XU property channel
+(`PROPERTY_EXT_*` names in the SDK strings) with the decompiler and see
+whether any property is POP4-gated emitter control; nothing gets sent until
+a gated write path is identified.
+
+**Derived — the vendor's laser-line OFF sequence.** Ghidra decompilation of
+the laser-line mode function (file offset 0x635234) shows the off path sends
+the mode register (`0x3001 7`) *followed by* the group command with 0
+(`0x3010 0x17 0`) — and that an optional precondition command (fetched from
+another member; empty on our unit path) runs first and must succeed. Our
+hardware test only ever sent the group-0 half alone, which left the laser
+on. The full pair is untested on hardware; if it works it could replace the
+45 s reboot when leaving blue-laser mode. The function also records the
+on/off state at object offset 0x4cd and resets stream bookkeeping after the
+switch.
+
 ## Lights, projector and blue-laser speckle mode (2026-10-14)
 
 All of this was measured on a live POP4 (`--pop4-lights-test`,
