@@ -4,6 +4,23 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261016-0030
+
+### Fixed
+- **Blue laser would not turn on at all in some sessions.** The app
+  remembered the scan mode across connects, but reconnecting reboots the
+  scanner back into infrared. If you had used the blue laser earlier, the app
+  still believed it was in blue-laser mode, so picking it again was skipped
+  as "already there" and the laser never came on.
+  - Connecting now records the mode the scanner is actually in (infrared).
+  - Picking blue laser (or speckle) always re-sends the commands. Only the
+    return to infrared is skipped when already there, because that one costs
+    a 45 s reboot.
+- Verified with the scanner's colour camera at every step: off, on, **on
+  again when picked twice**, off, on again after a full return to infrared,
+  off. And through the window itself — the RGB preview shows the blue lines
+  with "Blue laser (visible)" selected.
+
 ## Alpha-v20261015-0010
 
 ### Added

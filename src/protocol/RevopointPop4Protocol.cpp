@@ -157,6 +157,12 @@ public:
         controls_.illuminationPower = kIllumDefault;
         controls_.laserPower = kLaserDefault;
         controls_.exposure = kExposureDefault;
+        // Arming always leaves the scanner in infrared. Without this the app
+        // could still believe it was in blue-laser mode from an earlier
+        // session, and then skip the commands when you picked blue laser
+        // again — the laser simply never came on.
+        controls_.mode = ScanMode::StructuredLight;
+        lightOn_ = {{true, false, false}};
         state_ = ConnectionState::Connected;
         return true;
     }
@@ -293,7 +299,12 @@ public:
     // exposure/gain pairing follows RevoScan's own POP4 presets (speckle mode
     // is much shorter-exposure than surface mode).
     bool setScanMode(ScanMode mode) override {
-        if (mode == controls_.mode) {
+        // Only the infrared path is skipped when already there, because it
+        // costs a 45 s reboot. The projector commands are idempotent register
+        // writes, so picking blue laser (or speckle) always re-sends them:
+        // if our idea of the current mode were ever stale, skipping would
+        // leave the user with a control that silently does nothing.
+        if (mode == ScanMode::StructuredLight && controls_.mode == mode) {
             return true;
         }
         if (mode != ScanMode::StructuredLight) {

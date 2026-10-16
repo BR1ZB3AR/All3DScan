@@ -145,19 +145,30 @@ int pop4ModeTest(const char* outDir) {
     };
     capture("ir_mode", 25);
     const bool entered = scanner->setScanMode(ScanMode::BlueLaser);
-    std::cout << "enter blue-laser speckle mode: "
-              << (entered ? "ok" : "FAILED " + scanner->lastError()) << std::endl;
-    if (entered) {
-        capture("speckle_mode", 25);
-    }
+    std::cout << "blue laser on: " << (entered ? "ok" : "FAILED " + scanner->lastError())
+              << std::endl;
+    capture("blue_1st", 25);
+    // Pick it a second time without leaving the mode: a stale idea of the
+    // current mode used to make this a silent no-op.
+    const bool again = scanner->setScanMode(ScanMode::BlueLaser);
+    std::cout << "blue laser on again: " << (again ? "ok" : "FAILED " + scanner->lastError())
+              << std::endl;
+    capture("blue_2nd", 25);
     // Always go back, whatever happened above.
     const bool restored = scanner->setScanMode(ScanMode::StructuredLight);
     std::cout << "restore IR mode: " << (restored ? "ok" : "FAILED " + scanner->lastError())
               << std::endl;
     capture("ir_mode_restored", 25);
+    // And straight back into blue laser from infrared, as a user would.
+    const bool third = scanner->setScanMode(ScanMode::BlueLaser);
+    std::cout << "blue laser on after restore: "
+              << (third ? "ok" : "FAILED " + scanner->lastError()) << std::endl;
+    capture("blue_3rd", 25);
+    scanner->setScanMode(ScanMode::StructuredLight);
+    capture("final_ir", 20);
     scanner->stopStream();
     scanner->disconnect();
-    return entered && restored ? 0 : 3;
+    return entered && again && restored && third ? 0 : 3;
 }
 
 // Exercises the exact path the GUI uses — ScannerController with frame
@@ -640,7 +651,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261015-0010");
+    QApplication::setApplicationVersion("Alpha-v20261016-0030");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
@@ -731,7 +742,12 @@ int main(int argc, char** argv) {
             }
             std::cout << "after selecting: current=\"" << modeBox->currentText().toStdString()
                       << "\" enabled=" << modeBox->isEnabled() << "\n";
-            pump(3000);
+            pump(4000);
+            if (const char* shot = std::getenv("ALL3DSCAN_GUI_SHOT")) {
+                window.grab().save(QString::fromLocal8Bit(shot));
+                std::cout << "saved window shot while blue laser is selected\n";
+            }
+            pump(1000);
             std::cout << "selecting item 0 (back to infrared)…\n";
             modeBox->setCurrentIndex(0);
             pump(1000);
