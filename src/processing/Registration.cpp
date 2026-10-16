@@ -921,6 +921,111 @@ IcpResult icpPointToPlane(const pointcloud::PointCloud& source,
     return result;
 }
 
+namespace {
+
+pointcloud::PointCloud stridedSubset(const pointcloud::PointCloud& in, std::size_t limit) {
+    if (in.points.size() <= limit || limit == 0) {
+        return in;
+    }
+    const std::size_t stride = in.points.size() / limit;
+    pointcloud::PointCloud out;
+    out.points.reserve(in.points.size() / stride + 1);
+    for (std::size_t i = 0; i < in.points.size(); i += stride) {
+        out.points.push_back(in.points[i]);
+    }
+    return out;
+}
+
+std::array<double, 3> centroidOf(const pointcloud::PointCloud& c) {
+    std::array<double, 3> m{0, 0, 0};
+    if (c.points.empty()) {
+        return m;
+    }
+    for (const auto& p : c.points) {
+        m[0] += p.x;
+        m[1] += p.y;
+        m[2] += p.z;
+    }
+    const double inv = 1.0 / static_cast<double>(c.points.size());
+    return {m[0] * inv, m[1] * inv, m[2] * inv};
+}
+
+RigidTransform translation(double x, double y, double z) {
+    RigidTransform t;
+    t.m[3] = x;
+    t.m[7] = y;
+    t.m[11] = z;
+    return t;
+}
+
+} // namespace
+
+GlobalAlignResult alignGlobally(const pointcloud::PointCloud& source,
+                                const PlaneIcpTarget& target,
+                                const GlobalAlignOptions& opts) {
+    GlobalAlignResult best;
+    if (source.points.empty() || target.cloud().points.empty()) {
+        return best;
+    }
+    const pointcloud::PointCloud src = stridedSubset(source, opts.maxSourcePoints);
+    const auto sc = centroidOf(src);
+    const auto tc = centroidOf(target.cloud());
+
+    // Each trial is: move the source to the origin, rotate, then put it where
+    // the target sits. Centring first means the search only has to cover
+    // rotation, not the whole translation space.
+    const RigidTransform toOrigin = translation(-sc[0], -sc[1], -sc[2]);
+    const RigidTransform toTarget = translation(tc[0], tc[1], tc[2]);
+
+    const int yawSteps = std::max(1, opts.yawSteps);
+    const int tiltSteps = std::max(1, opts.tiltSteps);
+    for (int t = 0; t < tiltSteps; ++t) {
+        // 0, then alternating tilts away from upright.
+        const double tilt = t == 0 ? 0.0
+                                   : (3.14159265358979 * ((t + 1) / 2) / tiltSteps) *
+                                         ((t % 2) ? 1.0 : -1.0);
+        for (int y = 0; y < yawSteps; ++y) {
+            const double yaw = 2.0 * 3.14159265358979 * y / yawSteps;
+            const double cy = std::cos(yaw), sy = std::sin(yaw);
+            const double ct = std::cos(tilt), st = std::sin(tilt);
+            // Yaw about Y, then tilt about X.
+            RigidTransform rot;
+            rot.m = {cy,       0.0, sy,       0.0,
+                     st * sy,  ct,  -st * cy, 0.0,
+                     -ct * sy, st,  ct * cy,  0.0,
+                     0.0,      0.0, 0.0,      1.0};
+            const RigidTransform guess = toTarget * (rot * toOrigin);
+
+            IcpOptions coarse;
+            coarse.maxCorrespondenceDistM = opts.coarseCorrespondenceM;
+            coarse.maxIterations = 20;
+            coarse.convergenceTransEpsM = 1e-4;
+            coarse.convergenceRotEps = 1e-4;
+            const IcpResult c = icpPointToPlane(src, target, guess, coarse);
+
+            IcpOptions fine;
+            fine.maxCorrespondenceDistM = opts.fineCorrespondenceM;
+            fine.maxIterations = 15;
+            const IcpResult f = icpPointToPlane(src, target, c.transform, fine);
+
+            const AlignmentQuality q = evaluateAlignment(src, target, f.transform, opts.toleranceM);
+            ++best.orientationsTried;
+            // Prefer a candidate whose matched points actually agree; among
+            // those, the one that matches most of the scan. Without the first
+            // test a tight-but-small true match loses to a loose large one.
+            const bool qClose = q.inliers > 0 && q.rmseM <= opts.maxRmseM;
+            const bool bestClose = best.quality.inliers > 0 && best.quality.rmseM <= opts.maxRmseM;
+            if (qClose != bestClose ? qClose : q.overlap > best.quality.overlap) {
+                best.transform = f.transform;
+                best.quality = q;
+            }
+        }
+    }
+    best.ok = best.quality.inliers > 0 && best.quality.overlap >= opts.minOverlap &&
+              best.quality.rmseM <= opts.maxRmseM;
+    return best;
+}
+
 AlignmentQuality evaluateAlignment(const pointcloud::PointCloud& source,
                                    const PlaneIcpTarget& target,
                                    const RigidTransform& pose,

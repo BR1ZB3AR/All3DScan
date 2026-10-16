@@ -248,3 +248,56 @@ TEST_CASE("alignment quality separates a real fit from a near miss or another sh
         evaluateAlignment(sphere, target, RigidTransform::identity(), tol);
     REQUIRE(other.overlap < 0.3);
 }
+
+TEST_CASE("global alignment recovers an unknown pose between two scans") {
+    // Two scans of the same box corner with no shared pose: the second was
+    // taken after the object was turned. Frame-to-frame tracking cannot do
+    // this, because there is no pose guess to start from.
+    const PointCloud target = makeBoxCorner();
+    const PlaneIcpTarget prepared(target, 0.006f);
+
+    for (double deg : {35.0, 150.0, -95.0}) {
+        const PointCloud moved = rotateAboutZ(target, static_cast<float>(deg), 0.01f, -0.02f, 0.0f);
+        GlobalAlignOptions opts;
+        opts.yawSteps = 24;
+        opts.tiltSteps = 1; // the synthetic motion is a pure yaw
+        const GlobalAlignResult r = alignGlobally(moved, prepared, opts);
+        INFO("rotation " << deg << " deg, overlap " << r.quality.overlap);
+        REQUIRE(r.ok);
+        REQUIRE(r.quality.overlap > 0.80);
+        REQUIRE(r.quality.rmseM < 0.002);
+        REQUIRE(r.orientationsTried == 24);
+
+        // Landing on the target means the recovered pose really undoes the
+        // motion, not just that some overlap was found.
+        const PointCloud aligned = transformed(moved, r.transform);
+        const AlignmentQuality check = evaluateAlignment(aligned, prepared, RigidTransform{}, 0.004);
+        REQUIRE(check.overlap > 0.80);
+    }
+}
+
+TEST_CASE("global alignment reports a mismatch instead of forcing one") {
+    // A sphere is not the box. Note it still *overlaps* the box well: about
+    // 43% of its surface sits within 4 mm of those three orthogonal faces, so
+    // an overlap-only gate would merge two unrelated scans. What rejects it is
+    // how well the matched points agree (2.25 mm, against far under a
+    // millimetre for a true match).
+    const PlaneIcpTarget prepared(makeBoxCorner(), 0.006f);
+    PointCloud sphere;
+    for (int i = 0; i < 30; ++i) {
+        for (int j = 0; j < 60; ++j) {
+            const double th = 3.14159265358979 * (i + 0.5) / 30.0;
+            const double ph = 2.0 * 3.14159265358979 * j / 60.0;
+            sphere.points.push_back(Point{static_cast<float>(0.03 + 0.03 * std::sin(th) * std::cos(ph)),
+                                          static_cast<float>(0.03 + 0.03 * std::sin(th) * std::sin(ph)),
+                                          static_cast<float>(0.27 + 0.03 * std::cos(th))});
+        }
+    }
+    GlobalAlignOptions opts;
+    opts.yawSteps = 8;
+    opts.tiltSteps = 1;
+    const GlobalAlignResult r = alignGlobally(sphere, prepared, opts);
+    INFO("sphere overlap " << r.quality.overlap << " rmse " << r.quality.rmseM);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.quality.rmseM > opts.maxRmseM); // the test that actually rejects it
+}

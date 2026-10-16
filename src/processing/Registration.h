@@ -127,6 +127,43 @@ struct AlignmentQuality {
     double rmseM = 0.0;
     std::size_t inliers = 0;
 };
+// Aligns a scan to another one when nothing is known about how they are
+// posed relative to each other — the "scan the front, scan the back, line
+// them up" case. Frame-to-frame tracking cannot do this: it needs a pose
+// guess, and between two separate scans there is none.
+//
+// Both clouds are centred, then a spread of starting orientations is tried,
+// each refined by ICP and scored on the same strict surface-overlap test the
+// tracker uses. The best scoring pose wins, so a wrong answer shows up as a
+// low overlap rather than a confident mistake.
+struct GlobalAlignOptions {
+    int yawSteps = 24;            // orientations around the vertical axis
+    int tiltSteps = 3;            // tilts away from it, including upright
+    float coarseCorrespondenceM = 0.030f;
+    float fineCorrespondenceM = 0.008f;
+    double toleranceM = 0.004;    // "on the surface" distance when scoring
+    // Two gates, because neither alone is enough. Overlap must stay low
+    // because two scans of different sides of an object genuinely share only
+    // a band. But overlap alone accepts nonsense: a sphere dropped into a box
+    // corner scores 0.43, since much of it does sit within a few mm of the
+    // faces. What separates them is how well the matched points agree —
+    // a real match sits far inside a millimetre, that sphere sits at 2.25 mm.
+    double minOverlap = 0.25;
+    double maxRmseM = 0.0015;
+    std::size_t maxSourcePoints = 4000;
+};
+
+struct GlobalAlignResult {
+    RigidTransform transform;  // maps source into the target's frame
+    AlignmentQuality quality;
+    bool ok = false;
+    int orientationsTried = 0;
+};
+
+GlobalAlignResult alignGlobally(const pointcloud::PointCloud& source,
+                                const PlaneIcpTarget& target,
+                                const GlobalAlignOptions& opts = {});
+
 AlignmentQuality evaluateAlignment(const pointcloud::PointCloud& source,
                                    const PlaneIcpTarget& target,
                                    const RigidTransform& pose,
