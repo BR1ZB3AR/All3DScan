@@ -1,4 +1,4 @@
-# Revo Scan 6 USBPcap Capture Checklist (POP4)
+# Vendor-app USBPcap Capture Checklist (POP4)
 
 Use this checklist to produce capture-backed protocol fixtures for All3DScan.
 Metric depth, blue-laser mode, and lighting controls must not be invented —
@@ -6,7 +6,7 @@ only replay commands confirmed by these captures.
 
 ## Environment
 
-- Revo Scan 6 **v6.2.3.875** (or note exact version)
+- The vendor Windows app (note the exact version used)
 - POP4 `2207:110c`, cold power-cycle before each session
 - Windows host or VM with exclusive USB passthrough
 - USBPcap + Wireshark

@@ -20,8 +20,7 @@ Working extract lives under `artifacts/apk_revoscan_6.0.2.4/` (gitignored).
 | `assets/param_pop4.json` | POP4 model `0E1` scan presets | `resources/param_pop4.json` |
 | Ogre/Media assets | Proprietary UI renderer | Our Qt/OpenGL viewer |
 
-Same control surface as the Windows `3DCamera.dll` analysis in
-[`REVOSCAN6_RE.md`](REVOSCAN6_RE.md):
+The control surface seen in this Android package:
 
 - `libusb_control_transfer` + `libuvcSetExtension`
 - `cameraSetPropertyExtension` / `cameraGetPropertyExtension` (`type=%04X`)
@@ -152,7 +151,7 @@ themselves prove the HID/`EXECUTE_CMD` opcodes for mode switches.
 
 Next probes on the physical POP4:
 
-- Prefer Windows USBPcap / Frida of Revo Scan 6 opening device info or starting
+- Prefer a USBPcap capture of the vendor app opening device info or starting
   a scan, filtered for property `0x0918` and 68-byte intrinsics
   ([`USBCAP_CHECKLIST.md`](USBCAP_CHECKLIST.md)).
 - Keep capturing `640x2560` fixtures with `tools/re_probe/pop4_y16_analyze.py`

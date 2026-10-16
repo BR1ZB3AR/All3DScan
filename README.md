@@ -190,8 +190,6 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
   `DistanceScaleWidget`, `CameraPanel`, `Theme`, `ScannerController`.
 - `tests/` — Catch2 unit tests, runnable without hardware.
 - `docs/protocol/RE_NOTES.md` — reverse-engineering plan and findings log.
-- `docs/protocol/REVOSCAN6_RE.md` — clean-room map from Revo Scan 6 Windows
-  installer/SDK → native Ubuntu `.deb`.
 - `tools/re_probe/` — usbmon/XU/HID protocol analysis and replay tools.
 - `tools/pipeline/` — Python/Open3D processing workers.
 

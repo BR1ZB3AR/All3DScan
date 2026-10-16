@@ -700,7 +700,7 @@ metric depth and basic AI parity are solid.
 
 ## Capture-backed protocol import (2026-07-19)
 
-Official Revo Scan 6 control sequences (mode, lighting, blue laser, calibration
+Official vendor control sequences (mode, lighting, blue laser, calibration
 reads, emitter-off) are **not yet confirmed by USBPcap**. Until captures land:
 
 - Linux arming remains the empirical CS10 + CS7 sequence above.
@@ -856,73 +856,12 @@ tools/re_probe/requirements.txt`.
 - `xu_arm_probe.py` — systematic SET candidate sweep scored by depth
   nonzero count.
 
-## Static analysis of the real Revo Scan 6 Windows app (2026-07-16)
+## Windows-app analysis removed (2026-10-16)
 
-A working Wine/Proton install of the actual RevoScan6 app (v6.2.3.875)
-already existed on the dev machine at
-`~/Faugus/default/drive_c/Program Files/Revo Scan 6/`, with logs and
-cached config from real past scanning sessions
-(`~/Faugus/default/drive_c/users/steamuser/AppData/{Local,Roaming}/Revopoint/RevoScan6/`).
-No `wine` binary was available in the dev sandbox to run it live, but
-static analysis of the installed DLLs (`strings`, no disassembly) turned
-up a lot:
-
-### Follow-up (2026-07-18) — installer / SDK control path confirmed
-
-The matching Windows installer
-`RevoScan6-6.2.3.875-windows-x86_64.exe` is a 1.4 GiB PE GUI package.
-We analyze the **installed** tree (not redistributing the EXE). Full
-clean-room plan + `.deb` boundary: `docs/protocol/REVOSCAN6_RE.md`.
-
-`3DCamera.dll` shows POP4 control goes through UVC Extension Unit helpers
-(`setXu` / `getXu` / `getXuData`) exposed as `setPropertyExtension`
-(`type=%04X`). Notably `PROPERTY_EXT_WRITE_READ_HID` means HID traffic is
-wrapped via the XU — which explains why raw hidraw opcode sweeps scored
-zero hits. Other POP4-relevant extensions:
-`PROPERTY_EXT_EXECUTE_CMD`, `PAUSE/RESUME_DEPTH_STREAM`,
-`PROPERTY_EXT_DEPTH_SCALE`, `TRIGGER_MODE`, `HDR_EXPOSURE`.
-
-Re-run analysis anytime:
-
-```sh
-python3 tools/re_probe/analyze_revoscan_install.py \
-  "$HOME/Faugus/default/drive_c/Program Files/Revo Scan 6"
-```
-
-- **The vendor SDK statically links `hidapi`** (`hid_open`, `hid_write`,
-  `hid_read`, `hid_get_feature_report`, etc. all present as symbols in
-  `3DCamera.dll`) — confirms `hidapi` is the right library for whatever
-  the real HID protocol turns out to be, even though it wasn't the
-  answer for laser control (see below).
-- **Calibration files exist on disk as vendor defaults**, not something
-  that needs extracting from device flash:
-  `Resources/config/calibration/stepInfo/HighResolution/pop4.json` (+
-  `pop4_check.json`, `pop4_prepose.json`) and
-  `Resources/config/brightnessGainMap_POP4.json`. These turned out to be
-  **auto-scan staging parameters** (per working-distance step: gain,
-  exposure, `crossLaserLight`, `singleLaserLight`, `irLum`), not the
-  intrinsic/extrinsic camera matrix — real per-device intrinsics are
-  presumably read from the device itself at runtime. Confirms there are
-  two distinct laser modes: a "cross" alignment guide and a "single" scan
-  pattern, each with its own power level (~700-900 in whatever unit the
-  firmware uses).
-- **A JSON-RPC-shaped protocol exists in the SDK** (`3DCamera.dll` has
-  literal strings like `{"msgId":"getIntrinsics","streamType":%d}` and
-  `{"msgId":"getIntrinsicsRsp","result":"success",...}`, plus
-  `CameraDeviceRpcClient`, `RPCServerCamera` symbols). **Tested empirically
-  and ruled out for the USB HID channel**: sent the exact JSON (several
-  framing variants: exact string, with newline, with a 4-byte
-  length-prefix) over the HID interface via `hidapi` — zero response
-  every time. Most likely this JSON-RPC path belongs to Revopoint's
-  network/Wi-Fi-connected models (mini2/miracoF etc., which the same SDK
-  also supports), not the POP4's USB transport.
-- **Key `cs::Camera::` API surface** (symbol names only, no decompiled
-  logic): `ledAndLaserCtrl`, `setProjectorCtrlInWP`, `setFringePattern`,
-  `laserLineDirectionChange`, `laserLineExpTimeAdjust`, `setlaserCalParam`,
-  `startStream`/`stopStream`, `setStreamResolution`, `setCameraState`,
-  `setTriggerInterval`, `getIMUCalibrationState`. These are the real
-  function names for the operations we need — useful as a checklist even
-  without their implementations.
+Sections derived from the Revopoint Windows application were removed at the
+repository owner's request. Do not add findings from that application to
+this repository. Protocol facts used by the code are recorded in the
+device-measured and Android-SDK sections above and below.
 
 ## HID control channel: findings (interface 4)
 
@@ -1029,21 +968,11 @@ Reproduce dump:
 .venv/bin/python tools/re_probe/xu_probe.py --interface 2 --dump
 ```
 
-### DLL / PreISP notes (strings only, no redistribution)
+### Windows-app notes removed (2026-10-16)
 
-From `3DCamera.dll` (Wine install tree):
-
-- Still no numeric `PROPERTY_EXT_*` type IDs in strings — only
-  `setPropertyExtension type=%04X` / `Type=%04X` / JSON `propertyType:%d`.
-  28 `PROPERTY_EXT_*` names + `XU_DSP_GAIN`, `XU_FILE_*`, `XU_NEAR_FAR_STATE_CHANGE`.
-- Network/embedded path shells Rockchip PreISP registers, e.g.
-  `echo s 0x706 %d >/dev/rk_preisp`, `0x702 %d %d`, `0xb00`/`0xb01` laser-ish,
-  `0x701 1`. USB path logs `hid execute cmd failed` /
-  `PROPERTY_EXT_WRITE_READ_HID` — shell strings are **not** the USB wire format.
-- HID report descriptor on this POP4: Report Size 64 bits × Count 128 =
-  **1024-byte** reports (matches `wMaxPacketSize=0x400`). Raw hidraw writes of
-  ASCII `echo s 0xb00 1 > /dev/rk_preisp` (1024-byte padded) accepted with
-  **no response and no depth-score change**.
+Material derived from the Revopoint Windows application was removed at the
+repository owner's request. Do not add findings from that application to
+this repository.
 
 ### Arming results (depth nonzero/frame @ 640×512 Y16)
 
@@ -1087,15 +1016,14 @@ Broader sweep harness (optional): `tools/re_probe/xu_arm_probe.py`.
 - Exact field layout inside the 60-byte CS7 block is still guessed (5× int32
   from pop4.json). Narrow which fields matter; test CS8/CS1/CS2 with same
   layout after CS10.
-- Capture a real Revo Scan 6 USB session (`usbmon`) to confirm whether
+- Capture a real vendor USB session (`usbmon`) to confirm whether
   production uses CS7 or HID-wrapped `EXECUTE_CMD` / `WRITE_READ_HID`.
 - Map `PROPERTY_EXT_*` numeric IDs via disassembly or a logged
   `type=%04X` session — strings alone are insufficient.
 
 ## Step 2: Capture USB traffic
 
-Preferred: run the official Revo Scan 6 app (Windows, or Wine on Linux)
-while capturing:
+Preferred: run the official vendor app while capturing:
 - Linux native: `usbmon` + Wireshark (`sudo modprobe usbmon`, capture on
   `usbmonN` interface matching the bus the device is on).
 - Windows: USBPcap + Wireshark, or a Windows VM with USB passthrough if
