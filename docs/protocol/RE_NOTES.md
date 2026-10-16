@@ -84,12 +84,22 @@ Implemented as `decoder::RgbCalibration` with the byte layout pinned in
 device at connect, decodes the MJPEG with libturbojpeg, and samples a colour
 for each depth pixel. `ALL3DSCAN_POP4_COLOR=0` restores the old grey.
 
-**Unresolved — alignment is not yet confirmed.** On a live frame, ~45k pixels
-receive colour and the sampled image matches the scene's layout, but the
-scanner faces a white wall and a black desk (colour-camera mean saturation
-16.7), so a flat grey scene cannot show whether colours land on the right
-geometry. A chromatic, textured object in view is needed to judge the
-mapping, including whether a half-pixel or parallax correction is wanted.
+**Observed — the mapping is correct.** Confirmed by pointing the scanner at a
+printed carton (camera mean saturation 32.8, p95 137, versus 17 for the grey
+wall that made three earlier attempts useless). 28,516 depth pixels took
+colour and 74.6% of them were genuinely chromatic. Every colour region lands
+on its own geometry: the blue banner at the top of the box, the magenta panel
+below it, the red flower and green leaves centred, the yellow flowers at the
+lower right, and the text blocks legible and in place. Nothing is displaced
+sideways and no background bleeds onto the object, which is the failure the
+24 mm colour-camera offset would have produced had the parallax been wrong.
+
+A flat, unsaturated scene cannot test this: the sampled image looks plausible
+whether the offset is handled correctly, wrongly, or not at all. Any future
+change to the colour path needs a chromatic object in view to be meaningful.
+
+**Still open:** whether colour survives the TSDF averaging into the finished
+mesh (Complete), which is a separate stage from this per-frame sampling.
 
 ## Blue laser projects but cannot scan (2026-10-16)
 
