@@ -4,6 +4,35 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261016-2337
+
+### Added
+- **Scans now come out in the object's real colours.** Meshes and point
+  clouds were grey because the colour attached to each frame was made from
+  the infrared images — four of them averaged, then written into red, green
+  and blue alike. The scanner's own 1280x1024 colour camera only fed the
+  preview panel.
+  - The scanner stores its colour calibration next to the depth one, and the
+    app now reads and caches it per device: the colour camera's lens, its
+    distortion, and its 24 mm offset from the depth camera.
+  - Every depth pixel is mapped through that offset into the colour image
+    and sampled, so colours land on the right geometry rather than smearing
+    sideways.
+  - Confirmed on a printed carton: 74.6% of the sampled pixels were
+    genuinely coloured, with the blue banner, magenta panel, red flower,
+    green leaves and yellow flowers each sitting on their own part of the
+    box. A plain white wall cannot show this, which is why it took a
+    coloured object to verify.
+  - Needs `libturbojpeg` (already present on most systems). Without it the
+    app still runs and falls back to the old grey.
+  - `ALL3DSCAN_POP4_COLOR=0` restores the previous behaviour.
+
+### Known gaps
+- Whether the colour survives into the **finished mesh** after Complete is
+  not yet verified; the point cloud is confirmed.
+- Depth coverage on a flat, lightly-textured object held close is narrower
+  than the object itself, so its edges come back without geometry.
+
 ## Alpha-v20261016-0030
 
 ### Fixed

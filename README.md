@@ -71,6 +71,14 @@ Going back to infrared reboots the scanner (~45 s), which is the only way back
 that works. The commands and what each one measurably does are in
 `docs/protocol/RE_NOTES.md` (2026-10-14).
 
+**Scans come out in the object's real colours.** The app reads the scanner's
+own colour-camera calibration (lens, distortion and its 24 mm offset from the
+depth camera), maps every depth pixel through it and samples the colour
+camera, so point clouds and meshes carry the object's colours instead of a
+grey made from the infrared images. Verified on a printed carton: see the
+2026-10-16 section of `docs/protocol/RE_NOTES.md`. Needs `libturbojpeg`;
+without it the app falls back to grey. `ALL3DSCAN_POP4_COLOR=0` disables it.
+
 **Scans align themselves.** Each frame is aligned to the model as you scan,
 from a predicted motion, and fused only if most of it lands on the
 already-scanned surface (within 4 mm). If tracking is lost, move back over an
