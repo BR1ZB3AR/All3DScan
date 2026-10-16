@@ -557,6 +557,12 @@ private:
         if (!dir || dumpCount_ >= maxFrames) {
             return;
         }
+        if (dumpCount_ == 0) {
+            // Create it once: writes used to fail silently when the directory
+            // did not exist, so a recording session produced nothing at all.
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+        }
         char name[64];
         std::snprintf(name, sizeof(name), "/pop4_%ux%u_%04d.y16", captureWidth_,
                       captureHeight_, dumpCount_++);
