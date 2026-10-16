@@ -325,6 +325,71 @@ int pop4BlueExposureTest(const char* outDir) {
     return 0;
 }
 
+// Grabs one live frame with colour texturing applied and writes it as a
+// coloured PLY, plus the colour camera frame it sampled, so the mapping can
+// be checked by eye.
+//   all3dscan --pop4-color-test <outdir>
+int pop4ColorTest(const char* outDir) {
+    std::filesystem::create_directories(outDir);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::optional<revoscan::protocol::RawFrame> frame;
+    for (int i = 0; i < 40; ++i) { // warm-up, and let the colour camera settle
+        if (auto f = scanner->readFrame(3000)) {
+            frame = std::move(f);
+        }
+    }
+    if (auto jpeg = scanner->readRgbJpegPreview(500)) {
+        std::ofstream(std::string(outDir) + "/color_camera.jpg", std::ios::binary)
+            .write(reinterpret_cast<const char*>(jpeg->data()),
+                   static_cast<std::streamsize>(jpeg->size()));
+    }
+    const auto cal = scanner->calibration();
+    scanner->stopStream();
+    scanner->disconnect();
+    if (!frame) {
+        std::cerr << "no frame\n";
+        return 3;
+    }
+    const bool hasRgb = frame->rgb.size() == frame->depthMm.size() * 3;
+    std::cout << "frame " << frame->width << "x" << frame->height
+              << " rgb=" << (hasRgb ? "yes" : "no") << '\n';
+    size_t coloured = 0;
+    size_t chromatic = 0;
+    if (hasRgb) {
+        for (size_t i = 0; i < frame->depthMm.size(); ++i) {
+            const int r = frame->rgb[i * 3], g = frame->rgb[i * 3 + 1], b = frame->rgb[i * 3 + 2];
+            if (r || g || b) {
+                ++coloured;
+            }
+            if (std::abs(r - g) > 8 || std::abs(g - b) > 8 || std::abs(r - b) > 8) {
+                ++chromatic; // grey would have r==g==b
+            }
+        }
+        std::cout << "coloured pixels: " << coloured << ", genuinely chromatic: " << chromatic
+                  << " (" << (100.0 * chromatic / std::max<size_t>(coloured, 1)) << "% of them)\n";
+    }
+    if (hasRgb) {
+        // The colour resampled onto the depth grid: compare it with
+        // color_camera.jpg to judge whether the mapping lines up.
+        std::ofstream ppm(std::string(outDir) + "/depth_colored.ppm", std::ios::binary);
+        ppm << "P6\n" << frame->width << ' ' << frame->height << "\n255\n";
+        ppm.write(reinterpret_cast<const char*>(frame->rgb.data()),
+                  static_cast<std::streamsize>(frame->rgb.size()));
+    }
+    auto cloud = revoscan::pointcloud::fromDepthFrame(*frame, cal.depth);
+    const std::string ply = std::string(outDir) + "/colored.ply";
+    if (!revoscan::io::writePly(ply, cloud)) {
+        std::cerr << "failed to write " << ply << '\n';
+        return 4;
+    }
+    std::cout << "wrote " << ply << " with " << cloud.points.size() << " points\n";
+    return 0;
+}
+
 int probePop4() {
     auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
     std::cout << "Backend: " << scanner->backendName() << '\n';
@@ -690,6 +755,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--pop4-blue-exposure-test" && i + 1 < argc) {
             return pop4BlueExposureTest(argv[i + 1]);
+        }
+        if (std::string_view(argv[i]) == "--pop4-color-test" && i + 1 < argc) {
+            return pop4ColorTest(argv[i + 1]);
         }
         if (std::string_view(argv[i]) == "--pop4-cs7-test" && i + 1 < argc) {
             return pop4Cs7Test(argv[i + 1]);

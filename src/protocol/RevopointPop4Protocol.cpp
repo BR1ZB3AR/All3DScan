@@ -8,6 +8,7 @@
 #include <fstream>
 #include <filesystem>
 #include <array>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <memory>
@@ -21,7 +22,12 @@
 
 #include "ScannerProtocol.h"
 #include "decoder/Pop4DepthDecoder.h"
+#include "decoder/RgbCalibration.h"
 #include "decoder/StereoRig.h"
+
+#ifdef ALL3DSCAN_HAVE_TURBOJPEG
+#include <turbojpeg.h>
+#endif
 #include "usb/UsbDevice.h"
 #include "usb/V4l2Capture.h"
 
@@ -90,6 +96,7 @@ public:
         // now, while nothing is streaming: a device file read detaches
         // uvcvideo, so it must never happen mid-stream.
         blueRig_ = loadRig("/data/camparam_blue/camparam.yaml", "-blue");
+        loadRgbCalibration();
 
         // At most one USB reset per connect: every reset reboots the POP4,
         // and stacking them (as the old 1.5 s retry did) caused reset storms.
@@ -236,7 +243,9 @@ public:
         dumpRawFrame(*sensor, expectedBytes);
 
         decoder_.setCalibration(calibration_);
+        updateColorFrame();
         if (auto metric = decoder_.decode(frame)) {
+            colorizeDepth(*metric);
             return metric;
         }
         // Keep last decode reason for --probe-pop4 / diagnostics; preview path
@@ -251,11 +260,17 @@ public:
         if (state_ != ConnectionState::Streaming || !rgbCapture_.isOpen()) {
             return std::nullopt;
         }
-        auto frame = rgbCapture_.readFrame(timeoutMs);
-        if (!frame || frame->bytes.empty()) {
+        // readFrame() drains this node to texture the depth, so serve the
+        // cached frame rather than competing with it for buffers.
+        if (auto frame = rgbCapture_.readFrame(timeoutMs)) {
+            if (!frame->bytes.empty()) {
+                lastColorJpeg_ = std::move(frame->bytes);
+            }
+        }
+        if (lastColorJpeg_.empty()) {
             return std::nullopt;
         }
-        return std::move(frame->bytes);
+        return lastColorJpeg_;
     }
 
     void setParams(const ScannerParams& params) override { params_ = params; }
@@ -441,6 +456,45 @@ private:
         }
     }
 
+    // Colour-camera calibration: three small blobs beside camparam.yaml,
+    // cached per device so later runs work without re-reading the scanner.
+    void loadRgbCalibration() {
+        namespace fs = std::filesystem;
+        const char* xdg = std::getenv("XDG_CONFIG_HOME");
+        const char* home = std::getenv("HOME");
+        const fs::path dir = xdg && *xdg ? fs::path(xdg) / "All3DScan" / "camparam"
+                             : home     ? fs::path(home) / ".config" / "All3DScan" / "camparam"
+                                        : fs::path();
+        const std::array<const char*, 3> names{{"Prgb.bin", "Distort.bin", "LC_RT.bin"}};
+        std::array<std::vector<uint8_t>, 3> blobs;
+        const std::string id =
+            calibration_.serial.empty() ? std::string("device") : calibration_.serial;
+        for (size_t i = 0; i < names.size(); ++i) {
+            std::string err;
+            if (auto bytes = pop4::readDeviceFile(std::string("/data/camparam/") + names[i], &err)) {
+                blobs[i] = std::move(*bytes);
+                if (!dir.empty()) {
+                    std::error_code ec;
+                    fs::create_directories(dir, ec);
+                    std::ofstream(dir / (id + "-" + names[i]), std::ios::binary)
+                        .write(reinterpret_cast<const char*>(blobs[i].data()),
+                               static_cast<std::streamsize>(blobs[i].size()));
+                }
+            } else if (!dir.empty()) {
+                std::ifstream in(dir / (id + "-" + names[i]), std::ios::binary);
+                if (in) {
+                    blobs[i].assign(std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>());
+                }
+            }
+        }
+        std::string error;
+        rgbCal_ = decoder::parseRgbCalibration(blobs[0], blobs[1], blobs[2], &error);
+        if (!rgbCal_ && std::getenv("ALL3DSCAN_POP4_DEBUG")) {
+            std::fprintf(stderr, "[POP4] colour calibration unavailable: %s\n", error.c_str());
+        }
+    }
+
     std::optional<decoder::StereoRig> loadRig(const std::string& devicePath,
                                               const std::string& tag) {
         namespace fs = std::filesystem;
@@ -512,12 +566,113 @@ private:
         }
     }
 
+    std::vector<uint8_t> lastColorJpeg_;        // newest colour frame, as sent
+    std::vector<uint8_t> lastColorRgb_;         // and decoded, RGB888
+    int colorWidth_ = 0;
+    int colorHeight_ = 0;
+    size_t lastColouredPixels_ = 0;
+    std::optional<decoder::RgbCalibration> rgbCal_;
     std::string captureNode_;                   // which /dev/video* depth node
     std::optional<decoder::StereoRig> blueRig_; // /data/camparam_blue, if present
     // Indexed by Light (Projector, FillLight, IrLed). Arming leaves the
     // projector on and the fill light off.
     std::array<bool, 3> lightOn_{{true, false, false}};
     std::array<int, 3> lightLevel_{{180, 255, 255}};
+
+    // Pulls whatever the colour camera has ready (never blocks) and keeps the
+    // JPEG plus its decoded pixels. Both the texture mapping and the preview
+    // read this cache, so they cannot steal frames from each other.
+    void updateColorFrame() {
+        if (!rgbCapture_.isOpen()) {
+            return;
+        }
+        auto frame = rgbCapture_.readFrame(0);
+        if (!frame || frame->bytes.empty()) {
+            return;
+        }
+        lastColorJpeg_ = frame->bytes;
+#ifdef ALL3DSCAN_HAVE_TURBOJPEG
+        if (!colorEnabled()) {
+            return;
+        }
+        tjhandle tj = tj3Init(TJINIT_DECOMPRESS);
+        if (!tj) {
+            return;
+        }
+        if (tj3DecompressHeader(tj, lastColorJpeg_.data(), lastColorJpeg_.size()) == 0) {
+            const int w = tj3Get(tj, TJPARAM_JPEGWIDTH);
+            const int h = tj3Get(tj, TJPARAM_JPEGHEIGHT);
+            if (w > 0 && h > 0) {
+                std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 3);
+                if (tj3Decompress8(tj, lastColorJpeg_.data(), lastColorJpeg_.size(),
+                                   pixels.data(), 0, TJPF_RGB) == 0) {
+                    lastColorRgb_ = std::move(pixels);
+                    colorWidth_ = w;
+                    colorHeight_ = h;
+                }
+            }
+        }
+        tj3Destroy(tj);
+#endif
+    }
+
+    // Replaces the decoder's grey (synthesised from the infrared images) with
+    // real colour: every depth pixel is back-projected into the rectified left
+    // frame, mapped into the colour camera through the factory LC_RT/Prgb
+    // calibration, and sampled.
+    void colorizeDepth(RawFrame& metric) {
+        if (!rgbCal_ || lastColorRgb_.empty() || !colorEnabled()) {
+            return;
+        }
+        const auto& depth = calibration_.depth;
+        if (!(depth.fx > 0.0 && depth.fy > 0.0)) {
+            return;
+        }
+        const size_t pixels = static_cast<size_t>(metric.width) * metric.height;
+        if (metric.depthMm.size() != pixels) {
+            return;
+        }
+        std::vector<uint8_t> out(pixels * 3, 0);
+        size_t coloured = 0;
+        for (uint32_t v = 0; v < metric.height; ++v) {
+            for (uint32_t u = 0; u < metric.width; ++u) {
+                const size_t i = static_cast<size_t>(v) * metric.width + u;
+                const double z = metric.depthMm[i];
+                if (z <= 0.0) {
+                    continue;
+                }
+                const double x = (static_cast<double>(u) - depth.cx) * z / depth.fx;
+                const double y = (static_cast<double>(v) - depth.cy) * z / depth.fy;
+                double cu = 0.0;
+                double cv = 0.0;
+                if (!decoder::projectToRgb(*rgbCal_, x, y, z, &cu, &cv)) {
+                    continue;
+                }
+                const int su = static_cast<int>(std::lround(cu));
+                const int sv = static_cast<int>(std::lround(cv));
+                if (su < 0 || su >= colorWidth_ || sv < 0 || sv >= colorHeight_) {
+                    continue;
+                }
+                const size_t src = (static_cast<size_t>(sv) * colorWidth_ + su) * 3;
+                out[i * 3 + 0] = lastColorRgb_[src + 0];
+                out[i * 3 + 1] = lastColorRgb_[src + 1];
+                out[i * 3 + 2] = lastColorRgb_[src + 2];
+                ++coloured;
+            }
+        }
+        if (coloured > 0) {
+            metric.rgb = std::move(out);
+            lastColouredPixels_ = coloured;
+        }
+    }
+
+    static bool colorEnabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("ALL3DSCAN_POP4_COLOR");
+            return !(v && v[0] == '0');
+        }();
+        return on;
+    }
 
     std::array<uint8_t, 60> currentSettingsPayload() const {
         return pop4::makeSettingsPayload(

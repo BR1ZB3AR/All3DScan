@@ -76,6 +76,8 @@ set(DECODER_SOURCES
     src/decoder/Pop4DepthDecoder.cpp
     src/decoder/StereoRig.h
     src/decoder/StereoRig.cpp
+    src/decoder/RgbCalibration.h
+    src/decoder/RgbCalibration.cpp
     src/decoder/Pop4StereoCuda.h
 )
 if(ALL3DSCAN_CUDA_ENABLED)
@@ -108,6 +110,22 @@ add_library(protocol
 )
 target_include_directories(protocol PUBLIC src)
 target_link_libraries(protocol PUBLIC usb decoder)
+
+# Colour texture: the POP4's colour camera delivers MJPEG, which has to be
+# decoded before depth pixels can be coloured from it. Optional — without it
+# meshes keep the old grey shading from the infrared images.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(TURBOJPEG QUIET libturbojpeg)
+endif()
+if(TURBOJPEG_FOUND)
+    target_compile_definitions(protocol PRIVATE ALL3DSCAN_HAVE_TURBOJPEG=1)
+    target_include_directories(protocol PRIVATE ${TURBOJPEG_INCLUDE_DIRS})
+    target_link_libraries(protocol PRIVATE ${TURBOJPEG_LIBRARIES})
+    message(STATUS "All3DScan colour texture: ON (libturbojpeg ${TURBOJPEG_VERSION})")
+else()
+    message(STATUS "All3DScan colour texture: OFF (install libturbojpeg for coloured meshes)")
+endif()
 
 add_library(pointcloud
     src/pointcloud/PointCloud.h

@@ -52,6 +52,45 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Colour texture from the scanner's own colour camera (2026-10-16)
+
+**Observed — why meshes came out grey.** The "rgb" the decoder attached to
+each frame was synthesised from the *infrared* images: it averages four
+ambient sub-images and writes the same value into R, G and B. Every point and
+every mesh vertex therefore carried a grey. The real 1280x1024 colour camera
+was only ever used for the preview panel.
+
+**Observed — the colour calibration is on the scanner.** Three small blobs sit
+beside `camparam.yaml`, all little-endian float32, read over the XU file
+channel:
+
+| file | bytes | contents |
+|---|---|---|
+| `Prgb.bin` | 40 | one pad float, then the 3x3 colour camera matrix: fx = fy = 1557.547, cx = 633.888, cy = 518.032 |
+| `Distort.bin` | 20 | k1 k2 p1 p2 k3 for that camera |
+| `LC_RT.bin` | 48 | 3x3 rotation + 3 translation, T = (-24.033, 0.027, -2.404) mm |
+| `Pl.bin` | 40 | same layout; fx 1489.284, cx 331.878, cy 510.769 |
+
+**Derived — which frame LC_RT maps from.** `Pl.bin` is byte-identical to
+`camparam.yaml`'s `pL`, the *rectified left* projection we already
+back-project depth with. The vendor stores it beside `LC_RT.bin`, so the
+rotation/translation take the rectified left frame to the colour camera, and
+no un-rectification is needed. The principal point lands at the centre of a
+1280x1024 sensor and the 24 mm baseline matches the physical spacing, which is
+what makes the reading credible.
+
+Implemented as `decoder::RgbCalibration` with the byte layout pinned in
+`tests/test_stereo_rig.cpp`; the protocol reads and caches the blobs per
+device at connect, decodes the MJPEG with libturbojpeg, and samples a colour
+for each depth pixel. `ALL3DSCAN_POP4_COLOR=0` restores the old grey.
+
+**Unresolved — alignment is not yet confirmed.** On a live frame, ~45k pixels
+receive colour and the sampled image matches the scene's layout, but the
+scanner faces a white wall and a black desk (colour-camera mean saturation
+16.7), so a flat grey scene cannot show whether colours land on the right
+geometry. A chromatic, textured object in view is needed to judge the
+mapping, including whether a half-pixel or parallax correction is wanted.
+
 ## Blue laser projects but cannot scan (2026-10-16)
 
 **Observed — the blue laser is visible but nearly useless to the depth

@@ -100,3 +100,57 @@ TEST_CASE("camparam.yaml parser rejects missing matrices") {
     REQUIRE_FALSE(decoder::parseCamparamYaml("%YAML:1.0\n---\nwidth: \"1280\"\n", &error));
     REQUIRE(error.find("cameraMatrixL") != std::string::npos);
 }
+
+#include <cstring>
+
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+
+#include "decoder/RgbCalibration.h"
+
+// The colour calibration blobs are raw float32 with no header, so a layout
+// mistake would silently mis-project every texture sample. Pin the exact
+// bytes this POP4 returns (device D26545575B6S00E1B).
+TEST_CASE("RGB calibration parses the scanner's blob layout", "[rgb]") {
+    auto f32 = [](std::vector<float> v) {
+        std::vector<uint8_t> out(v.size() * 4);
+        std::memcpy(out.data(), v.data(), out.size());
+        return out;
+    };
+    // Prgb.bin leads with one pad float, then the 3x3 matrix row-major.
+    const auto prgb = f32({0.0f, 1557.54749f, 0.0f, 633.88849f, 0.0f, 1557.54749f, 518.03156f,
+                           0.0f, 0.0f, 1.0f});
+    const auto distort = f32({0.12374f, -0.60751f, -0.00030f, -0.00024f, 1.09100f});
+    const auto lcRt = f32({0.99518f, 0.00278f, -0.09806f, -0.00258f, 0.99999f, 0.00210f,
+                           0.09807f, -0.00184f, 0.99518f, -24.03342f, 0.02720f, -2.40354f});
+
+    std::string error;
+    const auto cal = revoscan::decoder::parseRgbCalibration(prgb, distort, lcRt, &error);
+    REQUIRE(cal.has_value());
+    REQUIRE_THAT(cal->fx(), Catch::Matchers::WithinAbs(1557.547, 1e-2));
+    REQUIRE_THAT(cal->fy(), Catch::Matchers::WithinAbs(1557.547, 1e-2));
+    // Principal point near the centre of the 1280x1024 colour sensor.
+    REQUIRE_THAT(cal->cx(), Catch::Matchers::WithinAbs(633.888, 1e-2));
+    REQUIRE_THAT(cal->cy(), Catch::Matchers::WithinAbs(518.032, 1e-2));
+    REQUIRE_THAT(cal->T[0], Catch::Matchers::WithinAbs(-24.033, 1e-2));
+
+    // A point 400 mm straight ahead of the depth camera must land inside the
+    // colour image, and left of centre: the colour camera sits 24 mm away.
+    double u = 0.0, v = 0.0;
+    REQUIRE(revoscan::decoder::projectToRgb(*cal, 0.0, 0.0, 400.0, &u, &v));
+    REQUIRE(u > 0.0);
+    REQUIRE(u < 1280.0);
+    REQUIRE(v > 0.0);
+    REQUIRE(v < 1024.0);
+    REQUIRE(u < cal->cx()); // shifted by the baseline
+
+    // Parallax must shrink as things get further away.
+    double uNear = 0.0, uFar = 0.0, tmp = 0.0;
+    revoscan::decoder::projectToRgb(*cal, 0.0, 0.0, 250.0, &uNear, &tmp);
+    revoscan::decoder::projectToRgb(*cal, 0.0, 0.0, 2000.0, &uFar, &tmp);
+    REQUIRE(uNear < uFar);
+
+    // Behind the camera is rejected, and malformed blobs never parse.
+    REQUIRE_FALSE(revoscan::decoder::projectToRgb(*cal, 0.0, 0.0, -10.0, &u, &v));
+    REQUIRE_FALSE(revoscan::decoder::parseRgbCalibration({}, distort, lcRt, &error).has_value());
+    REQUIRE_FALSE(revoscan::decoder::parseRgbCalibration(prgb, distort, prgb, &error).has_value());
+}
