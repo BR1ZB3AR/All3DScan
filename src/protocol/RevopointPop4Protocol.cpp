@@ -246,6 +246,7 @@ public:
         updateColorFrame();
         if (auto metric = decoder_.decode(frame)) {
             colorizeDepth(*metric);
+            stepAutoExposure();
             return metric;
         }
         // Keep last decode reason for --probe-pop4 / diagnostics; preview path
@@ -379,7 +380,11 @@ public:
 
     bool setExposure(int value) override {
         controls_.exposure = std::clamp(value, kExposureMin, kExposureMax);
-        return applyCs7Settings();
+        // The CS7 field alone does not move the sensor, so send the vendor's
+        // exposure register too.
+        const bool viaRegister = sendDeviceCommands({pop4::exposureCommand(controls_.exposure)});
+        const bool viaBlock = applyCs7Settings();
+        return viaRegister || viaBlock;
     }
 
     bool emittersOff() override {
@@ -572,6 +577,16 @@ private:
         }
     }
 
+    // Auto-exposure search state.
+    static constexpr int kAeFramesPerStep = 12;
+    int aeFrames_ = 0;
+    float aeAccum_ = 0.0f;
+    float aeBestScore_ = -1.0f;
+    int aeBestExposure_ = kExposureDefault;
+    int aeTrial_ = kExposureDefault;
+    int aeDirection_ = 0;
+    bool aeLocked_ = false;
+    int aeBadWindows_ = 0;
     std::vector<uint8_t> lastColorJpeg_;        // newest colour frame, as sent
     std::vector<uint8_t> lastColorRgb_;         // and decoded, RGB888
     int colorWidth_ = 0;
@@ -671,6 +686,82 @@ private:
             lastColouredPixels_ = coloured;
         }
     }
+
+    // EXPERIMENTAL, off by default. Walks the sensor exposure towards whatever
+    // yields the most depth, judged on the decoder's valid-pixel fraction.
+    // Measured twice against a fixed exposure on a live scene and it LOST both
+    // times (median 2.5% vs 3.7%, then 2.8% vs 4.1% after the oscillation fix):
+    // the per-frame yield noise is larger than the real exposure effect, so
+    // the climb chases noise. Kept behind ALL3DSCAN_POP4_AUTOEXPOSURE=1 for
+    // future work on a steadier score; do not enable by default without
+    // beating a fixed exposure on hardware.
+    void stepAutoExposure() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("ALL3DSCAN_POP4_AUTOEXPOSURE");
+            return v && v[0] == '1';
+        }();
+        if (!enabled || state_ != ConnectionState::Streaming) {
+            return;
+        }
+        const float valid = decoder_.lastStats().validFraction();
+        aeAccum_ += valid;
+        if (++aeFrames_ < kAeFramesPerStep) {
+            return;
+        }
+        const float score = aeAccum_ / static_cast<float>(aeFrames_);
+        aeFrames_ = 0;
+        aeAccum_ = 0.0f;
+
+        if (aeLocked_) {
+            // Settled. Reopen the search only when the scene has clearly
+            // changed: without a terminal state the first version of this
+            // loop kept wandering off the optimum and made coverage worse
+            // than a fixed exposure (measured 2.5% vs 3.7% median).
+            if (score < aeBestScore_ * 0.5f && ++aeBadWindows_ >= 2) {
+                aeLocked_ = false;
+                aeBestScore_ = -1.0f;
+                aeDirection_ = 0;
+                aeBadWindows_ = 0;
+            } else if (score >= aeBestScore_ * 0.5f) {
+                aeBadWindows_ = 0;
+                // Track slow drift so a slightly better scene does not look
+                // like a regression later.
+                aeBestScore_ = std::max(aeBestScore_ * 0.98f, score);
+            }
+            return;
+        }
+        if (aeBestScore_ < 0.0f) { // first measurement: take it and probe up
+            aeBestScore_ = score;
+            aeBestExposure_ = controls_.exposure;
+            aeDirection_ = 1;
+            aeTrial_ = clampExposure(controls_.exposure * 3 / 2);
+        } else {
+            if (score > aeBestScore_ * 1.05f) { // a real gain, keep going
+                aeBestScore_ = score;
+                aeBestExposure_ = controls_.exposure;
+            } else if (aeDirection_ > 0) {
+                aeDirection_ = -1; // up was no better: try down from the best
+            } else {
+                aeDirection_ = 0; // both ways tried: settle and lock
+            }
+            if (aeDirection_ > 0) {
+                aeTrial_ = clampExposure(controls_.exposure * 3 / 2);
+            } else if (aeDirection_ < 0) {
+                aeTrial_ = clampExposure(std::min(controls_.exposure, aeBestExposure_) * 2 / 3);
+            } else {
+                aeTrial_ = aeBestExposure_;
+                aeLocked_ = true;
+            }
+        }
+        if (aeTrial_ != controls_.exposure) {
+            controls_.exposure = aeTrial_;
+            // Register only: the CS7 block reopens the capture, which would
+            // stall the stream every time the exposure is nudged.
+            (void)sendDeviceCommands({pop4::exposureCommand(controls_.exposure)});
+        }
+    }
+
+    static int clampExposure(int v) { return std::clamp(v, kExposureMin, kExposureMax); }
 
     static bool colorEnabled() {
         static const bool on = [] {
@@ -1147,6 +1238,11 @@ std::vector<std::string> pop4::scanModeCommands(ScanMode mode) {
     // Returning to infrared is done by rebooting the scanner, not by a
     // command: every mode register we know leaves an emitter off instead.
     return {};
+}
+
+std::string pop4::exposureCommand(int microseconds) {
+    return "echo s 0x911 " + std::to_string(std::clamp(microseconds, 20, 60000)) +
+           " > /dev/rk_preisp";
 }
 
 std::vector<std::string> pop4::laserLineCommands(bool on) {

@@ -70,6 +70,15 @@ std::vector<std::string> scanModeCommands(ScanMode mode);
 // visible blue laser lines. Sending only the 0x3001 7 half leaves every
 // emitter off, which is why an earlier attempt looked dead.
 std::vector<std::string> laserLineCommands(bool on);
+
+// Sensor exposure, in the units the vendor's own parameter block uses.
+// cs::Camera::laserParamCollection (lib3DCamera.so @0x636af0) sends
+// "echo s 0x911 <value>" and logs "set exposure time failed" when it is
+// rejected; 0x910 is the frame time alongside it. The CS7 settings block the
+// app sends at arming has an exposure field, but changing it has no
+// measurable effect on the sensor (verified by sweeping it 3000 -> 200 with
+// saturation unchanged at 19.2%).
+std::string exposureCommand(int microseconds);
 std::string lightLevelCommand(Light light, int level);
 
 } // namespace revoscan::protocol::pop4

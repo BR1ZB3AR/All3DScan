@@ -390,6 +390,39 @@ int pop4ColorTest(const char* outDir) {
     return 0;
 }
 
+// Sweeps exposure in the normal infrared mode and records frames per step,
+// to find what the scene in front of the scanner actually wants.
+//   all3dscan --pop4-exposure-sweep <outdir>
+int pop4ExposureSweep(const char* outDir) {
+    std::filesystem::create_directories(outDir);
+    ::setenv("ALL3DSCAN_POP4_DUMP_DIR", outDir, 1);
+    ::setenv("ALL3DSCAN_POP4_DUMP_MAX", "4000", 1);
+    auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
+    if (!scanner->connect() || !scanner->startStream()) {
+        std::cerr << "POP4 connect/stream failed: " << scanner->lastError() << '\n';
+        return 2;
+    }
+    std::ofstream steps(std::string(outDir) + "/steps.txt");
+    int frameIndex = 0;
+    for (int exp : {3000, 2000, 1200, 700, 400, 200}) {
+        const bool ok = scanner->setExposure(exp);
+        std::cout << "exposure " << exp << ": " << (ok ? "ok" : "FAILED " + scanner->lastError())
+                  << std::endl;
+        const int first = frameIndex;
+        for (int i = 0; i < 20; ++i) {
+            if (scanner->readFrame(3000)) {
+                ++frameIndex;
+            }
+        }
+        steps << "exp" << exp << ' ' << first << ' ' << frameIndex - 1 << " ok\n";
+        steps.flush();
+    }
+    scanner->setExposure(3000);
+    scanner->stopStream();
+    scanner->disconnect();
+    return 0;
+}
+
 int probePop4() {
     auto scanner = revoscan::protocol::makeRevopointPop4Protocol();
     std::cout << "Backend: " << scanner->backendName() << '\n';
@@ -759,6 +792,9 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--pop4-color-test" && i + 1 < argc) {
             return pop4ColorTest(argv[i + 1]);
         }
+        if (std::string_view(argv[i]) == "--pop4-exposure-sweep" && i + 1 < argc) {
+            return pop4ExposureSweep(argv[i + 1]);
+        }
         if (std::string_view(argv[i]) == "--pop4-cs7-test" && i + 1 < argc) {
             return pop4Cs7Test(argv[i + 1]);
         }
@@ -812,7 +848,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261016-2337");
+    QApplication::setApplicationVersion("Alpha-v20261017-0040");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme

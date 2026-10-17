@@ -52,6 +52,31 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Exposure: the CS7 field is inert, 0x911 is real (2026-10-17)
+
+**Observed — the CS7 settings block does not control the sensor.** Sweeping
+its exposure field 3000 -> 200 (15x) left the left speckle image's saturated
+fraction at 19.2% +- 0.1 and coverage unchanged. Whatever that block arms, it
+is not exposure (its irLum field was already shown inert on 2026-10-14).
+
+**Observed — `echo s 0x911 <us> > /dev/rk_preisp` is the exposure register.**
+From the SDK's parameter-collection routine (which logs "set exposure time
+failed" beside it; 0x910 is frame time). Sweeping it on hardware: saturation
+19.4% -> 3.4% -> 0.9% -> 0.3%, mean level 22578 -> 8212. Values below ~700
+clamp. The app's Exposure control now sends this register.
+
+**Observed — saturation was not what limited that scene.** Coverage was best
+at the *most* saturated setting (3.9% at 3000 vs 1.2% clean at 700): the
+scene in front of the scanner sat at roughly the near clip (disparity ~125 ~=
+230 mm with the 250-500 mm preset), so most of the object was range-clipped
+whatever the exposure. Lesson repeated from the blue-laser work: measure the
+limiting factor before tuning a lever.
+
+**Measured and rejected — auto-exposure.** A hill-climb on the decoder's
+valid fraction lost to a fixed exposure twice (median 2.5% vs 3.7%; after
+fixing an oscillation bug, 2.8% vs 4.1%): per-frame yield noise exceeds the
+exposure effect. Left behind `ALL3DSCAN_POP4_AUTOEXPOSURE=1`, default off.
+
 ## Colour texture from the scanner's own colour camera (2026-10-16)
 
 **Observed — why meshes came out grey.** The "rgb" the decoder attached to

@@ -4,6 +4,26 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261017-0040
+
+### Fixed
+- **The exposure control never reached the sensor.** Changing it rewrote a
+  settings block the scanner accepts and ignores: sweeping it 15x left the
+  image byte-for-byte equally saturated. The vendor's real exposure register
+  was recovered from its SDK and verified on hardware (saturation 19.4% ->
+  0.3% across the range), and the Exposure slider now drives that.
+
+### Tried and not shipped
+- Automatic exposure (hill-climbing on depth yield) measured *worse* than a
+  fixed exposure twice (2.5% vs 3.7%, then 2.8% vs 4.1% after a bug fix):
+  frame-to-frame yield noise exceeds the real exposure effect. It stays
+  available behind `ALL3DSCAN_POP4_AUTOEXPOSURE=1`, default off.
+
+### Also
+- Recording directories (`ALL3DSCAN_POP4_DUMP_DIR`) are created instead of
+  failing silently; a scan-merge engine (global alignment with overlap+RMSE
+  gates) landed for the upcoming multi-scan feature.
+
 ## Alpha-v20261016-2337
 
 ### Added
