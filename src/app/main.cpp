@@ -606,11 +606,23 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
     applyCamparamEnv(decoder);
     const auto cal = decoder.factoryCalibration().value_or(
         revoscan::decoder::makeApproximatePop4FullFieldCalibration());
-    decoder.setDepthRange(250.0f, 500.0f); // the app's default 250-500 mm preset
+    // The app's default preset, overridable so a recording can be replayed
+    // against the other scanning-distance presets:
+    //   ALL3DSCAN_REPLAY_RANGE=<nearMm>,<farMm>
+    float nearMm = 250.0f;
+    float farMm = 500.0f;
+    if (const char* r = std::getenv("ALL3DSCAN_REPLAY_RANGE")) {
+        float a = 0.0f, b = 0.0f;
+        if (std::sscanf(r, "%f,%f", &a, &b) == 2 && a > 0.0f && b > a) {
+            nearMm = a;
+            farMm = b;
+        }
+    }
+    decoder.setDepthRange(nearMm, farMm);
 
     revoscan::document::ScanDocument document;
     revoscan::processing::ScanPipeline pipeline(&document);
-    pipeline.setDepthClip(0.25f, 0.50f);
+    pipeline.setDepthClip(nearMm / 1000.0f, farMm / 1000.0f);
     pipeline.start();
     int state = 0;
     double fitness = 0.0;
@@ -656,7 +668,30 @@ int replayDumps(int argc, char** argv, const char* dir, const char* plyOut) {
             continue;
         }
         auto cloud = revoscan::pointcloud::fromDepthFrame(*metric, cal.depth);
-        cloud = revoscan::pointcloud::isolateForegroundObject(cloud, {});
+        const size_t rawPoints = cloud.points.size();
+        // ALL3DSCAN_REPLAY_NOISOLATE=1 keeps the back-projected cloud whole,
+        // to separate "the scanner saw little" from "a filter discarded it".
+        if (!std::getenv("ALL3DSCAN_REPLAY_NOISOLATE")) {
+            cloud = revoscan::pointcloud::isolateForegroundObject(cloud, {});
+        }
+        // ALL3DSCAN_REPLAY_STAGES=1 reports what each filter keeps, so a scan
+        // that arrives with geometry and leaves without it can be traced.
+        if (std::getenv("ALL3DSCAN_REPLAY_STAGES")) {
+            std::vector<float> zs;
+            zs.reserve(cloud.points.size());
+            for (const auto& pt : cloud.points) {
+                zs.push_back(pt.z);
+            }
+            float zMed = 0.0f;
+            if (!zs.empty()) {
+                std::nth_element(zs.begin(), zs.begin() + static_cast<std::ptrdiff_t>(zs.size() / 2),
+                                 zs.end());
+                zMed = zs[zs.size() / 2];
+            }
+            std::cout << "  stages: backprojected=" << rawPoints
+                      << " isolated=" << cloud.points.size()
+                      << " medianZmm=" << zMed * 1000.0f << '\n';
+        }
         if (i == 0) {
             firstFrame = cloud; // reference surface for the orbit accuracy check
         }
@@ -848,7 +883,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261017-0040");
+    QApplication::setApplicationVersion("Alpha-v20261018-0030");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme

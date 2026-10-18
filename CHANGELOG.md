@@ -4,6 +4,30 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261018-0030
+
+### Fixed
+- **Scans were losing most of the object before it ever reached the model.**
+  The step that isolates your object from the background kept only the single
+  largest connected piece of it. A close object with patchy depth arrives as
+  five to eight pieces, so most of it was thrown away every frame. It now
+  keeps the other pieces when they sit at the object's own depth, while still
+  rejecting the background behind it.
+  - Measured on a real 400-frame hand-held sweep: **frames tracked 213 ->
+    340, frames lost 187 -> 60, model 16k -> 53k points.**
+  - Ruled out along the way, each by measurement: the scanning-distance
+    preset (250-500 mm is the best of the three) and the dominant-plane
+    removal (already off, and discarding nothing).
+
+### Added
+- Loop closure (in Rust) for the drift that leaves a swept object with two
+  surfaces slightly apart. The engine is tested against synthetic loops;
+  wiring it into live scanning is next.
+- Replay diagnostics for recorded scans: `ALL3DSCAN_REPLAY_STAGES=1` reports
+  what each filter keeps, `ALL3DSCAN_REPLAY_RANGE=<near>,<far>` replays
+  against other distance presets, and `ALL3DSCAN_REPLAY_NOISOLATE=1`
+  separates "the scanner saw little" from "a filter discarded it".
+
 ## Alpha-v20261017-0040
 
 ### Fixed

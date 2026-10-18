@@ -318,9 +318,19 @@ PointCloud isolateForegroundObject(const PointCloud& in,
     // Strip the dominant fronto-parallel plane (back wall / collapsed depth
     // slab) so the object's relief survives clustering rather than being buried
     // in a filled sheet.
+    const std::size_t beforePlane = band.points.size();
     band.points = removeDominantFrontoPlane(band.points, params);
+    const std::size_t afterPlane = band.points.size();
+    const bool trace = std::getenv("ALL3DSCAN_ISOLATE_TRACE") != nullptr;
+    if (trace) {
+        std::fprintf(stderr, "[isolate] in=%zu band=%zu afterPlane=%zu",
+                     in.points.size(), beforePlane, afterPlane);
+    }
 
     if (band.points.size() < params.minClusterPoints) {
+        if (trace) {
+            std::fprintf(stderr, " (too few to cluster)\n");
+        }
         return band;
     }
 
@@ -342,6 +352,7 @@ PointCloud isolateForegroundObject(const PointCloud& in,
         double sumY = 0.0;
         double sumZ = 0.0;
         float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
+        float minZ = 0.0f, maxZ = 0.0f;
         bool initBBox = false;
     };
 
@@ -370,12 +381,15 @@ PointCloud isolateForegroundObject(const PointCloud& in,
                 if (!stats.initBBox) {
                     stats.minX = stats.maxX = p.x;
                     stats.minY = stats.maxY = p.y;
+                    stats.minZ = stats.maxZ = p.z;
                     stats.initBBox = true;
                 } else {
                     stats.minX = std::min(stats.minX, p.x);
                     stats.maxX = std::max(stats.maxX, p.x);
                     stats.minY = std::min(stats.minY, p.y);
                     stats.maxY = std::max(stats.maxY, p.y);
+                    stats.minZ = std::min(stats.minZ, p.z);
+                    stats.maxZ = std::max(stats.maxZ, p.z);
                 }
             }
             for (int dx = -1; dx <= 1; ++dx) {
@@ -431,17 +445,60 @@ PointCloud isolateForegroundObject(const PointCloud& in,
     }
 
     const ClusterStats& chosen = comps[static_cast<size_t>(best)];
+
+    // One object usually arrives as several clusters, not one: patchy depth
+    // breaks a surface into pieces, and a close object can be crossed by its
+    // own gaps. Keeping strictly the largest discarded most of the object on a
+    // real sweep (521 of 1614 points kept, and 12x less model than with
+    // isolation off). Accept the other pieces too, provided each is a
+    // meaningful size and sits at the chosen cluster's depth — background at
+    // another depth is still rejected.
+    // A fragment counts as part of this object when it lies within the chosen
+    // cluster's own depth extent, plus a small margin for the gap that split
+    // them. Deliberately not nearBandM: that is the whole working window, wide
+    // enough to swallow a background surface a hand's width behind.
+    constexpr float kFragmentMarginM = 0.02f;
+    const float sameZLo = chosen.minZ - kFragmentMarginM;
+    const float sameZHi = chosen.maxZ + kFragmentMarginM;
+    std::vector<bool> accepted(comps.size(), false);
+    accepted[static_cast<size_t>(best)] = true;
+    float xMin = chosen.minX;
+    float xMax = chosen.maxX;
+    float yMin = chosen.minY;
+    float yMax = chosen.maxY;
+    size_t acceptedCount = chosen.count;
+    if (params.keepOnlyBestCluster) {
+        for (size_t i = 0; i < comps.size(); ++i) {
+            if (accepted[i]) {
+                continue;
+            }
+            const auto& c = comps[i];
+            if (c.count < minCount) {
+                continue;
+            }
+            const double cz = c.sumZ / static_cast<double>(c.count);
+            if (cz < sameZLo || cz > sameZHi) {
+                continue; // a different surface, not part of this object
+            }
+            accepted[i] = true;
+            acceptedCount += c.count;
+            xMin = std::min(xMin, c.minX);
+            xMax = std::max(xMax, c.maxX);
+            yMin = std::min(yMin, c.minY);
+            yMax = std::max(yMax, c.maxY);
+        }
+    }
     const float pad = params.lateralPadM;
-    const float xMin = chosen.minX - pad;
-    const float xMax = chosen.maxX + pad;
-    const float yMin = chosen.minY - pad;
-    const float yMax = chosen.maxY + pad;
+    xMin -= pad;
+    xMax += pad;
+    yMin -= pad;
+    yMax += pad;
 
     PointCloud out;
-    out.points.reserve(chosen.count);
+    out.points.reserve(acceptedCount);
     for (const auto& entry : cells) {
         const int comp = label.at(entry.first);
-        if (params.keepOnlyBestCluster && comp != best) {
+        if (params.keepOnlyBestCluster && !accepted[static_cast<size_t>(comp)]) {
             continue;
         }
         if (!params.keepOnlyBestCluster &&
@@ -457,6 +514,9 @@ PointCloud isolateForegroundObject(const PointCloud& in,
             }
             out.points.push_back(p);
         }
+    }
+    if (trace) {
+        std::fprintf(stderr, " clusters=%zu out=%zu\n", comps.size(), out.points.size());
     }
     return out.points.empty() ? band : out;
 }

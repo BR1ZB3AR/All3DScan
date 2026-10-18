@@ -52,6 +52,41 @@ no factory calibration is available.
   the cache, then to the approximate model. `ALL3DSCAN_CAMPARAM=<file>`
   overrides, including for `--decode-dump` and `--replay-dumps`.
 
+## Foreground isolation was deleting most of the object (2026-10-18)
+
+**Observed on a real 400-frame sweep** (the first recording of an actual
+hand-held scan, `/tmp/scan1`). Tracking held only 213 of 400 frames and the
+fused model came to 16k points. Stage counts per frame showed why:
+
+| stage | points | |
+|---|---|---|
+| decoder output | ~24,000 valid depth pixels | |
+| back-projected inside the 250-500 mm preset | 3,021 | |
+| after the nearest-surface band | 1,614 | 53% |
+| after dominant-plane removal | 1,614 | 100% — innocent |
+| **after clustering** | **521** | **32%** |
+
+The clustering kept only the single largest connected cluster. A close,
+patchy object arrives as 5-8 clusters, not one, so most of it was discarded
+every frame. Turning isolation off entirely gave 348 tracked and a 202k
+model, which proved the filter — not the sensor — was the limit.
+
+**Fix:** keep the other clusters too when each is a meaningful share of the
+largest *and* its centroid lies within the chosen cluster's own depth extent
+(+-20 mm). Result on the same recording: **213 -> 340 frames tracked, 187 ->
+60 lost, 16k -> 53k model points.**
+
+The first version of this test used `nearBandM` for "same depth", which a unit
+test caught: that parameter is the whole working window, wide enough to
+absorb a background sheet a hand's width behind the object. The cluster's own
+extent is the right reference.
+
+**Not the limiting factors, each measured and ruled out:** the scanning
+distance preset (250-500 mm is the best of the three; 210-400 collapses to 1
+tracked frame, and wider ranges are worse still, because the range steers the
+stereo search band rather than merely clipping), and the dominant-plane
+removal (already off by default).
+
 ## Exposure: the CS7 field is inert, 0x911 is real (2026-10-17)
 
 **Observed — the CS7 settings block does not control the sensor.** Sweeping
