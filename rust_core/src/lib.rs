@@ -1,4 +1,5 @@
 pub mod ar;
+pub mod posegraph;
 pub mod decoder;
 pub mod exporter;
 pub mod protocol;

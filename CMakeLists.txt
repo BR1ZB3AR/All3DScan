@@ -174,7 +174,7 @@ add_custom_command(
     OUTPUT ${RUST_STATIC_LIB}
     COMMAND cargo build --release
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/rust_core
-    DEPENDS ${CMAKE_SOURCE_DIR}/rust_core/src/lib.rs ${CMAKE_SOURCE_DIR}/rust_core/src/ar.rs ${CMAKE_SOURCE_DIR}/rust_core/src/protocol.rs ${CMAKE_SOURCE_DIR}/rust_core/src/decoder.rs ${CMAKE_SOURCE_DIR}/rust_core/src/exporter.rs
+    DEPENDS ${CMAKE_SOURCE_DIR}/rust_core/src/lib.rs ${CMAKE_SOURCE_DIR}/rust_core/src/posegraph.rs ${CMAKE_SOURCE_DIR}/rust_core/src/ar.rs ${CMAKE_SOURCE_DIR}/rust_core/src/protocol.rs ${CMAKE_SOURCE_DIR}/rust_core/src/decoder.rs ${CMAKE_SOURCE_DIR}/rust_core/src/exporter.rs
     COMMENT "Building Rust Core static library..."
 )
 
