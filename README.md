@@ -79,6 +79,12 @@ grey made from the infrared images. Verified on a printed carton: see the
 2026-10-16 section of `docs/protocol/RE_NOTES.md`. Needs `libturbojpeg`;
 without it the app falls back to grey. `ALL3DSCAN_POP4_COLOR=0` disables it.
 
+**Separate scans can be merged.** File -> Merge Scan… aligns a saved scan to
+the open one with no shared starting pose — scan the front, scan the back,
+merge. Borderline matches are reported with their numbers and left to you
+rather than merged silently. Also available as
+`all3dscan --merge-scans a.ply b.ply out.ply`.
+
 **Scans align themselves.** Each frame is aligned to the model as you scan,
 from a predicted motion, and fused only if most of it lands on the
 already-scanned surface (within 4 mm). If tracking is lost, move back over an

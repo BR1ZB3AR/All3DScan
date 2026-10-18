@@ -13,6 +13,7 @@
 #include "net/RevopointWifiControl.h"
 #include "processing/ScanPipeline.h"
 
+class QAction;
 class QLabel;
 class QPushButton;
 class QComboBox;
@@ -52,6 +53,13 @@ private slots:
     void onExport();
     void onSendToSlicer();
     void onImportPly();
+    // Merging a separately captured scan into the current model: pick a file,
+    // align it with no pose to start from, then fuse it in. The search runs
+    // off the UI thread and reports back through onMergeFinished.
+    void onMergeScan();
+    void onMergeFinished(bool ok, double overlap, double rmseMm, int addedPoints,
+                         const QString& error);
+    void applyMerge(double overlap, double rmseMm);
     void onUndo();
     void onRedo();
     void onDeleteSelection();
@@ -123,6 +131,13 @@ private:
     // onCompleteFinished so nothing resets the pipeline mid-build.
     std::thread completeThread_;
     bool completing_ = false;
+    std::thread mergeThread_;
+    bool merging_ = false;
+    // The aligned cloud is held until it is either fused or discarded, so a
+    // borderline match can be offered to the user rather than silently
+    // dropped or silently merged.
+    pointcloud::PointCloud pendingMerge_;
+    QAction* mergeAction_ = nullptr;
     QElapsedTimer relocalizedAt_; // last automatic re-alignment, for the HUD
     QPushButton* cancelButton_ = nullptr;
     QPushButton* newScanButton_ = nullptr;

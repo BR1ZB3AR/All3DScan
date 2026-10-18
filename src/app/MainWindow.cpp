@@ -42,6 +42,7 @@
 #include "Theme.h"
 #include "io/GeometryExport.h"
 #include "io/PlyImport.h"
+#include "processing/Registration.h"
 #include "io/PointCloudExport.h"
 #include "protocol/ScannerProtocol.h"
 #include "util/ResourcePaths.h"
@@ -507,6 +508,10 @@ MainWindow::~MainWindow() {
     if (completeThread_.joinable()) {
         completeThread_.join();
     }
+    // Likewise a merge: it holds the document and writes into it.
+    if (mergeThread_.joinable()) {
+        mergeThread_.join();
+    }
     if (pipeline_) {
         pipeline_->stop();
     }
@@ -521,6 +526,10 @@ void MainWindow::buildMenus() {
     newScanAction->setShortcut(QKeySequence::New);
     fileMenu->addSeparator();
     fileMenu->addAction(tr("Open PLY…"), this, &MainWindow::onImportPly);
+    mergeAction_ = fileMenu->addAction(tr("Merge Scan…"), this, &MainWindow::onMergeScan);
+    mergeAction_->setToolTip(
+        tr("Line a separately captured scan up with this one — scan the front,\n"
+           "scan the back, then merge them into a single model."));
     fileMenu->addAction(tr("Export…"), this, &MainWindow::onExport);
     fileMenu->addAction(tr("Send to OrcaSlicer"), this, &MainWindow::onSendToSlicer);
     fileMenu->addSeparator();
@@ -1509,6 +1518,140 @@ void MainWindow::onDeleteSelection() {
     }
     editView_->clearSelection();
     onDocumentUpdated();
+}
+
+void MainWindow::onMergeScan() {
+    if (merging_) {
+        return;
+    }
+    if (document_.cloudEmpty()) {
+        QMessageBox::information(
+            this, tr("Merge Scan"),
+            tr("There is nothing to merge into yet. Scan or open a model first, "
+               "then merge a second scan into it."));
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Merge a scan into this model"), QString(), tr("PLY (*.ply)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    std::string error;
+    auto incoming = io::readPlyCloud(path.toStdString(), &error);
+    if (!incoming || incoming->points.empty()) {
+        QMessageBox::critical(this, tr("Merge Scan"),
+                              error.empty() ? tr("That file has no points.")
+                                            : QString::fromStdString(error));
+        return;
+    }
+    if (mergeThread_.joinable()) {
+        mergeThread_.join();
+    }
+    merging_ = true;
+    if (mergeAction_) {
+        mergeAction_->setEnabled(false);
+    }
+    connLabel_->setText(tr("● Lining the scans up…"));
+    connLabel_->setStyleSheet("color:#d0a24c;");
+
+    // The search tries many orientations, each refined by ICP, so it is far
+    // too slow for the UI thread.
+    auto target = document_.cloudCopy();
+    auto source = std::make_shared<pointcloud::PointCloud>(std::move(*incoming));
+    mergeThread_ = std::thread([this, target = std::move(target), source] {
+        bool ok = false;
+        double overlap = 0.0;
+        double rmseMm = 0.0;
+        int added = 0;
+        QString err;
+        try {
+            const processing::PlaneIcpTarget prepared(target, 0.006f);
+            const processing::GlobalAlignResult r =
+                processing::alignGlobally(*source, prepared);
+            ok = r.ok;
+            overlap = r.quality.overlap;
+            rmseMm = r.quality.rmseM * 1000.0;
+            // Keep the aligned cloud whatever the verdict: a match the engine
+            // will not accept on its own may still be the right one, and the
+            // user can see the numbers and decide.
+            pendingMerge_ = processing::transformed(*source, r.transform);
+            added = static_cast<int>(pendingMerge_.points.size());
+        } catch (const std::exception& e) {
+            err = QString::fromUtf8(e.what());
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok, overlap, rmseMm, added, err] {
+                onMergeFinished(ok, overlap, rmseMm, added, err);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::onMergeFinished(bool ok, double overlap, double rmseMm, int addedPoints,
+                                 const QString& error) {
+    merging_ = false;
+    if (mergeAction_) {
+        mergeAction_->setEnabled(true);
+    }
+    if (!error.isEmpty()) {
+        QMessageBox::critical(this, tr("Merge Scan"), error);
+        connLabel_->setText(tr("● Merge failed"));
+        connLabel_->setStyleSheet("color:#d95c5c;");
+        return;
+    }
+    if (!ok) {
+        // A fair amount of the scan landed on the model, just not tightly
+        // enough for the engine to accept by itself. Show the numbers and let
+        // the user judge rather than silently refusing or silently merging.
+        const bool worthOffering = overlap >= 0.35 && rmseMm <= 5.0 &&
+                                   !pendingMerge_.points.empty();
+        if (worthOffering) {
+            const auto choice = QMessageBox::question(
+                this, tr("Merge Scan"),
+                tr("Close, but not certain.\n\n"
+                   "%1% of the second scan landed on this model, matching to "
+                   "%2 mm. That is typical of a correct merge on a noisy scan, "
+                   "but it is below the level this will accept on its own.\n\n"
+                   "Merge it anyway?")
+                    .arg(overlap * 100.0, 0, 'f', 0)
+                    .arg(rmseMm, 0, 'f', 1),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (choice == QMessageBox::Yes) {
+                applyMerge(overlap, rmseMm);
+                return;
+            }
+        } else {
+            QMessageBox::warning(
+                this, tr("Merge Scan"),
+                tr("These two scans could not be lined up, so nothing was merged.\n\n"
+                   "Best match: %1% of the scan sat on the model, within %2 mm.\n\n"
+                   "They need a genuinely overlapping region — scan so the second "
+                   "pass covers part of what the first one saw.")
+                    .arg(overlap * 100.0, 0, 'f', 0)
+                    .arg(rmseMm, 0, 'f', 1));
+        }
+        pendingMerge_.points.clear();
+        connLabel_->setText(tr("● Scans did not line up — nothing merged"));
+        connLabel_->setStyleSheet("color:#e0a83e;");
+        return;
+    }
+    applyMerge(overlap, rmseMm);
+}
+
+void MainWindow::applyMerge(double overlap, double rmseMm) {
+    const int added = static_cast<int>(pendingMerge_.points.size());
+    document_.fuseCloud(pendingMerge_, 0.001f, document_.isMetric(), "merged");
+    pendingMerge_.points.clear();
+    modelStage_ = ModelStage::PointClouds;
+    onDocumentUpdated();
+    showEditPage();
+    updateControlStates();
+    connLabel_->setText(tr("● Merged %1 points — %2% overlap, %3 mm")
+                            .arg(added)
+                            .arg(overlap * 100.0, 0, 'f', 0)
+                            .arg(rmseMm, 0, 'f', 1));
+    connLabel_->setStyleSheet("color:#5bbf5b;");
 }
 
 void MainWindow::onImportPly() {

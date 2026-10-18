@@ -4,6 +4,7 @@
 #include <QIcon>
 #include <QTimer>
 #include <QPushButton>
+#include <QAction>
 #include <QComboBox>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <string_view>
 
 #include "MainWindow.h"
+#include "io/PlyImport.h"
 #include "ScannerController.h"
 #include "bridge/RustBridge.h"
 #include "decoder/Pop4DepthDecoder.h"
@@ -420,6 +422,48 @@ int pop4ExposureSweep(const char* outDir) {
     scanner->setExposure(3000);
     scanner->stopStream();
     scanner->disconnect();
+    return 0;
+}
+
+// Aligns one saved scan onto another with no starting pose, the same way the
+// window's "Merge Scan..." does, and reports what it found.
+//   all3dscan --merge-scans <base.ply> <incoming.ply> [merged.ply]
+int mergeScans(const char* basePath, const char* incomingPath, const char* outPath) {
+    std::string error;
+    auto base = revoscan::io::readPlyCloud(basePath, &error);
+    if (!base || base->points.empty()) {
+        std::cerr << basePath << ": " << (error.empty() ? "no points" : error) << '\n';
+        return 2;
+    }
+    auto incoming = revoscan::io::readPlyCloud(incomingPath, &error);
+    if (!incoming || incoming->points.empty()) {
+        std::cerr << incomingPath << ": " << (error.empty() ? "no points" : error) << '\n';
+        return 2;
+    }
+    std::cout << "base " << base->points.size() << " points, incoming "
+              << incoming->points.size() << " points\n";
+    const auto t0 = std::chrono::steady_clock::now();
+    const revoscan::processing::PlaneIcpTarget prepared(*base, 0.006f);
+    const auto r = revoscan::processing::alignGlobally(*incoming, prepared);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "tried " << r.orientationsTried << " orientations in " << secs << " s\n"
+              << "overlap " << r.quality.overlap * 100.0 << "%, rmse "
+              << r.quality.rmseM * 1000.0 << " mm -> " << (r.ok ? "ALIGNED" : "no match")
+              << '\n';
+    if (!r.ok) {
+        return 3;
+    }
+    if (outPath) {
+        auto moved = revoscan::processing::transformed(*incoming, r.transform);
+        revoscan::pointcloud::PointCloud merged = *base;
+        merged.points.insert(merged.points.end(), moved.points.begin(), moved.points.end());
+        if (!revoscan::io::writePly(outPath, merged)) {
+            std::cerr << "failed to write " << outPath << '\n';
+            return 4;
+        }
+        std::cout << "wrote " << outPath << " with " << merged.points.size() << " points\n";
+    }
     return 0;
 }
 
@@ -827,6 +871,9 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--pop4-color-test" && i + 1 < argc) {
             return pop4ColorTest(argv[i + 1]);
         }
+        if (std::string_view(argv[i]) == "--merge-scans" && i + 2 < argc) {
+            return mergeScans(argv[i + 1], argv[i + 2], i + 3 < argc ? argv[i + 3] : nullptr);
+        }
         if (std::string_view(argv[i]) == "--pop4-exposure-sweep" && i + 1 < argc) {
             return pop4ExposureSweep(argv[i + 1]);
         }
@@ -883,7 +930,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QApplication::setApplicationName("All3DScan");
-    QApplication::setApplicationVersion("Alpha-v20261018-0030");
+    QApplication::setApplicationVersion("Alpha-v20261018-1400");
     QApplication::setOrganizationName("All3DScan");
     QApplication::setDesktopFileName("io.github.all3dscan.All3DScan");
     // App logo for windows, dialogs and the taskbar: the installed icon theme
@@ -917,6 +964,13 @@ int main(int argc, char** argv) {
                     QApplication::processEvents(QEventLoop::AllEvents, 10);
                 }
             };
+            // Report the File menu so a new action can be confirmed present.
+            for (auto* act : window.findChildren<QAction*>()) {
+                if (act->text().contains("Merge", Qt::CaseInsensitive)) {
+                    std::cout << "menu action found: \"" << act->text().toStdString()
+                              << "\" enabled=" << act->isEnabled() << "\n";
+                }
+            }
             auto* combo = window.findChild<QComboBox*>();
             const auto boxes = window.findChildren<QComboBox*>();
             QComboBox* modeBox = nullptr;

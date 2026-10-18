@@ -4,6 +4,25 @@ All notable changes to All3DScan are logged here, newest first. Versions
 follow `Alpha-vYYYYMMDD-HHMM` (local time at the point of the change) — this
 project is pre-release reverse-engineering work, not semver.
 
+## Alpha-v20261018-1400
+
+### Added
+- **File -> Merge Scan…** — line a separately captured scan up with the one
+  you have open. Scan the front, scan the back, then merge them into a single
+  model. The two scans need no shared starting position: the alignment
+  searches orientations for itself.
+  - It runs in the background, so the window stays usable.
+  - When the match is good it merges and reports how much of the second scan
+    landed on the model and how closely.
+  - When it is close but not certain it says so, with the numbers, and asks
+    whether to merge anyway — rather than silently merging something wrong or
+    silently refusing something right. Measured on two real scans: 69%
+    overlap at 1.9 mm, which is a correct merge on noisy scan data but sits
+    just outside what the engine accepts unaided.
+  - When the scans genuinely do not overlap, it merges nothing and says why.
+- `all3dscan --merge-scans <base.ply> <incoming.ply> [out.ply]` does the same
+  from the command line.
+
 ## Alpha-v20261018-0030
 
 ### Fixed
