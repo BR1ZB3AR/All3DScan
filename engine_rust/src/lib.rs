@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 pub mod fitting;
+pub mod fusion;
 pub mod hw;
 pub mod processing;
 
@@ -23,7 +24,7 @@ mod all3dscan_engine {
     use pyo3::types::PyDict;
 
     use crate::processing::ProcessingError;
-    use crate::{fitting, hw, processing};
+    use crate::{fitting, fusion, hw, processing};
 
     /// The mock depth camera from hw_cpp.
     ///
@@ -419,6 +420,150 @@ mod all3dscan_engine {
     #[pyfunction]
     fn pop4_present() -> bool {
         hw::Pop4Sensor::present()
+    }
+
+    /// A cloud handed back to Python: its points, colours and normals.
+    type Cloud<'py> = (
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<u8>>,
+        Bound<'py, PyArray2<f32>>,
+    );
+
+    /// The rows of an (N, 3) uint8 array, after checking its shape.
+    fn colour_rows(
+        array: &PyArrayLike2<'_, u8, AllowTypeChange>,
+        points: usize,
+    ) -> PyResult<Vec<[u8; 3]>> {
+        let view = array.as_array();
+        if view.ncols() != 3 || view.nrows() != points {
+            return Err(PyValueError::new_err(format!(
+                "colors must have shape ({points}, 3), got {:?}",
+                view.shape()
+            )));
+        }
+        Ok(view
+            .rows()
+            .into_iter()
+            .map(|r| [r[0], r[1], r[2]])
+            .collect())
+    }
+
+    /// Builds one point cloud out of a scan's frames.
+    ///
+    /// Each frame is aligned onto the model built so far, with point-to-plane
+    /// ICP against the Qt app's own tracker, and merged into it, thinned to
+    /// one point per voxel. The first frame becomes the model and fixes the
+    /// axes the rest are placed in. A frame that cannot be placed is left out
+    /// rather than smeared across the model, and add() says so.
+    #[pyclass(frozen)]
+    struct Fusion {
+        // Adding from one thread while the GUI reads the model from another
+        // takes turns instead of racing.
+        fusion: Mutex<fusion::Fusion>,
+        model_points: AtomicU64,
+    }
+
+    #[pymethods]
+    impl Fusion {
+        #[new]
+        #[pyo3(signature = (voxel_mm = 1.0))]
+        fn new(voxel_mm: f32) -> PyResult<Self> {
+            let fusion = fusion::Fusion::new(voxel_mm)
+                .map_err(|e| PyValueError::new_err(e.what().to_owned()))?;
+            Ok(Self {
+                fusion: Mutex::new(fusion),
+                model_points: AtomicU64::new(0),
+            })
+        }
+
+        /// Aligns an (N, 3) frame onto the model and merges it, carrying its
+        /// colours and normals across. Returns how it sat: whether it was
+        /// merged, the share of its points on the model's surface, their RMS
+        /// distance in millimetres, and the points in the model afterwards.
+        fn add<'py>(
+            &self,
+            py: Python<'py>,
+            points: PyArrayLike2<'py, f32, AllowTypeChange>,
+            colors: PyArrayLike2<'py, u8, AllowTypeChange>,
+            normals: PyArrayLike2<'py, f32, AllowTypeChange>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            // Copied while attached: other Python threads may change the
+            // arrays once the GIL is released.
+            let frame = processing::Cloud {
+                points: triples(&points, "points")?,
+                colors: colour_rows(&colors, points.as_array().nrows())?,
+                normals: triples(&normals, "normals")?,
+            };
+            if frame.normals.len() != frame.points.len() {
+                return Err(PyValueError::new_err(format!(
+                    "normals must match points, got {} normals for {} points",
+                    frame.normals.len(),
+                    frame.points.len()
+                )));
+            }
+            let fit = py
+                .detach(|| self.locked().add(&frame))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            self.model_points.store(fit.model_points, Ordering::Relaxed);
+            let result = PyDict::new(py);
+            result.set_item("merged", fit.merged)?;
+            result.set_item("overlap", fit.overlap)?;
+            result.set_item("rmse_mm", fit.rmse_mm)?;
+            result.set_item("model_points", fit.model_points)?;
+            Ok(result)
+        }
+
+        /// The model so far, as an (N, 3) float32 array of millimetres in the
+        /// first frame's axes, and its (N, 3) uint8 colours.
+        fn cloud<'py>(&self, py: Python<'py>) -> PyResult<Cloud<'py>> {
+            let (xyz, rgb, normals) = py.detach(|| {
+                let fusion = self.locked();
+                let cloud = fusion.cloud();
+                (
+                    flatten(&cloud.points),
+                    cloud.colors.iter().copied().flatten().collect::<Vec<u8>>(),
+                    cloud
+                        .normals
+                        .iter()
+                        .flat_map(|n| [n.x, n.y, n.z])
+                        .collect::<Vec<f32>>(),
+                )
+            });
+            let n = xyz.len() / 3;
+            Ok((
+                into_array(py, xyz)?,
+                PyArray1::from_vec(py, rgb).reshape([n, 3])?,
+                into_array(py, normals)?,
+            ))
+        }
+
+        /// Throws the model away and starts again.
+        fn clear(&self, py: Python<'_>) {
+            py.detach(|| self.locked().clear());
+            self.model_points.store(0, Ordering::Relaxed);
+        }
+
+        #[getter]
+        fn model_points(&self) -> u64 {
+            self.model_points.load(Ordering::Relaxed)
+        }
+
+        /// Frames handed over, and of those, the ones that were merged.
+        #[getter]
+        fn frames(&self) -> u64 {
+            self.locked().frames()
+        }
+
+        #[getter]
+        fn merged(&self) -> u64 {
+            self.locked().merged()
+        }
+    }
+
+    impl Fusion {
+        fn locked(&self) -> std::sync::MutexGuard<'_, fusion::Fusion> {
+            self.fusion.lock().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
     #[pymethods]

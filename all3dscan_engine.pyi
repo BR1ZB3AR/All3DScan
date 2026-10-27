@@ -87,6 +87,43 @@ class Pop4Sensor:
     @property
     def closed(self) -> bool: ...
 
+class Fusion:
+    """Builds one point cloud out of a scan's frames.
+
+    Each frame is aligned onto the model built so far (point-to-plane ICP)
+    and merged into it, thinned to one point per voxel, carrying its colours
+    and normals across. The first frame becomes the model and fixes the axes
+    the rest are placed in; a frame that cannot be placed is left out.
+    """
+
+    def __init__(self, voxel_mm: float = 1.0) -> None: ...
+    def add(
+        self, points: npt.ArrayLike, colors: npt.ArrayLike, normals: npt.ArrayLike
+    ) -> FrameFit:
+        """Aligns an (N, 3) frame onto the model and merges it."""
+    def cloud(
+        self,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.uint8], npt.NDArray[np.float32]]:
+        """The model so far: its points in millimetres, colours and normals."""
+    def clear(self) -> None:
+        """Throws the model away and starts again."""
+    @property
+    def model_points(self) -> int: ...
+    @property
+    def frames(self) -> int: ...
+    @property
+    def merged(self) -> int:
+        """Frames handed over, and of those, the ones that were merged."""
+
+class FrameFit(TypedDict):
+    merged: bool
+    """Whether the frame was aligned well enough to be merged."""
+    overlap: float
+    """The share of the frame's points lying on the model's surface."""
+    rmse_mm: float
+    """Their RMS distance from it."""
+    model_points: int
+
 def pop4_present() -> bool:
     """Whether a POP 4 is plugged in, without opening it."""
 

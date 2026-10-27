@@ -13,6 +13,8 @@ window stays responsive while a scan is processed.
 - `viewport3d.py` — the 3D view: point clouds drawn with OpenGL, shaded by
   their normals, in scan blue ("No color") or their own colours ("Color"),
   with each fitted primitive's points tinted in its colour
+- `app.py`'s **Fusion** builds one model from a scan's frames; the alignment
+  is the Qt app's own tracker, reached through the engine
 - `rea_engine.py` — scan-to-CAD: fits planes and cylinders to a scan (RANSAC
   in the Rust engine) and writes them to STEP as exact geometry
   (OpenCASCADE, through OCP)
@@ -102,6 +104,24 @@ and Shift+M toggles fullscreen. In the 3D view, drag to rotate, Shift+drag
 frame the cloud again. Completing a scan prints its last point cloud's array
 shape to the console; the capture window prints one per capture.
 `install_desktop_entry.py --remove` takes the launcher entry out again.
+
+## Fusion
+
+**Fusion** in the ribbon, on by default, builds one model out of a scan's
+frames instead of keeping only the last one: each frame is aligned onto the
+model so far with point-to-plane ICP and merged into it, carrying its colours
+and normals. A frame that cannot be placed is left out rather than smeared
+across the model, and the status bar's **Tracking** count shows how many were
+placed of those tried.
+
+Fusing a frame costs far more than capturing one, so it runs on its own
+thread and takes whichever frame is current when it is free, dropping the
+rest; the live view keeps its frame rate and the model fills in as fast as
+the machine allows. Turn Fusion off to see only the newest frame, which is
+what you want when the scene itself is moving.
+
+Completing a scan keeps the fused model, so the REA fits below measure the
+whole object rather than one frame of it.
 
 ## Scan to CAD (REA)
 

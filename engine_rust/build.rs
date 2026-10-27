@@ -1,4 +1,9 @@
-//! Compiles the C++ sensor layer (../hw_cpp) and its cxx bridge into the engine.
+//! Compiles the C++ layers (../hw_cpp, ../fusion_cpp) and their cxx bridges
+//! into the engine.
+//!
+//! Fusion reuses the Qt app's registration (../src/processing/Registration,
+//! ../src/pointcloud), which needs nothing but the standard library and
+//! OpenMP, so it is always built.
 //!
 //! The POP 4 goes through the scanner backend the legacy app uses: ../src/usb,
 //! ../src/protocol and ../src/decoder, compiled here too, with the decoder's
@@ -23,14 +28,31 @@ fn main() {
         println!("cargo:warning=libusb-1.0 not found: building without POP 4 support");
     }
 
-    cxx_build::bridge("src/hw.rs")
+    let fusion_cpp = root.join("fusion_cpp");
+    cxx_build::bridges(["src/hw.rs", "src/fusion.rs"])
         .file(hw_cpp.join("src/MockDepthSensor.cpp"))
         .file(hw_cpp.join("src/Pop4Presence.cpp"))
         .include(hw_cpp.join("include"))
+        .include(fusion_cpp.join("include"))
+        .include(&legacy) // FrameFusion.h reaches the registration headers
         .std("c++17")
         .flag_if_supported("-Wall")
         .flag_if_supported("-Wextra")
         .compile("all3dscan_hw");
+
+    // The registration's own warnings stay out of this build's output.
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .warnings(false)
+        .flag("-fopenmp") // ICP's hot loops
+        .include(fusion_cpp.join("include"))
+        .include(&legacy)
+        .file(fusion_cpp.join("src/FrameFusion.cpp"))
+        .file(legacy.join("pointcloud/PointCloud.cpp"))
+        .file(legacy.join("processing/Registration.cpp"))
+        .compile("all3dscan_fusion");
+    println!("cargo:rustc-link-lib=gomp");
 
     let Some(libusb) = libusb else {
         cc::Build::new()
@@ -39,7 +61,7 @@ fn main() {
             .file(hw_cpp.join("src/Pop4SensorStub.cpp"))
             .include(hw_cpp.join("include"))
             .compile("all3dscan_pop4");
-        rerun_if_changed(&[&hw_cpp]);
+        rerun_if_changed(&[&hw_cpp, &fusion_cpp, &legacy.join("processing")]);
         return;
     };
 
@@ -125,13 +147,15 @@ fn main() {
             println!("cargo:rustc-link-lib={lib}");
         }
     }
-    println!("cargo:rustc-link-lib=gomp");
 
     rerun_if_changed(&[
         &hw_cpp,
+        &fusion_cpp,
         &legacy.join("usb"),
         &legacy.join("protocol"),
         &legacy.join("decoder"),
+        &legacy.join("pointcloud"),
+        &legacy.join("processing"),
     ]);
     for var in ["ALL3DSCAN_CUDA_ARCH", "NVCC", "CUDA_PATH"] {
         println!("cargo:rerun-if-env-changed={var}");
@@ -156,6 +180,7 @@ fn find_nvcc() -> Option<PathBuf> {
 
 fn rerun_if_changed(paths: &[&Path]) {
     println!("cargo:rerun-if-changed=src/hw.rs");
+    println!("cargo:rerun-if-changed=src/fusion.rs");
     for path in paths {
         println!("cargo:rerun-if-changed={}", path.display());
     }

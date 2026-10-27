@@ -1,5 +1,8 @@
 # hw_cpp — sensor layer (C++)
 
+(The other C++ the engine compiles is `../fusion_cpp`, which wraps the Qt
+app's registration so a scan's frames can be fused into one model.)
+
 Talks to sensor hardware and vendor SDKs and hands raw point and depth
 buffers to the Rust engine. It has no build of its own: `engine_rust`'s build
 script compiles these files with `cxx-build` and links them into the engine.

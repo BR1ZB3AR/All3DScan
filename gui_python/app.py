@@ -16,6 +16,7 @@ to STEP (rea_engine.py):
 """
 
 import argparse
+import math
 import sys
 import tempfile
 import time
@@ -42,6 +43,15 @@ from common import APP_ICON, APP_ID, apply_dark_theme, configure_opengl, warn_if
 from panels import CameraPanel, ModelPanel, ScanModel, ScanPanel, ScanState, Viewport, tint
 from viewport3d import image_pixels
 from widgets import RibbonGroup
+
+
+def for_display(cloud: tuple) -> tuple:
+    """A cloud cut down to what the viewport draws, and made contiguous so
+    that showing it copies nothing more."""
+    step = max(math.ceil(len(cloud[0]) / Viewport.MAX_SHOWN_POINTS), 1)
+    if step == 1:
+        return cloud
+    return tuple(np.ascontiguousarray(part[::step]) for part in cloud)
 
 
 def describe(exc: BaseException) -> str:
@@ -183,8 +193,56 @@ class ReaWorker(QObject):
         self.fitted.emit(job, found, time.perf_counter() - start)
 
 
+class FusionWorker(QObject):
+    """Builds one cloud out of a scan's frames, on the thread it is moved to.
+
+    Fusing a frame costs far more than capturing one, so the window offers it
+    whichever frame is current when this is free and drops the rest: the live
+    view keeps its frame rate and the model fills in as fast as the machine
+    allows, which is how a scanner tracks."""
+
+    # The model, a thinned copy of it to draw, and how the frame sat.
+    model_ready = pyqtSignal(tuple, tuple, dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fusion = None
+
+    @pyqtSlot(float)
+    def start(self, voxel_mm: float) -> None:
+        try:
+            self._fusion = engine.Fusion(voxel_mm=voxel_mm)
+        except BaseException as exc:
+            self._fusion = None
+            self.failed.emit(describe(exc))
+
+    @pyqtSlot()
+    def stop(self) -> None:
+        self._fusion = None
+
+    @pyqtSlot(object, object, object)
+    def add(self, points, colors, normals) -> None:
+        if self._fusion is None:
+            return
+        try:
+            fit = self._fusion.add(points, colors, normals)
+            cloud = self._fusion.cloud() if fit["merged"] else None
+        except BaseException as exc:
+            self.failed.emit(describe(exc))
+            return
+        if cloud is not None:
+            # Thinned here rather than on the GUI thread: a model of several
+            # million points costs about 100 ms to cut down, and the window
+            # would stop for it. Arrays themselves pass by reference.
+            self.model_ready.emit(cloud, for_display(cloud), fit)
+
+
 class MainWindow(QMainWindow):
     frame_requested = pyqtSignal()
+    fuse_requested = pyqtSignal(object, object, object)  # a frame's points, colours, normals
+    fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
+    fusion_stop_requested = pyqtSignal()
     pop4_requested = pyqtSignal()
     mock_requested = pyqtSignal()
     control_requested = pyqtSignal(str, tuple)  # a POP 4 method and its arguments
@@ -203,6 +261,13 @@ class MainWindow(QMainWindow):
     # few seconds, so try this many times before giving up on it. Each try
     # waits for two consecutive looks that find one, about four seconds.
     MAX_RECONNECTS = 4
+    # One point per cube of this edge in the fused model, as the Qt app's
+    # pipeline uses (src/processing/ScanPipeline.cpp).
+    FUSION_VOXEL_MM = 1.0
+    # Points of a frame offered to the fusion. It thins what it keeps to the
+    # voxel above, so a denser frame only costs time — and the copy into the
+    # engine holds the GIL, which the window would feel.
+    FUSION_MAX_POINTS = 200_000
 
     def __init__(self, sensor=None, open_pop4=None, pop4_present=None) -> None:
         """sensor is the mock to scan with until a POP 4 is picked;
@@ -240,11 +305,13 @@ class MainWindow(QMainWindow):
         self.scan_state = QLabel(ScanState.IDLE.value)
         self._fps = QLabel("FPS: —")
         self._points = QLabel("Points: —")
+        self._tracking = QLabel("Tracking: —")
+        self._tracking.setToolTip("Frames the fusion placed on the model, of those it was given")
         self._coverage = QLabel("Coverage: —")
         self._coverage.setToolTip("The share of the depth camera's pixels that got a distance")
         self.statusBar().addWidget(self._connection)
         self.statusBar().addWidget(self.scan_state)
-        for label in (self._fps, self._points, self._coverage):
+        for label in (self._fps, self._tracking, self._points, self._coverage):
             self.statusBar().addPermanentWidget(label)
 
         self._state = ScanState.IDLE
@@ -286,6 +353,10 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
         self._fitting = False
+        self._fusing = False  # a frame is with the fusion worker
+        self._fused: tuple | None = None  # the model built from this scan
+        self._tracked = 0  # frames the fusion placed on the model
+        self._offered = 0  # frames it was given
         self._shown_model: ScanModel | None = None  # the model in the 3D view
         self._rea_thread = QThread(self)
         self._rea_worker = ReaWorker()
@@ -295,6 +366,17 @@ class MainWindow(QMainWindow):
         self._rea_worker.fitted.connect(self._on_fitted)
         self._rea_worker.failed.connect(self._on_fit_failed)
         self._rea_thread.start()
+
+        self._fusion_thread = QThread(self)
+        self._fusion_worker = FusionWorker()
+        self._fusion_worker.moveToThread(self._fusion_thread)
+        self._fusion_thread.finished.connect(self._fusion_worker.deleteLater)
+        self.fuse_requested.connect(self._fusion_worker.add)
+        self.fusion_start_requested.connect(self._fusion_worker.start)
+        self.fusion_stop_requested.connect(self._fusion_worker.stop)
+        self._fusion_worker.model_ready.connect(self._on_model_ready)
+        self._fusion_worker.failed.connect(self._on_fusion_failed)
+        self._fusion_thread.start()
         QApplication.instance().aboutToQuit.connect(self._stop_worker)
 
         models = self.model_panel
@@ -355,8 +437,13 @@ class MainWindow(QMainWindow):
         self.marker_scan.triggered.connect(lambda: self.scan_panel.set_tracking("marker"))
 
         later = "Not available yet"
+        self.fusion_action = action(
+            "Fusion", "draw-polygon",
+            "Build one model from the scan's frames, aligning each onto the last.\n"
+            "Off, the view shows only the newest frame.", checkable=True)
+        self.fusion_action.setChecked(True)
         point_cloud = [
-            action("Fusion", "draw-polygon", later, enabled=False),
+            self.fusion_action,
             action("Isolation", "edit-delete", later, enabled=False),
             action("Overlap", "edit-select-all", later, enabled=False),
             action("Smooth", "smooth", later, enabled=False),
@@ -398,7 +485,9 @@ class MainWindow(QMainWindow):
         ):
             self.ribbon_groups[caption] = RibbonGroup(caption, actions)
             ribbon.addWidget(self.ribbon_groups[caption])
-        self.needs_a_model = point_cloud + mesh + rea_tools + [self.export_action]
+        # Fusion works during a scan, so it is not one of these.
+        self.needs_a_model = [a for a in point_cloud if a is not self.fusion_action]
+        self.needs_a_model += mesh + rea_tools + [self.export_action]
 
     # Scanning: each frame is asked for when the last one has been shown.
 
@@ -413,12 +502,21 @@ class MainWindow(QMainWindow):
             self._request_frame()
         else:
             self._streaming = False
+            self._fusing = False
             self._next_frame.stop()
             if state is ScanState.PAUSED:
                 self.viewport.show_toast("Paused. Press Space to resume.")
         self._update_rea_tools()
 
     def _start_scan(self) -> None:
+        self._fused = None
+        self._fusing = False
+        self._tracked = self._offered = 0
+        self._tracking.setText("Tracking: —")
+        if self.fusion_action.isChecked():
+            self.fusion_start_requested.emit(self.FUSION_VOXEL_MM)
+        else:
+            self.fusion_stop_requested.emit()
         self._low_coverage = 0
         self.viewport.show_warning("")
         self.frames = 0
@@ -448,7 +546,10 @@ class MainWindow(QMainWindow):
         self.camera_panel.rgb_view.show_image(frame.rgb)
         self.viewport.gauge.set_depths(frame.depth_mm)
         self.viewport.set_frame_count(self.frames)
-        self.viewport.show_cloud(frame.points, frame.colors, frame.normals)
+        if self.fusion_action.isChecked():
+            self._offer_to_fusion(frame)
+        if self._fused is None:
+            self.viewport.show_cloud(frame.points, frame.colors, frame.normals)
         self._show_coverage(frame)
         now = time.perf_counter()
         if self._last_arrival is not None:
@@ -456,10 +557,36 @@ class MainWindow(QMainWindow):
             self._rate = rate if self._rate == 0 else 0.9 * self._rate + 0.1 * rate
             self._fps.setText(f"FPS: {self._rate:.0f}")
         self._last_arrival = now
-        self._points.setText(f"Points: {len(frame.points):,}")
+        if self._fused is None:  # fusing, the model's count is the useful one
+            self._points.setText(f"Points: {len(frame.points):,}")
         if self._streaming:
             wait = 1.0 / self.TARGET_FPS - (now - self._requested_at)
             self._next_frame.start(max(0, int(wait * 1000)))
+
+    def _offer_to_fusion(self, frame) -> None:
+        """Hands the fusion this frame, unless it is still on the last one."""
+        if self._fusing or not len(frame.points):
+            return
+        self._fusing = True
+        self._offered += 1
+        step = max(math.ceil(len(frame.points) / self.FUSION_MAX_POINTS), 1)
+        self.fuse_requested.emit(frame.points[::step], frame.colors[::step],
+                                 frame.normals[::step])
+
+    def _on_model_ready(self, model: tuple, display: tuple, fit: dict) -> None:
+        self._fusing = False
+        self._tracked += 1
+        self._fused = model
+        self._tracking.setText(f"Tracking: {self._tracked}/{self._offered}")
+        if self._state is not ScanState.IDLE:
+            self.viewport.show_cloud(*display, frame=self._tracked == 1)
+            self._points.setText(f"Points: {len(model[0]):,}")
+
+    def _on_fusion_failed(self, message: str) -> None:
+        self._fusing = False
+        print(f"fusion failed: {message}", file=sys.stderr, flush=True)
+        self.viewport.show_toast(f"Fusion failed: {message}", 6000)
+        self.fusion_action.setChecked(False)
 
     def _show_coverage(self, frame) -> None:
         """Reports how much of the depth camera got a distance, and says so
@@ -500,26 +627,41 @@ class MainWindow(QMainWindow):
         name = f"Scan {self._scans:02d}"
         panel = self.scan_panel
         frame = self.last_frame
-        points = frame.points if frame is not None else None
+        fused = self._fused
+        points = fused[0] if fused is not None else (frame.points if frame is not None else None)
         properties = {
             "Model name": name,
             "Scanner": panel.device.currentText(),
             "Rendering state": "Raw",
             "Rendering frames": str(self.frames),
-            "Points": f"{len(points):,} in the last frame" if points is not None else "—",
+            "Points": (f"{len(points):,} fused from {self._tracked} frames"
+                       if fused is not None else
+                       f"{len(points):,} in the last frame" if points is not None else "—"),
             "Scan settings": f"{panel.accuracy.currentText()} · "
                              f"{panel.tracking.currentText()} tracking · "
                              f"{panel.object_type.currentText()}",
         }
-        # The model is the last frame's cloud, which stays in the 3D view.
-        model = ScanModel(name, properties, *((frame.points, frame.colors, frame.normals)
-                                               if frame is not None else ()))
+        # The cloud already on screen becomes the model: the frames fused
+        # together, or the last frame alone when fusion was off.
+        if fused is not None:
+            model = ScanModel(name, properties, *fused)
+        elif frame is not None:
+            model = ScanModel(name, properties, frame.points, frame.colors, frame.normals)
+        else:
+            model = ScanModel(name, properties)
         self._shown_model = model  # already on screen: no need to draw it again
         self.left.setCurrentWidget(self.model_panel)
         self.viewport.set_stage(scanning=False)
-        self.model_panel.add_model(model)
-        if frame is None:
+        if model.points is None:
             self.viewport.clear_cloud(f"{name}: no frames captured")
+        elif fused is not None:
+            # While scanning the viewport was given a cloud already thinned
+            # for it; hand it the whole model now, so that what it draws is
+            # a thinning of the model a fit will be measured against and the
+            # two line up point for point. Before listing the model, which
+            # selects it and tints its points.
+            self.viewport.show_cloud(*fused)
+        self.model_panel.add_model(model)
         self._clear_live_view()
         shape = points.shape if points is not None else "none"
         print(f"{name} complete: {self.frames} frames, last point cloud {shape}", flush=True)
@@ -801,7 +943,7 @@ class MainWindow(QMainWindow):
         # destroyed while it is still running.
         self._streaming = False
         self._presence.stop()
-        for thread in (self._thread, self._rea_thread):
+        for thread in (self._thread, self._rea_thread, self._fusion_thread):
             if thread.isRunning():
                 thread.quit()
                 thread.wait()

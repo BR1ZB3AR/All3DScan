@@ -286,7 +286,7 @@ class StreamingTests(WindowTestCase):
         self.assertFalse(window.camera_panel.rgb_view.image.pixmap().isNull())
         self.assertIsNotNone(window.viewport.gauge.distance_mm)
         self.assertRegex(window.viewport.frames.text(), r"^Rendering frames: \d+$")
-        self.assertEqual(window.viewport.view3d.point_count, len(window.last_frame.points))
+        self.assertGreater(window.viewport.view3d.point_count, 0)
         self.assertTrue(window.viewport.message.isHidden())
 
     def test_the_3d_view_draws_the_live_cloud(self):
@@ -426,7 +426,7 @@ class Pop4Tests(WindowTestCase):
         window.scan_panel.new_scan()
         wait_until(lambda: window.frames >= 3)
         self.assertIs(window.scan_panel.state, ScanState.SCANNING)
-        self.assertEqual(window.viewport.view3d.point_count, len(window.last_frame.points))
+        self.assertGreater(window.viewport.view3d.point_count, 0)
 
     def test_almost_no_depth_is_reported_with_what_to_check(self):
         window = self.open_window()
@@ -556,11 +556,102 @@ class Pop4Tests(WindowTestCase):
         self.assertTrue(second.closed)
 
 
+class FusionTests(WindowTestCase):
+    """Building one model out of a scan's frames."""
+
+    def scan(self, window, frames: int = 4) -> None:
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= frames)
+
+    def test_a_scan_fuses_its_frames_into_one_model(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.assertTrue(window.fusion_action.isChecked())  # on by default
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        self.assertRegex(window._tracking.text(), r"^Tracking: [1-9]\d*/\d+$")
+        # The model holds more than any one frame does.
+        self.assertGreater(len(window._fused[0]), len(window.last_frame.points))
+        self.assertEqual(window.viewport.view3d.point_count, len(window._fused[0]))
+
+        window.scan_panel.complete()
+        model = window.model_panel.current_model()
+        self.assertEqual(len(model.points), len(window._fused[0]))
+        self.assertRegex(model.properties["Points"], r"^[\d,]+ fused from \d+ frames$")
+        # Real normals come through the fusion, which the cylinder fit needs.
+        self.assertEqual(model.normals.shape, model.points.shape)
+        lengths = np.linalg.norm(model.normals, axis=1)
+        np.testing.assert_allclose(lengths, 1.0, atol=1e-3)
+
+    def test_the_points_shown_are_the_models_while_fusing(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        # Frames keep arriving between fusions; the count must not flick back
+        # to one frame's worth.
+        frames = window.frames
+        wait_until(lambda: window.frames > frames + 2)
+        shown = int(window._points.text().removeprefix("Points: ").replace(",", ""))
+        self.assertEqual(shown, len(window._fused[0]))
+
+    def test_with_fusion_off_the_model_is_the_last_frame(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        window.fusion_action.setChecked(False)
+        self.scan(window)
+        self.assertIsNone(window._fused)
+        self.assertEqual(window._tracking.text(), "Tracking: —")
+        self.assertEqual(window.viewport.view3d.point_count, len(window.last_frame.points))
+        window.scan_panel.complete()
+        model = window.model_panel.current_model()
+        np.testing.assert_array_equal(model.points, window.last_frame.points)
+        self.assertRegex(model.properties["Points"], r"in the last frame$")
+
+    def test_each_scan_starts_its_model_afresh(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        window.scan_panel.complete()
+        first = len(window.model_panel.current_model().points)
+
+        window.scan_panel.new_scan()
+        self.assertIsNone(window._fused)  # not carried over from the last scan
+        self.assertEqual((window._tracked, window._offered), (0, 0))
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        window.scan_panel.complete()
+        second = len(window.model_panel.current_model().points)
+        self.assertLess(abs(second - first), first)  # the same scene, not twice it
+
+    def test_fusion_runs_off_the_gui_thread(self):
+        window = self.open_window(engine.MockDepthSensor(640, 480, seed=1))
+        self.assertIs(window._fusion_worker.thread(), window._fusion_thread)
+        beat = {"last": time.perf_counter(), "longest": 0.0}
+
+        def tick():
+            now = time.perf_counter()
+            beat["longest"] = max(beat["longest"], now - beat["last"])
+            beat["last"] = now
+
+        timer = QTimer()
+        timer.timeout.connect(tick)
+        timer.start(2)
+        beat["last"] = time.perf_counter()
+        window.scan_panel.new_scan()
+        wait_until(lambda: window._tracked >= 2, timeout_s=60)
+        window.scan_panel.toggle_pause()
+        timer.stop()
+        # Fusing a 640x480 frame takes well over 100 ms; the window must not
+        # stop for it.
+        self.assertLess(beat["longest"], 0.1, f"the GUI thread stalled {beat['longest']:.3f}s")
+
+
 class ReaToolTests(WindowTestCase):
     """The REA tools in the window, on the mock sensor's wall and pipe."""
 
     def scanned_window(self, width: int = 320, height: int = 240) -> app.MainWindow:
         window = self.open_window(engine.MockDepthSensor(width, height, seed=1))
+        # Fusion off: these are about the fits, and whether a fusion had
+        # finished by the time a two-frame scan completes is a race, which
+        # would make the model — and so every measurement here — vary.
+        window.fusion_action.setChecked(False)
         window.scan_panel.new_scan()
         wait_until(lambda: window.frames >= 2)
         window.scan_panel.complete()
