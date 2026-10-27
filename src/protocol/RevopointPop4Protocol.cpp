@@ -199,6 +199,15 @@ public:
             (void)rgbCapture_.start(); // optional; depth still works if this fails
         }
         state_ = ConnectionState::Streaming;
+        // Measured 2026-10-27: after connecting, the pattern projector's
+        // pattern was missing from image 5 (local contrast 0.04) although the
+        // controls showed it on, and 0xb04 1 sent while connecting did not
+        // change that; sent once streaming, it lit image 5 (0.12) about five
+        // frames later. So put it back as the controls show it, here, and
+        // again once frames flow: after a connect that had to reset the
+        // scanner, the command sent here alone did not take.
+        reassertProjector();
+        projectorReassertIn_ = 5;
         return true;
     }
 
@@ -214,7 +223,7 @@ public:
         if (state_ != ConnectionState::Streaming) {
             return std::nullopt;
         }
-        auto sensor = capture_.readFrame(timeoutMs);
+        auto sensor = capture_.readFrame(timeoutMs, newestOnly_);
         if (!sensor) {
             if (!capture_.lastError().empty()) {
                 lastError_ = capture_.lastError();
@@ -241,6 +250,10 @@ public:
                 (static_cast<uint16_t>(sensor->bytes[i * 2 + 1]) << 8);
         }
         dumpRawFrame(*sensor, expectedBytes);
+        keepInfrared(frame);
+        if (projectorReassertIn_ > 0 && --projectorReassertIn_ == 0) {
+            reassertProjector();
+        }
 
         decoder_.setCalibration(calibration_);
         updateColorFrame();
@@ -282,6 +295,12 @@ public:
     }
 
     ScannerCalibration calibration() const override { return calibration_; }
+
+    bool stillConnected() const override {
+        return state_ != ConnectionState::Disconnected && !capture_.deviceGone();
+    }
+
+    void setNewestFrameOnly(bool newest) override { newestOnly_ = newest; }
 
     void setDepthRangeHint(float nearMm, float farMm) override {
         decoder_.setDepthRange(nearMm, farMm);
@@ -439,6 +458,16 @@ public:
     }
     std::string lastError() const override { return lastError_; }
 
+    Image lastInfrared() const override { return lastInfrared_; }
+
+    Image lastColor() const override {
+        if (lastColorRgb_.empty()) {
+            return {};
+        }
+        return {static_cast<uint32_t>(colorWidth_), static_cast<uint32_t>(colorHeight_), 3,
+                lastColorRgb_};
+    }
+
 private:
     // Factory stereo calibration, in order of preference:
     //  1. ALL3DSCAN_CAMPARAM=<camparam.yaml> (offline / override)
@@ -589,6 +618,10 @@ private:
     int aeBadWindows_ = 0;
     std::vector<uint8_t> lastColorJpeg_;        // newest colour frame, as sent
     std::vector<uint8_t> lastColorRgb_;         // and decoded, RGB888
+    Image lastInfrared_;                        // see keepInfrared()
+    std::chrono::steady_clock::time_point nextColorRetry_{}; // see retryColorCamera()
+    int projectorReassertIn_ = 0; // frames until startStream() lights the projector again
+    bool newestOnly_ = false;     // see setNewestFrameOnly()
     int colorWidth_ = 0;
     int colorHeight_ = 0;
     size_t lastColouredPixels_ = 0;
@@ -600,14 +633,76 @@ private:
     std::array<bool, 3> lightOn_{{true, false, false}};
     std::array<int, 3> lightLevel_{{180, 255, 255}};
 
+    void reassertProjector() {
+        if (lightOn_[static_cast<size_t>(Light::Projector)]) {
+            (void)sendDeviceCommands(pop4::lightSwitchCommands(Light::Projector, true));
+        }
+    }
+
+    // The colour camera's node can come back later than the depth camera's
+    // after the scanner re-enumerates, and connect() opens it only on a best
+    // effort, so a stream that started without it looks again every 2 s.
+    void retryColorCamera() {
+        if (rgbCapture_.isOpen() || state_ != ConnectionState::Streaming) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextColorRetry_) {
+            return;
+        }
+        nextColorRetry_ = now + std::chrono::seconds(2);
+        if (auto node = usb::findV4l2CaptureNodeNamed(pop4::kVendorId, pop4::kProductId,
+                                                      V4L2_PIX_FMT_MJPEG, 1280, 1024, "RGB")) {
+            if (rgbCapture_.open(*node, V4L2_PIX_FMT_MJPEG, 1280, 1024, 2) &&
+                rgbCapture_.start()) {
+                return;
+            }
+            rgbCapture_.close();
+        }
+    }
+
+    // Keeps the left camera's first exposure (image 5 of the ten 320x512 ones
+    // a packed frame holds) as an 8-bit preview. Not the speckle image the
+    // depth is matched from (9): an always-on emitter lights that one, while
+    // the pattern projector the user can switch lights images 0-3 and 5-8
+    // (RE_NOTES 2026-10-14), so this is where switching it shows. Scaled so
+    // its mean sits at a third of full scale, since the sensor's 16-bit
+    // levels move a lot with exposure and ambient light.
+    void keepInfrared(const RawFrame& raw) {
+        constexpr uint32_t kWidth = 320;
+        constexpr uint32_t kHeight = 512;
+        constexpr size_t kLeftFirstExposure = 5;
+        const size_t pixels = static_cast<size_t>(kWidth) * kHeight;
+        if (raw.depthMm.size() < pixels * (kLeftFirstExposure + 1)) {
+            lastInfrared_ = {};
+            return;
+        }
+        const uint16_t* image = raw.depthMm.data() + pixels * kLeftFirstExposure;
+        uint64_t sum = 0;
+        for (size_t i = 0; i < pixels; ++i) {
+            sum += image[i];
+        }
+        const double mean = std::max(1.0, static_cast<double>(sum) / static_cast<double>(pixels));
+        const double gain = 85.0 / mean;
+        lastInfrared_.width = kWidth;
+        lastInfrared_.height = kHeight;
+        lastInfrared_.channels = 1;
+        lastInfrared_.pixels.resize(pixels);
+        for (size_t i = 0; i < pixels; ++i) {
+            lastInfrared_.pixels[i] =
+                static_cast<uint8_t>(std::min(255.0, static_cast<double>(image[i]) * gain));
+        }
+    }
+
     // Pulls whatever the colour camera has ready (never blocks) and keeps the
     // JPEG plus its decoded pixels. Both the texture mapping and the preview
     // read this cache, so they cannot steal frames from each other.
     void updateColorFrame() {
+        retryColorCamera();
         if (!rgbCapture_.isOpen()) {
             return;
         }
-        auto frame = rgbCapture_.readFrame(0);
+        auto frame = rgbCapture_.readFrame(0, newestOnly_);
         if (!frame || frame->bytes.empty()) {
             return;
         }

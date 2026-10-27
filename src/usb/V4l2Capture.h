@@ -61,9 +61,21 @@ public:
     void stop();
     bool isOpen() const { return fd_ >= 0; }
     bool isStreaming() const { return streaming_; }
+    // True once the node reported the device gone (poll hang-up or error, or
+    // an ioctl with ENODEV): the scanner unplugged or re-enumerated, and this
+    // descriptor will never deliver another frame. Cleared by close().
+    bool deviceGone() const { return deviceGone_; }
     int fd() const { return fd_; }
 
-    std::optional<V4l2Frame> readFrame(int timeoutMs);
+    // Waits up to timeoutMs for a frame. With newest, takes the newest one the
+
+    // driver has ready and gives the older ones back unread: a consumer slower
+
+    // than the camera otherwise always gets the oldest of the queued buffers,
+
+    // which runs as many frames behind as there are buffers.
+
+    std::optional<V4l2Frame> readFrame(int timeoutMs, bool newest = false);
     const std::string& lastError() const { return lastError_; }
 
 private:
@@ -76,6 +88,7 @@ private:
 
     int fd_ = -1;
     bool streaming_ = false;
+    bool deviceGone_ = false;
     std::vector<Buffer> buffers_;
     std::string lastError_;
 };
