@@ -40,6 +40,14 @@ struct RawFrame {
     DepthEncoding encoding = DepthEncoding::MetricMillimeters;
 };
 
+// An 8-bit image, row-major: grey with one channel, or RGB with three.
+struct Image {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t channels = 0;
+    std::vector<uint8_t> pixels;
+};
+
 struct CameraIntrinsics {
     double fx = 0.0;
     double fy = 0.0;
@@ -203,6 +211,17 @@ public:
     // band. No-op for backends without a bounded search (e.g. ToF).
     virtual void setDepthRangeHint(float /*nearMm*/, float /*farMm*/) {}
 
+    // Whether the scanner is still there. False once it has unplugged or
+    // re-enumerated mid-stream, where state() alone cannot tell: a stream
+    // that was started stays "Streaming" while its device is gone.
+    virtual bool stillConnected() const { return state() != ConnectionState::Disconnected; }
+
+    // Whether readFrame() gives the newest frame the camera has ready,
+    // skipping older ones, rather than every frame in turn: what a live view
+    // wants, where a frame that has waited in the queue is a stale one.
+    // Off by default; a no-op for backends without a frame queue.
+    virtual void setNewestFrameOnly(bool /*newest*/) {}
+
     // Confidence of the most recent depth decode; default/empty when the
     // backend doesn't produce a bounded phase/stereo match (mock, ToF, etc.).
     virtual DepthDecodeStats depthDecodeStats() const { return {}; }
@@ -211,6 +230,12 @@ public:
     virtual std::optional<std::vector<uint8_t>> readRgbJpegPreview(int /*timeoutMs*/) {
         return std::nullopt;
     }
+
+    // An infrared image from the newest frame, scaled to 8 bits, and the
+    // newest decoded colour camera image. Empty when the backend has none
+    // (or, for colour, was built without a JPEG decoder).
+    virtual Image lastInfrared() const { return {}; }
+    virtual Image lastColor() const { return {}; }
 
     virtual std::string backendName() const = 0;
     virtual std::string lastError() const = 0;

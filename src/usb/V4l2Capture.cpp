@@ -368,6 +368,7 @@ void V4l2Capture::stop() {
 
 void V4l2Capture::close() {
     stop();
+    deviceGone_ = false;
     for (auto& buffer : buffers_) {
         if (buffer.address) {
             munmap(buffer.address, buffer.length);
@@ -380,7 +381,7 @@ void V4l2Capture::close() {
     }
 }
 
-std::optional<V4l2Frame> V4l2Capture::readFrame(int timeoutMs) {
+std::optional<V4l2Frame> V4l2Capture::readFrame(int timeoutMs, bool newest) {
     if (fd_ < 0 || !streaming_) {
         return std::nullopt;
     }
@@ -399,8 +400,11 @@ std::optional<V4l2Frame> V4l2Capture::readFrame(int timeoutMs) {
         return std::nullopt;
     }
     if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        // The scanner unplugged or re-enumerated: this descriptor is dead,
+        // and a caller that keeps polling it would spin forever.
+        deviceGone_ = true;
         std::ostringstream message;
-        message << "V4L2 poll error (revents=0x" << std::hex
+        message << "the scanner disconnected (poll revents=0x" << std::hex
                 << descriptor.revents << ')';
         lastError_ = message.str();
         return std::nullopt;
@@ -414,9 +418,25 @@ std::optional<V4l2Frame> V4l2Capture::readFrame(int timeoutMs) {
     buffer.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd_, VIDIOC_DQBUF, &buffer) < 0) {
         if (errno != EAGAIN) {
+            deviceGone_ = deviceGone_ || errno == ENODEV;
             setError("VIDIOC_DQBUF");
         }
         return std::nullopt;
+    }
+    // The descriptor is non-blocking, so a dequeue with nothing ready fails
+    // with EAGAIN, which ends the walk to the newest frame.
+    while (newest) {
+        v4l2_buffer next{};
+        next.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        next.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd_, VIDIOC_DQBUF, &next) < 0) {
+            break;
+        }
+        if (xioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
+            setError("VIDIOC_QBUF");
+            return std::nullopt;
+        }
+        buffer = next;
     }
 
     std::optional<V4l2Frame> result;
