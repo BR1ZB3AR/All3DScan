@@ -3,3 +3,9 @@ members = [
     "rust_core",
 ]
 resolver = "2"
+
+# Cargo reads profiles only from the workspace root; in rust_core/Cargo.toml
+# they were ignored.
+[profile.release]
+opt-level = 3
+lto = true
