@@ -1,0 +1,328 @@
+/* The dark theme's styling, on top of the Fusion palette common.py sets.
+   The accent is red, as in Revo Scan; widgets.py paints the distance bands. */
+
+/* Shared by both windows. */
+
+QStatusBar {
+    background-color: #1b1c1f;
+    color: #a9adb3;
+}
+
+QStatusBar QLabel {
+    padding: 0 10px;
+}
+
+QLabel#hint {
+    color: #8b8e94;
+}
+
+QLabel#sectionTitle {
+    color: #f2f3f5;
+    font-size: 11pt;
+    font-weight: 600;
+    padding-top: 4px;
+}
+
+QPushButton {
+    background-color: #2f3134;
+    color: #e6e8eb;
+    border: 1px solid #3c3f44;
+    border-radius: 4px;
+    padding: 6px 12px;
+}
+
+QPushButton:hover {
+    background-color: #383b3f;
+}
+
+QPushButton:pressed {
+    background-color: #2a2c2f;
+}
+
+QPushButton:disabled {
+    background-color: #26282b;
+    color: #5f6369;
+    border-color: #2e3034;
+}
+
+QPushButton:checked {
+    background-color: #e5484d;
+    border-color: #e5484d;
+    color: #ffffff;
+}
+
+QPushButton:checked:disabled {
+    background-color: #4a2a2c;
+    border-color: #4a2a2c;
+    color: #8b8e94;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #3c3f44;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background: #e5484d;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: #f2f3f5;
+    width: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+
+QSlider::sub-page:horizontal:disabled {
+    background: #4a3c3d;
+}
+
+QSlider::handle:horizontal:disabled {
+    background: #6f737a;
+}
+
+QMenu {
+    background-color: #26282b;
+    color: #dfe1e5;
+    border: 1px solid #3a3d42;
+}
+
+QMenu::item:selected {
+    background-color: #e5484d;
+    color: #ffffff;
+}
+
+/* The capture window (main.py). */
+
+QLabel#heading {
+    font-size: 16pt;
+    font-weight: 600;
+}
+
+QLabel#subtle {
+    color: #8b8e94;
+}
+
+QLabel[role="value"] {
+    font-family: monospace;
+}
+
+QPushButton#primary {
+    background-color: #e5484d;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 20px;
+    font-weight: 600;
+}
+
+QPushButton#primary:hover {
+    background-color: #f05d61;
+}
+
+QPushButton#primary:pressed {
+    background-color: #c93c41;
+}
+
+QPushButton#primary:disabled {
+    background-color: #3a3c40;
+    color: #8b8e94;
+}
+
+/* The main window (app.py). */
+
+QToolBar#ribbon {
+    background-color: #26272b;
+    border: none;
+    border-bottom: 1px solid #141517;
+    spacing: 0;
+    padding: 2px 4px;
+}
+
+QWidget#ribbonGroup {
+    border-right: 1px solid #3a3d42;
+}
+
+QToolBar#ribbon QToolButton {
+    color: #d6d8dc;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 6px;
+    min-width: 52px;
+}
+
+QToolBar#ribbon QToolButton:hover {
+    background-color: #34363a;
+}
+
+QToolBar#ribbon QToolButton:checked {
+    background-color: #e5484d;
+    color: #ffffff;
+}
+
+QToolBar#ribbon QToolButton:disabled {
+    color: #5f6369;
+}
+
+QLabel#ribbonCaption {
+    color: #8b8e94;
+    font-size: 8pt;
+}
+
+QSplitter::handle {
+    background-color: #141517;
+}
+
+QSplitter::handle:horizontal {
+    width: 2px;
+}
+
+QWidget#sidePanel {
+    background-color: #26272b;
+}
+
+QLabel#connection {
+    color: #f2f3f5;
+    font-size: 12pt;
+    font-weight: 600;
+}
+
+QLabel#scale {
+    color: #e6e8eb;
+    font-family: monospace;
+}
+
+QToolButton#scanAction {
+    background-color: #e5484d;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 4px;
+    font-weight: 600;
+}
+
+QToolButton#scanAction:hover {
+    background-color: #f05d61;
+}
+
+QToolButton#scanAction:disabled {
+    background-color: #3a2f30;
+    color: #7a7d82;
+}
+
+QToolButton#complete {
+    background-color: #3a3c40;
+    color: #f2f3f5;
+    border: 1px solid #4a4d52;
+    border-radius: 6px;
+    padding: 8px 4px;
+    font-weight: 600;
+}
+
+QToolButton#complete:hover {
+    background-color: #44474c;
+}
+
+QToolButton#complete:disabled {
+    background-color: #2a2c2f;
+    color: #6a6d72;
+    border-color: #303236;
+}
+
+QListWidget#models {
+    background-color: #202124;
+    border: 1px solid #34363b;
+    border-radius: 4px;
+}
+
+QListWidget#models::item {
+    padding: 8px;
+}
+
+QListWidget#models::item:selected {
+    background-color: #e5484d;
+    color: #ffffff;
+}
+
+QLabel#previewTitle {
+    color: #c9ccd1;
+    font-weight: 600;
+}
+
+QLabel#previewImage {
+    background-color: #000000;
+    color: #5a5d63;
+    border: 1px solid #2e3034;
+}
+
+QFrame#viewport {
+    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #3b3d42, stop: 1 #2b2c30);
+}
+
+QLabel#viewportHint {
+    color: #d6d8dc;
+    font-size: 9pt;
+}
+
+QLabel#viewportMessage {
+    color: #8f939a;
+    font-size: 13pt;
+}
+
+QPushButton#segment {
+    background-color: #2a2b2e;
+    border: 1px solid #45484d;
+    border-radius: 0;
+    padding: 5px 14px;
+    color: #c9ccd1;
+}
+
+QPushButton#segment:checked {
+    background-color: #f2f3f5;
+    border-color: #f2f3f5;
+    color: #1e1f22;
+}
+
+QLabel#toast {
+    background-color: rgba(20, 21, 23, 215);
+    color: #f0a35e;
+    border: 1px solid #e0a83e;
+    border-radius: 4px;
+    padding: 8px 18px;
+    font-size: 11pt;
+}
+
+QRadioButton {
+    color: #d6d8dc;
+}
+
+QListWidget#primitives {
+    background-color: #202124;
+    border: 1px solid #34363b;
+    border-radius: 4px;
+}
+
+QListWidget#primitives::item {
+    padding: 6px;
+}
+
+QListWidget#primitives::item:selected {
+    background-color: #3d4046;
+    color: #ffffff;
+}
+
+QLabel#details {
+    color: #dfe1e5;
+}
+
+QLabel#warning {
+    background-color: rgba(20, 21, 23, 225);
+    color: #f0a35e;
+    border: 1px solid #c07a2a;
+    border-radius: 4px;
+    padding: 10px 20px;
+    max-width: 520px;
+}

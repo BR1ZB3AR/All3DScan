@@ -1,0 +1,716 @@
+"""Tests of the Revo Scan-style main window (app.py), drawn offscreen.
+
+Run from the repository root after `maturin develop`:
+
+    .venv/bin/python -m unittest discover -s gui_python/tests
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+# Offscreen unless the caller picks a platform, so no windows open on the desktop.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np
+from PyQt6.QtCore import QTimer
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication
+
+GUI_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(GUI_DIR))
+
+from common import apply_dark_theme, configure_opengl  # noqa: E402
+
+if QApplication.instance() is None:
+    configure_opengl()  # before the QApplication, which reads it
+
+import all3dscan_engine as engine  # noqa: E402
+import app  # noqa: E402
+import rea_engine as rea  # noqa: E402
+from panels import ScanState  # noqa: E402
+from presets import load_presets  # noqa: E402
+from widgets import DistanceGauge, center_distance_mm, zone_for  # noqa: E402
+
+qt_app = QApplication.instance() or QApplication([])
+apply_dark_theme(qt_app)
+
+
+def wait_until(condition, timeout_s: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for the window")
+        QTest.qWait(5)
+
+
+def items(combo) -> list[str]:
+    return [combo.itemText(i) for i in range(combo.count())]
+
+
+class FakePop4:
+    """Stands in for engine.Pop4Sensor, so no test touches a real scanner:
+    the mock sensor's frames, and the POP 4's controls, each call recorded."""
+
+    serial = "TEST0001"
+    backend = "Revopoint POP4 (fake)"
+    last_error = "V4L2 frame timeout"
+
+    def __init__(self, missing: int = 0) -> None:
+        self._mock = engine.MockDepthSensor(160, 120, seed=1)
+        self.missing = missing  # captures still to come back empty
+        self.refuse: set[str] = set()  # controls that raise
+        self.calls: list[tuple] = []
+        self.lights = {"projector": [True, 180], "fill light": [False, 255]}
+        self.scan_mode = "infrared"
+        self.exposure_us = 3000
+        self.closed = False
+        self.connected = True  # False once the scanner has unplugged
+
+    def capture_frame(self, voxel_mm=None, timeout_ms=2000):
+        if not self.connected:
+            self.last_error = "the scanner disconnected (poll revents=0x18)"
+            return None
+        if self.missing:
+            self.missing -= 1
+            return None
+        return self._mock.capture_frame(voxel_mm)
+
+    def unplug(self) -> None:
+        """What a POP 4 leaving the USB bus looks like to the app."""
+        self.connected = False
+
+    def light_on(self, light):
+        return self.lights[light][0]
+
+    def light_level(self, light):
+        return self.lights[light][1]
+
+    def __getattr__(self, name):
+        # set_light, set_light_level, set_exposure, set_scan_mode, set_depth_range
+        if not name.startswith("set_"):
+            raise AttributeError(name)
+
+        def control(*args):
+            self.calls.append((name, args))
+            if name in self.refuse:
+                raise OSError(f"{name} was refused")
+            if name == "set_light":
+                self.lights[args[0]][0] = args[1]
+            elif name == "set_scan_mode":
+                if args[0] == "infrared":
+                    time.sleep(0.3)  # a reboot, much shortened
+                self.scan_mode = args[0]
+
+        return control
+
+    def close(self):
+        self.closed = True
+
+
+class WindowTestCase(unittest.TestCase):
+    def open_window(self, sensor=None, pop4=None, present=True) -> app.MainWindow:
+        """A window whose POP 4, when picked, is `pop4` (a FakePop4 by
+        default): never the real scanner. self.present stands in for the USB
+        bus, so a test can take the scanner off it."""
+        self.pop4 = pop4 if pop4 is not None else FakePop4()
+        self.present = present
+
+        def open_pop4():
+            if isinstance(self.pop4, BaseException):
+                raise self.pop4
+            return self.pop4
+
+        window = app.MainWindow(sensor, open_pop4=open_pop4,
+                                pop4_present=lambda: self.present)
+        self.addCleanup(window.close)
+        window.resize(1440, 900)
+        window.show()
+        QTest.qWait(20)
+        return window
+
+    def connect_pop4(self, window: app.MainWindow) -> None:
+        window.scan_panel.device.setCurrentIndex(1)
+        wait_until(lambda: window._pop4 and window.scan_panel.new_scan_button.isEnabled())
+
+    def calls(self, name: str) -> list[tuple]:
+        return [args for called, args in self.pop4.calls if called == name]
+
+
+class LayoutTests(WindowTestCase):
+    def test_viewport_sits_between_the_two_side_panels(self):
+        window = self.open_window()
+        self.assertIs(window.splitter.widget(1), window.viewport)
+        left, middle, right = window.splitter.sizes()
+        self.assertGreater(middle, 2 * max(left, right))
+
+    def test_ribbon_groups(self):
+        window = self.open_window()
+        groups = {caption: [b.text() for b in group.buttons]
+                  for caption, group in window.ribbon_groups.items()}
+        self.assertEqual(groups, {
+            "Scan": ["Feature scan", "Marker scan"],
+            "Point cloud edit": ["Fusion", "Isolation", "Overlap", "Smooth", "Simplify"],
+            "Mesh edit": ["Mesh", "Fill holes", "Smooth", "Simplify"],
+            "REA": ["Fit plane", "Fit cylinder", "Export STEP"],
+            "Output": ["Export", "Fullscreen"],
+        })
+
+    def test_editing_tools_wait_for_a_model(self):
+        window = self.open_window()
+        self.assertFalse(any(action.isEnabled() for action in window.needs_a_model))
+
+    def test_pop4_lights_and_modes_follow_the_selected_device(self):
+        window = self.open_window()
+        camera, scan = window.camera_panel, window.scan_panel
+        self.assertEqual([b.text() for b in (camera.projector_button, camera.fill_light_button)],
+                         ["Pattern projector", "Fill light"])
+        self.assertEqual(items(scan.mode), ["Infrared", "Blue laser (visible)", "Infrared speckle"])
+        pop4_only = (camera.lights, camera.exposure_box, scan.mode)
+        self.assertFalse(any(w.isEnabled() for w in pop4_only))  # the mock has none of them
+        self.connect_pop4(window)
+        self.assertTrue(all(w.isEnabled() for w in pop4_only))
+
+
+class PresetTests(WindowTestCase):
+    def test_presets_come_from_the_vendor_file(self):
+        presets = load_presets()
+        self.assertEqual(len(presets), 12)
+        self.assertEqual({p.band_edges_mm for p in presets},
+                         {(290, 350, 400, 460), (290, 400, 500, 600)})
+
+    def test_settings_offer_only_combinations_the_presets_have(self):
+        scan = self.open_window().scan_panel
+        self.assertEqual(items(scan.tracking), ["Feature", "Marker", "Global marker", "Texture"])
+        self.assertEqual(items(scan.object_type), ["General", "Dark", "Face"])
+        scan.set_tracking("marker")
+        self.assertEqual(items(scan.object_type), ["General"])
+        scan.accuracy.setCurrentIndex(1)  # High speed
+        self.assertEqual(items(scan.tracking), ["Feature", "Texture"])
+        self.assertEqual(items(scan.object_type), ["Body", "Large object"])
+
+    def test_gauge_exposure_and_ribbon_follow_the_preset(self):
+        window = self.open_window()
+        scan = window.scan_panel
+        scan.accuracy.setCurrentIndex(1)  # High speed
+        self.assertEqual(window.viewport.gauge.band_edges_mm, (290, 400, 500, 600))
+        self.assertEqual(window.viewport.gauge.scale_mm, (250, 700))
+        self.assertEqual(scan.scale_label.text(), "250 – 700 mm")
+        self.assertEqual(window.camera_panel.exposure.value(), scan.preset.exposure_us)
+        self.assertFalse(window.marker_scan.isEnabled())  # no marker presets at high speed
+        scan.accuracy.setCurrentIndex(0)
+        window.marker_scan.trigger()
+        self.assertEqual(scan.tracking.currentData(), "marker")
+
+
+class DistanceGaugeTests(unittest.TestCase):
+    def test_band_edges(self):
+        edges = (290, 350, 400, 460)
+        for mm, zone in [(289.9, "too-near"), (290, "excellent"), (350, "good"),
+                         (400, "far"), (460, "too-far"), (None, "idle")]:
+            self.assertEqual(zone_for(mm, edges), zone, mm)
+
+    def test_distance_is_the_median_of_the_middle(self):
+        depth = np.full((100, 100), 600, np.uint16)
+        depth[30:70, 30:70] = 330
+        depth[50, 50] = 0  # a dropped pixel does not count
+        self.assertEqual(center_distance_mm(depth), 330)
+        self.assertIsNone(center_distance_mm(np.zeros((10, 10), np.uint16)))
+
+    def test_gauge_takes_a_depth_image_and_draws_it(self):
+        gauge = DistanceGauge()
+        gauge.resize(170, 400)
+        gauge.set_depths(np.full((48, 64), 320, np.uint16))
+        self.assertEqual((gauge.distance_mm, gauge.zone), (320.0, "excellent"))
+        self.assertFalse(gauge.grab().isNull())  # paints without raising
+        gauge.set_depths(None)
+        self.assertEqual(gauge.zone, "idle")
+
+
+class ScanControlTests(WindowTestCase):
+    def test_new_scan_pause_resume_complete(self):
+        scan = self.open_window().scan_panel
+
+        def buttons():
+            return (scan.new_scan_button.isEnabled(), scan.pause_button.text(),
+                    scan.pause_button.isEnabled(), scan.complete_button.isEnabled())
+
+        self.assertEqual(buttons(), (True, "Pause", False, False))
+        scan.new_scan_button.click()
+        self.assertEqual(buttons(), (False, "Pause", True, True))
+        scan.pause_button.click()
+        self.assertEqual(buttons(), (False, "Resume", True, True))
+        scan.pause_button.click()
+        self.assertIs(scan.state, ScanState.SCANNING)
+        scan.complete_button.click()
+        self.assertEqual(buttons(), (True, "Pause", False, False))
+
+    def test_space_starts_and_pauses_and_esc_cancels(self):
+        window = self.open_window()
+        scan = window.scan_panel
+        window.space_shortcut.activated.emit()
+        self.assertIs(scan.state, ScanState.SCANNING)
+        window.space_shortcut.activated.emit()
+        self.assertIs(scan.state, ScanState.PAUSED)
+        window.escape_shortcut.activated.emit()
+        self.assertIs(scan.state, ScanState.IDLE)
+        self.assertEqual(window.model_panel.models.count(), 0)  # a cancelled scan is dropped
+
+    def test_status_bar_shows_connection_and_scan_state(self):
+        window = self.open_window()
+        self.assertIn("Mock depth sensor connected", window._connection.text())
+        self.assertEqual(window.scan_state.text(), "Ready")
+        window.scan_panel.new_scan()
+        self.assertEqual(window.scan_state.text(), "Scanning")
+        self.assertEqual(window.statusBar().currentMessage(), "")  # nothing drawn over them
+
+    def test_settings_are_fixed_while_scanning(self):
+        scan = self.open_window().scan_panel
+        scan.new_scan()
+        self.assertFalse(scan.accuracy.isEnabled() or scan.device.isEnabled())
+        scan.complete()
+        self.assertTrue(scan.accuracy.isEnabled() and scan.device.isEnabled())
+
+
+class StreamingTests(WindowTestCase):
+    def test_a_scan_streams_into_the_feeds_and_the_gauge(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 3)
+        self.assertFalse(window.camera_panel.depth_view.image.pixmap().isNull())
+        self.assertFalse(window.camera_panel.rgb_view.image.pixmap().isNull())
+        self.assertIsNotNone(window.viewport.gauge.distance_mm)
+        self.assertRegex(window.viewport.frames.text(), r"^Rendering frames: \d+$")
+        self.assertEqual(window.viewport.view3d.point_count, len(window.last_frame.points))
+        self.assertTrue(window.viewport.message.isHidden())
+
+    def test_the_3d_view_draws_the_live_cloud(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        blue, tinted = app.cloud_pixels(window)
+        self.assertGreater(blue, 20_000)  # most of the view: the wall, the ball and the pipe
+        self.assertEqual(tinted, 0)
+
+    def test_a_3d_view_that_cannot_start_says_so(self):
+        window = self.open_window()
+        window.viewport.view3d._fail("no OpenGL driver")
+        self.assertIn("3D view unavailable", window.viewport.message.text())
+        self.assertFalse(window.viewport.message.isHidden())
+
+    def test_the_color_switch_reaches_the_3d_view(self):
+        window = self.open_window()
+        self.assertFalse(window.viewport.view3d.use_color)
+        window.viewport.color_button.click()
+        self.assertTrue(window.viewport.view3d.use_color)
+        window.viewport.no_color_button.click()
+        self.assertFalse(window.viewport.view3d.use_color)
+
+    def test_cancelling_clears_the_3d_view(self):
+        window = self.open_window(engine.MockDepthSensor(64, 48, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        window.scan_panel.cancel()
+        self.assertEqual(window.viewport.view3d.point_count, 0)
+        self.assertFalse(window.viewport.message.isHidden())
+
+    def test_pausing_stops_the_stream(self):
+        window = self.open_window(engine.MockDepthSensor(64, 48, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        window.scan_panel.toggle_pause()
+        QTest.qWait(100)  # let a frame already on its way arrive
+        frames = window.frames
+        QTest.qWait(250)
+        self.assertEqual(window.frames, frames)
+
+    def test_completing_lists_the_model_with_its_properties(self):
+        window = self.open_window(engine.MockDepthSensor(64, 48, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        window.scan_panel.complete()
+        models = window.model_panel
+        self.assertEqual(models.models.count(), 1)
+        self.assertIs(window.left.currentWidget(), models)
+        self.assertEqual(models.value("Model name"), "Scan 01")
+        self.assertEqual(models.value("Scan settings"), "High accuracy · Feature tracking · General")
+        self.assertEqual(models.value("Rendering frames"), str(window.frames))
+        self.assertTrue(window.camera_panel.depth_view.image.pixmap().isNull())  # feeds cleared
+        self.assertGreater(window.viewport.view3d.point_count, 0)  # the model stays in view
+
+    def test_the_window_keeps_responding_while_it_scans(self):
+        sensor = engine.MockDepthSensor(2048, 1536, seed=3)
+        start = time.perf_counter()
+        sensor.capture_frame()
+        capture_s = time.perf_counter() - start
+        if capture_s < 0.02:
+            self.skipTest(f"a capture took {capture_s:.3f}s, too quick to tell a stall apart")
+        window = self.open_window(sensor)
+        beat = {"last": time.perf_counter(), "longest": 0.0}
+
+        def tick():
+            now = time.perf_counter()
+            beat["longest"] = max(beat["longest"], now - beat["last"])
+            beat["last"] = now
+
+        timer = QTimer()
+        timer.timeout.connect(tick)
+        timer.start(2)
+        beat["last"] = time.perf_counter()
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 4, timeout_s=30)
+        window.scan_panel.toggle_pause()
+        timer.stop()
+        self.assertLess(
+            beat["longest"], capture_s / 2,
+            f"the GUI thread stalled {beat['longest']:.3f}s; a capture takes {capture_s:.3f}s",
+        )
+
+
+class Pop4Tests(WindowTestCase):
+    """Picking the POP 4 and driving it from the window, with a FakePop4."""
+
+    def test_it_can_be_picked_only_while_plugged_in(self):
+        present = {"now": False}
+        window = app.MainWindow(open_pop4=FakePop4, pop4_present=lambda: present["now"])
+        self.addCleanup(window.close)
+        item = window.scan_panel.device.model().item(1)
+        self.assertFalse(item.isEnabled())
+        present["now"] = True
+        window._check_pop4_present()
+        self.assertTrue(item.isEnabled())
+
+    def test_picking_it_connects_and_sets_it_up_from_the_preset(self):
+        window = self.open_window()
+        scan = window.scan_panel
+        scan.device.setCurrentIndex(1)
+        self.assertFalse(scan.new_scan_button.isEnabled())  # not until it is connected
+        self.assertIn("Connecting to the POP 4", window._connection.text())
+        wait_until(lambda: window._pop4 and scan.new_scan_button.isEnabled())
+        self.assertIn("Revopoint POP 4 TEST0001 connected", window._connection.text())
+        wait_until(lambda: self.calls("set_depth_range") and self.calls("set_exposure"))
+        self.assertEqual(self.calls("set_depth_range")[-1], (250.0, 500.0))  # the preset's range
+        self.assertEqual(self.calls("set_exposure")[-1], (scan.preset.exposure_us,))
+        self.assertTrue(window.camera_panel.projector_button.isChecked())  # as the scanner has it
+
+    def test_lights_and_exposure_reach_the_scanner(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        camera = window.camera_panel
+        camera.projector_button.click()
+        camera.fill_light_button.click()
+        camera.fill_light_level.setValue(100)
+        camera.exposure.setValue(4000)
+        wait_until(lambda: self.calls("set_light_level") and (4000,) in self.calls("set_exposure"))
+        self.assertEqual(self.calls("set_light"),
+                         [("projector", False), ("fill light", True)])
+        self.assertEqual(self.calls("set_light_level"), [("fill light", 100)])
+
+    def test_a_refused_control_says_so(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        self.pop4.refuse.add("set_light")
+        window.camera_panel.fill_light_button.click()
+        wait_until(lambda: "refused" in window.viewport.toast.text())
+        self.assertIn("The POP 4 refused set light: OSError: set_light was refused",
+                      window.viewport.toast.text())
+
+    def test_a_scan_streams_from_it_through_a_missed_frame_or_two(self):
+        window = self.open_window(pop4=FakePop4(missing=2))
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 3)
+        self.assertIs(window.scan_panel.state, ScanState.SCANNING)
+        self.assertEqual(window.viewport.view3d.point_count, len(window.last_frame.points))
+
+    def test_almost_no_depth_is_reported_with_what_to_check(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        # A scanner seeing nothing: every pixel comes back without a distance.
+        blank = self.pop4._mock.capture_frame()
+        blank.depth_mm[:] = 0
+        self.pop4.capture_frame = lambda voxel_mm=None, timeout_ms=2000: blank
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= app.MainWindow.LOW_COVERAGE_FRAMES)
+        self.assertEqual(window._coverage.text(), "Coverage: 0.0%")
+        warning = window.viewport.warning
+        self.assertFalse(warning.isHidden())
+        self.assertIn("250–500 mm away", warning.text())  # the preset's distance band
+        self.assertIn("too dark", warning.text())
+
+    def test_a_scanner_seeing_the_object_says_nothing(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames > app.MainWindow.LOW_COVERAGE_FRAMES)
+        self.assertRegex(window._coverage.text(), r"^Coverage: 9\d\.\d%$")  # the mock's ~98%
+        self.assertTrue(window.viewport.warning.isHidden())
+
+    def test_a_scanner_that_sends_nothing_stops_the_scan(self):
+        window = self.open_window(pop4=FakePop4(missing=100))
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.scan_panel.state is ScanState.IDLE)
+        self.assertIn("no frames from the POP 4 (V4L2 frame timeout)",
+                      window.viewport.toast.text())
+
+    def test_blue_laser_and_back_to_infrared(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        scan = window.scan_panel
+        scan.mode.setCurrentIndex(1)
+        scan.mode.activated.emit(1)
+        wait_until(lambda: "Scan mode: Blue laser" in window.viewport.toast.text())
+        self.assertEqual(self.calls("set_scan_mode"), [("blue laser",)])
+
+        scan.mode.setCurrentIndex(0)
+        scan.mode.activated.emit(0)
+        self.assertIn("Restarting the scanner into infrared (about 45 s)",
+                      window.viewport.toast.text())
+        self.assertFalse(scan.new_scan_button.isEnabled())  # not while it reboots
+        wait_until(lambda: scan.new_scan_button.isEnabled())
+        self.assertEqual(self.pop4.scan_mode, "infrared")
+        self.assertEqual(scan.mode.currentData(), "infrared")
+
+    def test_a_scanner_that_unplugs_mid_scan_says_so(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        self.pop4.unplug()
+        wait_until(lambda: not window._pop4)
+        # The status must not keep claiming a scanner that has gone.
+        self.assertIn("disconnected", window._connection.text())
+        self.assertNotIn("POP 4 TEST0001 connected", window._connection.text())
+        # The heading beside the scanner list must not claim one either.
+        self.assertEqual(window.scan_panel.connection.text(), "Disconnected")
+        self.assertFalse(window.scan_panel.connection_ok)
+        self.assertIs(window.scan_panel.state, ScanState.IDLE)
+        self.assertFalse(window.camera_panel.lights.isEnabled())
+        self.assertIn("The POP 4 disconnected", window.viewport.warning.text())
+        self.assertTrue(self.pop4.closed)
+
+    def test_it_reconnects_once_the_scanner_comes_back(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        self.pop4.unplug()
+        wait_until(lambda: not window._pop4)
+        # The scanner returns, as it does after every session.
+        self.pop4 = FakePop4()
+        wait_until(lambda: window._pop4, timeout_s=30)
+        self.assertIn("Revopoint POP 4 TEST0001 connected", window._connection.text())
+        self.assertEqual(window.scan_panel.connection.text(), "Connected")
+        self.assertTrue(window.scan_panel.connection_ok)
+        self.assertTrue(window.viewport.warning.isHidden())
+        self.assertTrue(window.camera_panel.lights.isEnabled())
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+
+    def test_it_gives_up_after_enough_failed_reconnects(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        self.pop4.unplug()
+        wait_until(lambda: not window._pop4)
+        self.pop4 = OSError("POP 4: no 640x2560 capture node")  # never opens again
+        wait_until(lambda: window.scan_panel.device.currentIndex() == 0, timeout_s=60)
+        wait_until(lambda: "Mock depth sensor connected" in window._connection.text())
+        self.assertEqual(window.scan_panel.connection.text(), "Connected")
+        self.assertTrue(window.viewport.warning.isHidden())
+
+    def test_unplugging_between_scans_is_noticed_too(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        self.present = False  # off the USB bus, with nothing capturing
+        wait_until(lambda: not window._pop4, timeout_s=30)
+        self.assertIn("disconnected", window._connection.text())
+        self.assertIn("no longer on the USB bus", window.viewport.warning.text())
+
+    def test_a_scanner_that_will_not_open_leaves_the_mock_in_use(self):
+        window = self.open_window(pop4=OSError("POP 4: no 640x2560 capture node"))
+        window.scan_panel.device.setCurrentIndex(1)
+        wait_until(lambda: window.scan_panel.device.currentIndex() == 0
+                   and window.scan_panel.new_scan_button.isEnabled())
+        self.assertIn("Could not open the POP 4: OSError: POP 4: no 640x2560 capture node",
+                      window.viewport.toast.text())
+        self.assertIn("Mock depth sensor connected", window._connection.text())
+        self.assertFalse(window.camera_panel.lights.isEnabled())
+
+    def test_going_back_to_the_mock_or_closing_lets_it_go(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.device.setCurrentIndex(0)
+        wait_until(lambda: self.pop4.closed and not window._pop4)
+        second = FakePop4()
+        self.pop4 = second
+        self.connect_pop4(window)
+        window.close()
+        self.assertTrue(second.closed)
+
+
+class ReaToolTests(WindowTestCase):
+    """The REA tools in the window, on the mock sensor's wall and pipe."""
+
+    def scanned_window(self, width: int = 320, height: int = 240) -> app.MainWindow:
+        window = self.open_window(engine.MockDepthSensor(width, height, seed=1))
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 2)
+        window.scan_panel.complete()
+        return window
+
+    def fit(self, window: app.MainWindow, kind: str):
+        model = window.model_panel.current_model()
+        count = len(model.session.primitives)
+        window.fit(kind)
+        self.assertTrue(window._fitting)
+        wait_until(lambda: not window._fitting)
+        added = model.session.primitives[count:]
+        return added[0] if added else None
+
+    def test_the_tools_wait_for_a_completed_scan(self):
+        window = self.open_window(engine.MockDepthSensor(64, 48, seed=1))
+        tools = (window.fit_plane_action, window.fit_cylinder_action, window.export_step_action)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 1)
+        self.assertFalse(any(tool.isEnabled() for tool in tools))
+        window.scan_panel.complete()
+        self.assertEqual([tool.isEnabled() for tool in tools], [True, True, False])
+
+    def test_fitting_lists_the_primitive_and_tints_its_points(self):
+        window = self.scanned_window()
+        wall = self.fit(window, "plane")
+        np.testing.assert_allclose(wall.normal, [0, 0, -1], atol=1e-2)
+        panel = window.model_panel
+        self.assertEqual(panel.primitives.count(), 1)
+        self.assertTrue(panel.primitives.item(0).text().startswith("Plane 1  ·  "))
+        self.assertIs(panel.current_primitive(), wall)
+        self.assertIn("Normal", panel.primitive_details.text())
+        self.assertTrue(window.export_step_action.isEnabled())
+        self.assertIn("Plane 1", window.viewport.toast.text())
+        _, tinted = app.cloud_pixels(window)
+        self.assertGreater(tinted, 20_000)  # the wall, in amber
+
+        pipe = self.fit(window, "cylinder")
+        self.assertAlmostEqual(pipe.radius_mm, 40.0, delta=1.0)
+        self.assertEqual(panel.primitives.count(), 2)
+
+    def test_the_window_keeps_responding_while_it_fits(self):
+        window = self.scanned_window(640, 480)
+        session = window.model_panel.current_model().session
+        start = time.perf_counter()
+        rea.fit_plane(session.points, session.normals)
+        fit_s = time.perf_counter() - start
+        if fit_s < 0.03:
+            self.skipTest(f"a fit took {fit_s:.3f}s, too quick to tell a stall apart")
+        beat = {"last": time.perf_counter(), "longest": 0.0}
+
+        def tick():
+            now = time.perf_counter()
+            beat["longest"] = max(beat["longest"], now - beat["last"])
+            beat["last"] = now
+
+        timer = QTimer()
+        timer.timeout.connect(tick)
+        timer.start(2)
+        beat["last"] = time.perf_counter()
+        self.fit(window, "plane")
+        timer.stop()
+        self.assertIs(window._rea_worker.thread(), window._rea_thread)
+        self.assertLess(beat["longest"], fit_s / 2,
+                        f"the GUI thread stalled {beat['longest']:.3f}s; a fit takes {fit_s:.3f}s")
+
+    def test_when_nothing_is_left_to_fit_it_says_so(self):
+        window = self.scanned_window()
+        self.fit(window, "plane")
+        self.fit(window, "cylinder")
+        self.assertIsNone(self.fit(window, "plane"))
+        self.assertIn("No plane found", window.viewport.toast.text())
+        self.assertTrue(window.fit_plane_action.isEnabled())
+
+    def test_removing_a_primitive_frees_its_points(self):
+        window = self.scanned_window()
+        session = window.model_panel.current_model().session
+        self.fit(window, "plane")
+        window.model_panel.remove_button.click()
+        self.assertEqual(window.model_panel.primitives.count(), 0)
+        self.assertEqual(len(session.unclaimed()), len(session.points))
+        self.assertFalse(window.export_step_action.isEnabled())
+        self.assertEqual(app.cloud_pixels(window)[1], 0)  # no tint left
+
+    def test_export_step_writes_the_fitted_primitives(self):
+        window = self.scanned_window()
+        pipe, wall = self.fit(window, "cylinder"), self.fit(window, "plane")
+        with tempfile.TemporaryDirectory() as folder:
+            written = window.export_step(Path(folder) / "part.step")
+            bodies = rea.read_step(written)
+        self.assertEqual([(name, colour) for name, _, colour in bodies],
+                         [(pipe.name, pipe.color), (wall.name, wall.color)])
+        self.assertIn("Exported 2 primitives to part.step", window.viewport.toast.text())
+
+    def test_export_asks_where_and_adds_the_extension(self):
+        window = self.scanned_window()
+        self.fit(window, "plane")
+        with tempfile.TemporaryDirectory() as folder:
+            answer = (str(Path(folder) / "part"), "STEP files (*.step *.stp)")
+            with mock.patch.object(app.QFileDialog, "getSaveFileName", return_value=answer) as ask:
+                written = window.export_step()
+            self.assertEqual(written, Path(folder) / "part.step")
+            self.assertTrue(written.exists())
+            self.assertTrue(ask.call_args.args[2].endswith("Scan 01.step"))  # the suggested name
+        with mock.patch.object(app.QFileDialog, "getSaveFileName", return_value=("", "")):
+            self.assertIsNone(window.export_step())  # cancelled
+
+    def test_each_model_keeps_its_own_cloud_and_fits(self):
+        window = self.scanned_window()
+        first = window.model_panel.current_model()
+        self.fit(window, "plane")
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 5)
+        window.scan_panel.complete()
+        second = window.model_panel.current_model()
+        self.assertIsNot(first, second)
+        self.assertEqual(window.model_panel.primitives.count(), 0)
+
+        window.model_panel.models.setCurrentRow(0)
+        self.assertIs(window.model_panel.current_model(), first)
+        self.assertEqual(window.viewport.view3d.point_count, len(first.points))
+        np.testing.assert_array_equal(window.viewport.view3d._cloud[0], first.points)
+        self.assertEqual(window.model_panel.primitives.count(), 1)
+        self.assertGreater(app.cloud_pixels(window)[1], 0)
+        window.model_panel.models.setCurrentRow(1)
+        np.testing.assert_array_equal(window.viewport.view3d._cloud[0], second.points)
+
+    def test_cancelling_a_new_scan_goes_back_to_the_models(self):
+        window = self.scanned_window()
+        model = window.model_panel.current_model()
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 1)
+        window.scan_panel.cancel()
+        self.assertIs(window.left.currentWidget(), window.model_panel)
+        np.testing.assert_array_equal(window.viewport.view3d._cloud[0], model.points)
+        self.assertTrue(window.fit_plane_action.isEnabled())
+
+
+class SmokeTestModeTests(unittest.TestCase):
+    def test_scans_fits_exports_and_exits_cleanly(self):
+        # Also guards the exit path: a still-running QThread aborts the process.
+        result = subprocess.run([sys.executable, str(GUI_DIR / "app.py"), "--smoke-test"],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previews filled", result.stdout)
+        self.assertRegex(result.stdout, r"3D view showing [1-9][\d,]* points \([1-9][\d,]* pixels")
+        self.assertIn("model listed: True", result.stdout)
+        self.assertRegex(result.stdout, r"fitted Plane 1: \d+ × \d+ mm; Cylinder 1: ⌀ 79\.\d mm")
+        self.assertIn("STEP bodies read back: ['Cylinder 1', 'Plane 1']", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
