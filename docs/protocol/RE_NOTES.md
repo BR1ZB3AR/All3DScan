@@ -6,6 +6,139 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Driving the scanner from the new app (2026-10-27)
+
+Measured while wiring the POP4 into the PyQt6 app (`gui_python/app.py`,
+through `hw_cpp/src/Pop4Sensor.cpp`, which drives the same
+`RevopointPop4Protocol` backend). Tests:
+`ALL3DSCAN_POP4_TESTS=1 .venv/bin/python -m unittest gui_python/tests/test_pop4_hardware.py`,
+which judges each control by what the scanner's own cameras then see.
+
+### The pattern projector has to be switched on once frames are flowing
+
+**Observed.** After `connect()` the backend's controls said the projector
+was on, but its pattern was missing from the packed images it lights: local
+contrast of image 5 was **0.040** (the value measured with the projector
+explicitly off), against **0.118** with it on. Sending `0xb04 1` during
+`connect()`, before streaming, did not change that. Sending it after
+`startStream()` did, about **five frames** later.
+
+`startStream()` now re-sends the projector's state right after the stream
+starts, and again five frames in (one send alone did not take after a
+connect that had to reset the scanner). Toggling it from the app's
+"Pattern projector" button then shows in the infrared preview:
+on **0.100**, off **0.040**, on again **0.118**.
+
+**Inferred, untested:** the register write is dropped, or has no effect,
+while the depth node is not streaming.
+
+### The depth preview must come from an image the projector lights
+
+**Observed, consistent with 2026-10-14.** The depth decoder matches images
+4 and 9, which an always-on speckle emitter lights, so the user's projector
+button never changes them: toggling it moved their local contrast by under
+2% (0.129 against 0.128). Image 5 — the left camera's first ambient
+exposure — is one of the images `0xb04` does light. The app's "Depth
+camera" preview therefore shows image 5, so that switching the projector is
+visible where the user is looking.
+
+### A slow consumer needs the newest queued frame, not the next one
+
+**Observed.** V4L2 hands back the oldest queued buffer. Reading one frame
+per GUI repaint, the app ran the queue's depth behind the camera, and a
+light switched in one frame only showed several frames later — long enough
+that the projector test measured the *previous* state and failed.
+`V4l2Capture::readFrame(timeoutMs, newest = true)` now drains to the newest
+ready buffer, requeueing the older ones unread. `Pop4Sensor` asks for it;
+the legacy app keeps the old every-frame behaviour.
+
+### Fill light and blue laser, re-confirmed through the app's own controls
+
+| Control | Measured through the window |
+|---|---|
+| Fill light on / off | Colour image mean **52 → 145-183 → 50** |
+| Blue laser mode | Strongly blue pixels (B − R > 25) **0.07% → 65.95%** |
+| Back to infrared | Reboot completes; depth returns (0.82% of pixels) |
+
+### "Connected" must mean frames are flowing, not that arming worked
+
+**Observed.** A session showed the status bar claiming the scanner was
+connected while every capture failed with `V4L2 poll error (revents=0x18)` —
+`POLLHUP | POLLERR`. The kernel log explains it: the scanner left the bus
+mid-session (`usb 1-14.1: USB disconnect, device number 15`) and came back
+twelve and twenty-four seconds later as device 17, **with different node
+numbers** (`/dev/video4`, `/dev/video5`; `video0` and `video2` were gone).
+The app held a descriptor on the dead node.
+
+Two faults, both in the app rather than the scanner:
+
+- `connect()` and `startStream()` can both succeed against a scanner that is
+  on its way out, so "connected" never meant a frame had arrived.
+  `Pop4Sensor` now waits for a first frame (three tries of two seconds)
+  before reporting a connection, and fails with the scanner's own reason
+  otherwise.
+- Nothing ever un-set the status. `V4l2Capture` now records `deviceGone()`
+  on poll hang-up/error or `ENODEV`, the protocol reports it through
+  `stillConnected()`, and the window drops to the mock sensor, says
+  "disconnected — waiting for it", and stops the scan.
+
+**Recovery.** The window reconnects by itself: it looks for the scanner every
+two seconds and opens it after two consecutive sightings, so a device still
+re-enumerating is not grabbed too early. Tries are only spent while a scanner
+is actually present, so a reboot of a minute or more costs none of them.
+
+Verified on hardware by resetting the scanner's USB port mid-scan
+(`--usb-reset`): the window reported `revents=0x18`, stopped claiming a
+connection, disabled the lighting controls, cancelled the scan, reconnected
+once the scanner returned, and scanned again.
+
+**Also found by the test for this:** the in-flight flag that stops two
+captures overlapping was never cleared when a capture died with the device,
+so after reconnecting a scan would sit silent forever. Cleared on loss now.
+
+### Depth yield is far below the 27.8% of 2026-10-16: the scene, not the code
+
+**Observed.** Every session this day gave **0.4-1.1%** valid depth (300-1,800
+points of 163,840 pixels) against 27.8% measured on 2026-10-16. Dumped frames
+(`ALL3DSCAN_POP4_DUMP_DIR`) settle why, without needing the 2026-10-16 scene
+back.
+
+The two images the decoder matches, 4 (right) and 9 (left), both carry a
+stronger pattern than their own ambient exposures, so the projector is firing
+and the preview is reading the right plane:
+
+| image | mean | local contrast | contrast / mean |
+|---|---|---|---|
+| 0-3 right ambient | 4,360 | 547 | 0.125 |
+| **4 right speckle** | 8,617 | **2,094** | 0.243 |
+| 5-8 left ambient | 4,020 | 175 | 0.043 |
+| **9 left speckle** | 7,279 | **1,170** | 0.161 |
+
+Subtracting a camera's ambient exposure from its speckle one isolates what the
+projector adds: **45% (right) and 40% (left) of pixels gain more than 2,000
+counts**, so the light reaches the scene. But what comes back is smooth
+illumination of dark fabric, with no crisp dots — and **57% (right) / 64%
+(left) of each image sits below 9% of full scale**. Decoding a dumped frame
+offline gives disparities spread over almost the whole search band
+(p10/p50/p90 = **19 / 78 / 153 px**), which is scattered false matches, not a
+surface.
+
+**Derived:** the scene — a dark mesh seat a couple of metres off, well past
+the preset's 250-500 mm — is too dark and too far for the dot pattern to
+resolve, so there is nothing to match. Sweeping the decoder's band over
+150-1500 mm moved the yield by under 0.2 points, as expected when no distance
+holds a matchable surface.
+
+**Still unresolved:** no scan of a near, light-coloured object has been
+measured on this build, so 27.8% has not been reproduced here. Also seen:
+`V4L2 frame timeout` on the first capture of many sessions, occasional runs
+where every capture timed out until the scanner was left alone for a minute,
+and 1.5-7.4 frames/s against the 15 fps the Y16 modes advertise.
+
+**In the app:** the window now shows the coverage in the status bar and, after
+eight frames under 5%, says what to check (distance band, dark or shiny
+surface) instead of leaving an empty viewport.
+
 ## Factory calibration read from the scanner (2026-10-13)
 
 **This supersedes the fitted row map, the "lens bias" and the 28 mm

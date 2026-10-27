@@ -1,0 +1,5 @@
+{
+    // engine_rust is its own Cargo workspace, which rust-analyzer only finds
+    // when it is listed next to the root one.
+    "rust-analyzer.linkedProjects": ["Cargo.toml", "engine_rust/Cargo.toml"]
+}
