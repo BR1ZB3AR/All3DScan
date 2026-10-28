@@ -26,7 +26,9 @@ backend as the legacy app (`src/protocol/RevopointPop4Protocol`).
 - `presets.py` — the vendor's POP 4 scan presets (accuracy, tracking, object
   type), which set the gauge's distance bands
 - `main.py` — a small window that captures from the mock sensor
-- `theme.py` — the colours, and the Dark and Light themes
+- `theme.py` — the colours, the Dark and Light themes, and building a
+  custom one
+- `theme_dialog.py` — choosing a custom theme's colours
 - `common.py` — the icon, app id and OpenGL setup both windows share, and
   dressing the app in a theme
 - `assets/` — icons, stylesheets and other UI files
@@ -110,7 +112,18 @@ The menu bar offers the ribbon's own actions, so the two never disagree
 about what is available, plus what has no button: Quit (Ctrl+Q), the
 shortcuts (F1), scanning tips, and what the app is built from.
 
-**Theme** switches between Dark and Light, and the choice is remembered.
+**Theme** switches between Dark, Light and a custom theme of your own, and
+the choice is remembered.
+
+**Custom…** builds a theme from three colours rather than asking for all
+fifty-four: the **surface** everything sits on, the **text**, and the
+**accent**. Every other colour follows, keeping the place in the order of
+lightness that the built-in themes gave it, and how much more or less
+coloured it was — so a grey hint beside white text stays a hint instead of
+turning the full colour. The offsets are taken from whichever built-in
+theme matches the surface, light or dark, since on a light surface the
+hints are darker than the text and on a dark one lighter. The window
+recolours as you pick, and cancelling puts back what was there.
 There is one set of styling rules, `assets/dark.qss`, written in the dark
 theme's colours; a theme is a table saying what each of those colours
 becomes, so a second theme cannot drift away from the first the way a

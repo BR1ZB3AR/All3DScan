@@ -15,6 +15,8 @@ the names and asks a theme for the colour, so nothing else holds a hex value:
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from PyQt6.QtGui import QColor
+
 QSS = Path(__file__).resolve().parent / "assets" / "dark.qss"
 
 # Surfaces, from the furthest back to the nearest.
@@ -194,6 +196,83 @@ LIGHT = Theme(
         PALETTE_DISABLED_TEXT: "#a3a8b0",
     },
 )
+
+# Which family each colour belongs to, so a custom theme can derive them
+# all from a handful of choices. Every name above is in exactly one of
+# these, but for the distance bands and the notices, which say something and
+# so keep their colours whatever the theme.
+SURFACES = (
+    EDGE, SUNKEN, WINDOW, BASE, PANEL, ALT, SEGMENT, PRESSED, RAISED, RAISED_ALT,
+    RIBBON_HOVER, HOVER, HOVER_ALT, PREVIEW, BORDER_DIM, BORDER_PRESSED, BORDER_FAINT,
+    BORDER_SOFT, BORDER, BORDER_SEGMENT, BORDER_ALT, VIEWPORT_TOP, VIEWPORT_BOTTOM,
+    PALETTE_BASE,
+)
+TEXTS = (
+    TEXT_STRONG, TEXT_SOFT, TEXT, TEXT_MID, TEXT_MUTED, GAUGE_TICK, MUTED, MESSAGE,
+    DIM, GAUGE_LINE, DISABLED_WARM, SLIDER_DISABLED, DISABLED_ALT, DISABLED,
+    PREVIEW_TEXT, PALETTE_DISABLED_TEXT,
+)
+ACCENTS = (
+    ACCENT, ACCENT_HOVER, ACCENT_PRESSED, ACCENT_DIM, ACCENT_SUNKEN,
+    SLIDER_TRACK_DISABLED, LINK,
+)
+OVERLAYS = (OVERLAY, OVERLAY_SOLID)
+
+CUSTOM = "Custom"
+# What a custom theme is built from, and what it starts as.
+CUSTOM_PARTS = ("surface", "text", "accent")
+CUSTOM_DEFAULTS = {"surface": WINDOW, "text": TEXT, "accent": ACCENT}
+
+
+def _hsl(colour: str) -> tuple[float, float, float]:
+    """A colour as hue, saturation and lightness, with grey's missing hue
+    reported as 0 rather than Qt's -1."""
+    hue, saturation, lightness, _ = QColor(colour).getHslF()
+    return (max(hue, 0.0), saturation, lightness)
+
+
+def _shifted(hue: float, saturation: float, lightness: float) -> str:
+    return QColor.fromHslF(hue, saturation, min(max(lightness, 0.0), 1.0)).name()
+
+
+def _family(names, anchor: str, chosen: str, source: "Theme") -> dict[str, str]:
+    """Recolours a family of related colours from the one colour chosen for
+    it. Each keeps how much lighter or darker it was than its family's
+    anchor, and how much more or less coloured: a grey hint beside white
+    text stays a hint rather than turning the full colour."""
+    hue, saturation, lightness = _hsl(chosen)
+    _, anchor_saturation, anchor_lightness = _hsl(source.of(anchor))
+    recoloured = {}
+    for name in names:
+        _, was_saturation, was_lightness = _hsl(source.of(name))
+        share = was_saturation / anchor_saturation if anchor_saturation > 0 else 1.0
+        recoloured[name] = _shifted(hue, min(saturation * share, 1.0),
+                                    lightness + was_lightness - anchor_lightness)
+    return recoloured
+
+
+def custom(surface: str, text: str, accent: str) -> "Theme":
+    """A theme derived from three colours: the surface everything sits on,
+    the text, and the accent. The rest follow, each keeping its place in the
+    order of lightness one of the two themes put it in.
+
+    Which of them is the starting point follows the surface: on a light one
+    the hints are darker than the text, on a dark one lighter, so taking the
+    offsets from the wrong theme would push them off the end."""
+    base = LIGHT if _hsl(surface)[2] > 0.5 else DARK
+    recolour = {}
+    recolour.update(_family(SURFACES, WINDOW, surface, base))
+    recolour.update(_family(TEXTS, TEXT, text, base))
+    recolour.update(_family(ACCENTS, ACCENT, accent, base))
+    # Text sitting on the accent: whichever of black or white can be read on it.
+    recolour[WHITE] = "#ffffff" if _hsl(accent)[2] < 0.6 else "#15181d"
+    # The backdrop behind a toast, at the edge colour but keeping its alpha.
+    edge = QColor(recolour[EDGE])
+    for name in OVERLAYS:
+        alpha = name.rsplit(",", 1)[1].strip(" )")
+        recolour[name] = f"rgba({edge.red()}, {edge.green()}, {edge.blue()}, {alpha})"
+    return Theme(CUSTOM, recolour, light=base.light)
+
 
 THEMES = {theme.name: theme for theme in (DARK, LIGHT)}
 DEFAULT = DARK.name

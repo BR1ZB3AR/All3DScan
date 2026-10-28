@@ -133,8 +133,28 @@ def _settings() -> QSettings:
 def current_theme() -> str:
     """The theme last chosen, or the default when none has been."""
     name = _settings().value("theme", theme.DEFAULT)
-    return name if name in theme.THEMES else theme.DEFAULT
+    return name if name in theme.THEMES or name == theme.CUSTOM else theme.DEFAULT
 
 
 def remember_theme(name: str) -> None:
     _settings().setValue("theme", name)
+
+
+def custom_colours() -> dict[str, str]:
+    """The colours a custom theme is built from, as last chosen."""
+    saved = _settings()
+    return {part: str(saved.value(f"custom/{part}", theme.CUSTOM_DEFAULTS[part]))
+            for part in theme.CUSTOM_PARTS}
+
+
+def remember_custom_colours(colours: dict[str, str]) -> None:
+    saved = _settings()
+    for part in theme.CUSTOM_PARTS:
+        saved.setValue(f"custom/{part}", colours[part])
+
+
+def theme_named(name: str) -> theme.Theme:
+    """The theme of that name, building the custom one from its colours."""
+    if name == theme.CUSTOM:
+        return theme.custom(**custom_colours())
+    return theme.THEMES.get(name, theme.DARK)

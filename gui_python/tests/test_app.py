@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QPalette
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
@@ -231,7 +231,7 @@ class MenuTests(WindowTestCase):
         window = self.open_window()
         menus = self.menus(window)
         self.assertEqual(list(menus), ["&File", "&Edit", "&Theme", "&Help", "&About"])
-        self.assertEqual(menus["&Theme"], ["Dark", "Light"])
+        self.assertEqual(menus["&Theme"], ["Dark", "Light", "Custom…"])
         self.assertIsNone(menus["&About"])  # one thing to do, so no submenu
         self.assertIn("&Quit", menus["&File"])
         self.assertIn("Export STEP", menus["&File"])
@@ -300,7 +300,8 @@ class ThemeTests(WindowTestCase):
         # Chosen themes are remembered, so put back whatever was set.
         was = common.current_theme()
         self.addCleanup(common.remember_theme, was)
-        self.addCleanup(common.apply_theme, qt_app, theme.THEMES[was])
+        self.addCleanup(common.apply_theme, qt_app, common.theme_named(was))
+        self.addCleanup(common.remember_custom_colours, common.custom_colours())
 
     def test_one_set_of_rules_recoloured_for_each_theme(self):
         dark, light = theme.DARK.stylesheet(), theme.LIGHT.stylesheet()
@@ -343,6 +344,68 @@ class ThemeTests(WindowTestCase):
         window.set_theme("Light")
         window.set_theme("Chartreuse")
         self.assertEqual(common.current_theme(), "Light")
+
+    def test_a_custom_theme_is_built_from_three_colours(self):
+        made = theme.custom(surface="#1b2430", text="#e8eef6", accent="#2f9e68")
+        self.assertEqual(made.of(theme.WINDOW), "#1b2430")
+        self.assertEqual(made.of(theme.TEXT), "#e8eef6")
+        self.assertEqual(made.of(theme.ACCENT), "#2f9e68")
+        # The rest follow: panels sit a little off the surface, hints a
+        # little back from the text, and the accent keeps its own shades.
+        for name in (theme.PANEL, theme.BASE, theme.EDGE, theme.DIM, theme.ACCENT_HOVER):
+            self.assertNotEqual(made.of(name), theme.DARK.of(name), name)
+        self.assertNotIn(theme.DARK.of(theme.WINDOW), made.stylesheet())
+
+    def test_the_default_colours_give_back_the_dark_theme(self):
+        made = theme.custom(**theme.CUSTOM_DEFAULTS)
+        for name in (theme.WINDOW, theme.PANEL, theme.TEXT, theme.ACCENT):
+            self.assertEqual(QColor(made.of(name)).name(), QColor(theme.DARK.of(name)).name())
+
+    def test_light_and_dark_surfaces_both_keep_their_hints_readable(self):
+        # The offsets come from whichever theme matches the surface, so a
+        # hint stays between the text and the surface either way.
+        for surface, text in (("#1b2430", "#e8eef6"), ("#f6f1e8", "#241f18")):
+            made = theme.custom(surface=surface, text=text, accent="#b4652a")
+            lightness = [QColor(made.of(name)).lightnessF()
+                         for name in (theme.TEXT, theme.DIM, theme.WINDOW)]
+            self.assertEqual(sorted(lightness, reverse=surface == "#1b2430"), lightness,
+                             f"{surface}: text {lightness[0]:.2f} dim {lightness[1]:.2f} "
+                             f"surface {lightness[2]:.2f}")
+
+    def test_choosing_custom_colours_shows_them_and_remembers(self):
+        window = self.open_window()
+        colours = {"surface": "#101820", "text": "#eef2f6", "accent": "#1f8a4c"}
+        with mock.patch.object(app.CustomThemeDialog, "exec", return_value=1):
+            dialog = app.CustomThemeDialog(colours)
+            with mock.patch.object(app, "CustomThemeDialog", return_value=dialog):
+                window.choose_custom_theme()
+        self.assertEqual(common.current_theme(), theme.CUSTOM)
+        self.assertEqual(common.custom_colours(), colours)
+        self.assertIn("#101820", qt_app.styleSheet())
+        ticked = [a.data() for a in window.theme_actions.actions() if a.isChecked()]
+        self.assertEqual(ticked, [theme.CUSTOM])
+
+    def test_cancelling_puts_the_old_theme_back(self):
+        window = self.open_window()
+        window.set_theme("Light")
+        with mock.patch.object(app.CustomThemeDialog, "exec", return_value=0):
+            dialog = app.CustomThemeDialog({"surface": "#101820", "text": "#eef2f6",
+                                            "accent": "#1f8a4c"})
+            with mock.patch.object(app, "CustomThemeDialog", return_value=dialog):
+                window.choose_custom_theme()
+        self.assertEqual(common.current_theme(), "Light")
+        self.assertIn(theme.LIGHT.of(theme.WINDOW), qt_app.styleSheet())
+        self.assertNotIn("#101820", qt_app.styleSheet())
+
+    def test_the_dialog_previews_each_change(self):
+        window = self.open_window()
+        dialog = app.CustomThemeDialog(dict(theme.CUSTOM_DEFAULTS), window)
+        dialog.changed.connect(lambda colours: window._wear_theme(theme.custom(**colours)))
+        dialog.set_colour("accent", "#1f8a4c")
+        self.assertIn("#1f8a4c", qt_app.styleSheet())  # on screen before OK
+        dialog.reset()
+        self.assertEqual(dialog.colours, dict(theme.CUSTOM_DEFAULTS))
+        self.assertIn(theme.ACCENT, qt_app.styleSheet())
 
     def test_the_distance_bands_keep_their_meaning_in_every_theme(self):
         # Red for too near, green for good: those say something, so a theme

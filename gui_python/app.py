@@ -56,9 +56,13 @@ from common import (
     apply_theme,
     configure_opengl,
     current_theme,
+    custom_colours,
+    remember_custom_colours,
     remember_theme,
+    theme_named,
     warn_if_platform_differs,
 )
+from theme_dialog import CustomThemeDialog
 from panels import CameraPanel, ModelPanel, ScanModel, ScanPanel, ScanState, Viewport, tint
 from viewport3d import image_pixels
 from widgets import RibbonGroup
@@ -652,10 +656,16 @@ class MainWindow(QMainWindow):
         theme_menu = bar.addMenu("&Theme")
         self.theme_actions = QActionGroup(self)
         self.theme_actions.setExclusive(True)
-        for name in theme.THEMES:
-            choice = QAction(name, self, checkable=True)
+        for name in (*theme.THEMES, theme.CUSTOM):
+            choice = QAction(f"{name}…" if name == theme.CUSTOM else name,
+                             self, checkable=True)
+            choice.setData(name)
             choice.setChecked(name == current_theme())
-            choice.triggered.connect(lambda _checked, name=name: self.set_theme(name))
+            if name == theme.CUSTOM:
+                choice.setToolTip("Choose the colours yourself")
+                choice.triggered.connect(lambda _checked: self.choose_custom_theme())
+            else:
+                choice.triggered.connect(lambda _checked, name=name: self.set_theme(name))
             self.theme_actions.addAction(choice)
             theme_menu.addAction(choice)
 
@@ -668,13 +678,28 @@ class MainWindow(QMainWindow):
 
     def set_theme(self, name: str) -> None:
         """Dresses the window in a theme and remembers it for next time."""
-        chosen = theme.THEMES.get(name)
-        if chosen is None:
+        if name not in theme.THEMES and name != theme.CUSTOM:
             return
-        apply_theme(QApplication.instance(), chosen)
+        self._wear_theme(theme_named(name))
         remember_theme(name)
         for action in self.theme_actions.actions():
-            action.setChecked(action.text() == name)
+            action.setChecked(action.data() == name)
+
+    def choose_custom_theme(self) -> None:
+        """Picks the colours of a custom theme, showing each change behind
+        the dialog and putting the old theme back if it is cancelled."""
+        was = current_theme()
+        dialog = CustomThemeDialog(custom_colours(), self)
+        dialog.changed.connect(lambda colours: self._wear_theme(theme.custom(**colours)))
+        self._wear_theme(theme.custom(**dialog.colours))
+        if dialog.exec():
+            remember_custom_colours(dialog.colours)
+            self.set_theme(theme.CUSTOM)
+        else:
+            self.set_theme(was)
+
+    def _wear_theme(self, chosen: theme.Theme) -> None:
+        apply_theme(QApplication.instance(), chosen)
         # The stylesheet reaches most things on its own; these two draw
         # themselves and have to be asked.
         self.viewport.view3d.update()
@@ -1344,7 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setDesktopFileName(APP_ID)
     if APP_ICON.exists():
         app.setWindowIcon(QIcon(str(APP_ICON)))
-    apply_theme(app, theme.THEMES.get(current_theme(), theme.DARK))
+    apply_theme(app, theme_named(current_theme()))
 
     def report_unhandled(exc_type, exc, tb) -> None:
         # With the default hook, PyQt6 aborts the whole app when a slot raises.
