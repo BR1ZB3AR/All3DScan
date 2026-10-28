@@ -416,6 +416,42 @@ mod all3dscan_engine {
         }
     }
 
+    /// Drops the points that have far fewer neighbours within `radius_mm`
+    /// than the cloud's points typically do: the speckle a depth camera
+    /// leaves in mid-air, which has nothing around it, where a surface
+    /// point has its neighbours.
+    ///
+    /// A point is kept when at least `share` of the typical neighbour count
+    /// surrounds it. The measure comes from the cloud itself, so the same
+    /// settings suit a dense scan and a sparse one.
+    #[pyfunction]
+    #[pyo3(signature = (points, colors, normals, radius_mm = 3.0, share = 0.2))]
+    fn remove_speckle<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        colors: PyArrayLike2<'py, u8, AllowTypeChange>,
+        normals: PyArrayLike2<'py, f32, AllowTypeChange>,
+        radius_mm: f32,
+        share: f32,
+    ) -> PyResult<Cloud<'py>> {
+        let cloud = processing::Cloud {
+            points: triples(&points, "points")?,
+            colors: colour_rows(&colors, points.as_array().nrows())?,
+            normals: triples(&normals, "normals")?,
+        };
+        if cloud.normals.len() != cloud.points.len() {
+            return Err(PyValueError::new_err(format!(
+                "normals must match points, got {} normals for {} points",
+                cloud.normals.len(),
+                cloud.points.len()
+            )));
+        }
+        let kept = py
+            .detach(|| processing::remove_speckle(&cloud, radius_mm, share))
+            .map_err(value_error)?;
+        cloud_into_py(py, &kept)
+    }
+
     /// Whether a POP 4 is plugged in, without opening it.
     #[pyfunction]
     fn pop4_present() -> bool {
@@ -428,6 +464,18 @@ mod all3dscan_engine {
         Bound<'py, PyArray2<u8>>,
         Bound<'py, PyArray2<f32>>,
     );
+
+    /// A cloud's points, colours and normals, as three numpy arrays.
+    fn cloud_into_py<'py>(py: Python<'py>, cloud: &processing::Cloud) -> PyResult<Cloud<'py>> {
+        let n = cloud.points.len();
+        let rgb: Vec<u8> = cloud.colors.iter().copied().flatten().collect();
+        let normals: Vec<f32> = cloud.normals.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
+        Ok((
+            into_array(py, flatten(&cloud.points))?,
+            PyArray1::from_vec(py, rgb).reshape([n, 3])?,
+            into_array(py, normals)?,
+        ))
+    }
 
     /// The rows of an (N, 3) uint8 array, after checking its shape.
     fn colour_rows(
@@ -516,25 +564,8 @@ mod all3dscan_engine {
         /// The model so far, as an (N, 3) float32 array of millimetres in the
         /// first frame's axes, and its (N, 3) uint8 colours.
         fn cloud<'py>(&self, py: Python<'py>) -> PyResult<Cloud<'py>> {
-            let (xyz, rgb, normals) = py.detach(|| {
-                let fusion = self.locked();
-                let cloud = fusion.cloud();
-                (
-                    flatten(&cloud.points),
-                    cloud.colors.iter().copied().flatten().collect::<Vec<u8>>(),
-                    cloud
-                        .normals
-                        .iter()
-                        .flat_map(|n| [n.x, n.y, n.z])
-                        .collect::<Vec<f32>>(),
-                )
-            });
-            let n = xyz.len() / 3;
-            Ok((
-                into_array(py, xyz)?,
-                PyArray1::from_vec(py, rgb).reshape([n, 3])?,
-                into_array(py, normals)?,
-            ))
+            let copied = py.detach(|| self.locked().cloud().clone());
+            cloud_into_py(py, &copied)
         }
 
         /// Throws the model away and starts again.

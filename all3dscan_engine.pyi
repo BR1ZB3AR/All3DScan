@@ -124,6 +124,18 @@ class FrameFit(TypedDict):
     """Their RMS distance from it."""
     model_points: int
 
+def remove_speckle(
+    points: npt.ArrayLike,
+    colors: npt.ArrayLike,
+    normals: npt.ArrayLike,
+    radius_mm: float = 3.0,
+    share: float = 0.2,
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.uint8], npt.NDArray[np.float32]]:
+    """Drops the points with far fewer neighbours than the cloud's typically
+    have: the speckle a depth camera leaves in mid-air. Both the radius and
+    the threshold tune themselves to the cloud, so one setting suits a dense
+    scan and a sparse one."""
+
 def pop4_present() -> bool:
     """Whether a POP 4 is plugged in, without opening it."""
 

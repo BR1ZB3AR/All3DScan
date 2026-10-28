@@ -1,5 +1,6 @@
 //! Point-cloud processing on every core (rayon), on nalgebra points.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use nalgebra::{Point3, Vector3};
@@ -131,6 +132,117 @@ fn centroid(points: &[Point3<f32>], run: &[([i64; 3], u32)]) -> Point3<f32> {
         sum + points[i as usize].coords.cast::<f64>()
     });
     Point3::from((sum / run.len() as f64).cast::<f32>())
+}
+
+/// How many points lie within `radius_mm` of each point, itself included,
+/// paired with each point's index. Exact, not approximate: the points are
+/// binned into cubes of that edge, so the 27 cubes around a point hold
+/// every point within the radius of it, and each candidate is measured.
+fn neighbour_counts(
+    points: &[Point3<f32>],
+    radius_mm: f32,
+) -> Result<Vec<(u32, u32)>, ProcessingError> {
+    let keyed = voxel_keys(points, radius_mm)?;
+    let mut cubes: HashMap<[i64; 3], &[([i64; 3], u32)]> = HashMap::new();
+    for run in keyed.chunk_by(|a, b| a.0 == b.0) {
+        cubes.insert(run[0].0, run);
+    }
+    let radius = radius_mm * radius_mm;
+    Ok(keyed
+        .par_iter()
+        .map(|(key, index)| {
+            let here = points[*index as usize];
+            let mut near = 0;
+            for offset in 0..27 {
+                let beside = [
+                    key[0] + offset / 9 - 1,
+                    key[1] + offset / 3 % 3 - 1,
+                    key[2] + offset % 3 - 1,
+                ];
+                if let Some(cube) = cubes.get(&beside) {
+                    near += cube
+                        .iter()
+                        .filter(|(_, other)| {
+                            (points[*other as usize] - here).norm_squared() <= radius
+                        })
+                        .count() as u32;
+                }
+            }
+            (*index, near)
+        })
+        .collect())
+}
+
+/// How many times the radius may be doubled while looking for one at which
+/// the points can see each other at all.
+const SPECKLE_WIDENINGS: u32 = 4;
+
+/// Drops the points that have far fewer neighbours than the cloud's points
+/// typically do: the speckle a depth camera leaves in mid-air, which has
+/// nothing around it, where a surface point has its neighbours. Returns the
+/// indices of the points kept, in order.
+///
+/// Both halves of the judgement come from the cloud itself, because how
+/// close its points lie depends on the sensor, the distance and how much it
+/// has been thinned. `radius_mm` is only a starting point: it is doubled
+/// until the typical point has a neighbour, so a cloud sampled more coarsely
+/// than the radius is not simply declared empty. A point is then kept when at
+/// least `share` of the typical count surrounds it.
+///
+/// A cloud whose points cannot see each other at any of those radii is
+/// merely sparse — nothing in it stands out as speckle — and is kept whole.
+pub fn dense_points(
+    points: &[Point3<f32>],
+    radius_mm: f32,
+    share: f32,
+) -> Result<Vec<u32>, ProcessingError> {
+    check_voxel_size(radius_mm)?;
+    let mut radius = radius_mm;
+    let mut counted = Vec::new();
+    let mut typical = 0.0f32;
+    for _ in 0..=SPECKLE_WIDENINGS {
+        counted = neighbour_counts(points, radius)?;
+        if counted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut counts: Vec<u32> = counted.iter().map(|(_, near)| *near).collect();
+        let middle = counts.len() / 2;
+        counts.par_sort_unstable();
+        typical = counts[middle] as f32;
+        if typical >= 2.0 {
+            break;
+        }
+        radius *= 2.0;
+    }
+    if typical < 2.0 {
+        let mut all: Vec<u32> = counted.into_iter().map(|(index, _)| index).collect();
+        all.par_sort_unstable();
+        return Ok(all);
+    }
+    // A speck has only itself, so two is the lowest count that says anything.
+    let least = ((typical * share).round() as u32).max(2);
+    let mut kept: Vec<u32> = counted
+        .into_par_iter()
+        .filter(|(_, near)| *near >= least)
+        .map(|(index, _)| index)
+        .collect();
+    kept.par_sort_unstable();
+    Ok(kept)
+}
+
+/// The cloud with only the points that `dense_points` keeps.
+pub fn remove_speckle(cloud: &Cloud, radius_mm: f32, share: f32) -> Result<Cloud, ProcessingError> {
+    let n = cloud.points.len();
+    assert!(
+        cloud.colors.len() == n && cloud.normals.len() == n,
+        "a cloud needs one colour and one normal per point"
+    );
+    let kept = dense_points(&cloud.points, radius_mm, share)?;
+    Ok(Cloud {
+        points: kept.iter().map(|&i| cloud.points[i as usize]).collect(),
+        colors: kept.iter().map(|&i| cloud.colors[i as usize]).collect(),
+        normals: kept.iter().map(|&i| cloud.normals[i as usize]).collect(),
+    })
 }
 
 /// How far, in pixels, a normal looks for the neighbours it is taken from.
@@ -395,6 +507,111 @@ mod tests {
             voxel_downsample(&[p(1.0, 0.0, 0.0)], 1e-30),
             Err(ProcessingError::CoordinateOutOfRange(1e-30))
         );
+    }
+
+    #[test]
+    fn speckle_in_mid_air_goes_and_the_surface_stays() {
+        // A plate of points 1 mm apart, and scattered specks well away from it.
+        let mut cloud = Cloud::default();
+        for i in 0..40 * 40 {
+            cloud
+                .points
+                .push(p((i % 40) as f32, (i / 40) as f32, 400.0));
+            cloud.colors.push([200, 200, 200]);
+            cloud.normals.push(-Vector3::z());
+        }
+        let surface = cloud.points.len();
+        for i in 0..60 {
+            cloud
+                .points
+                .push(p(i as f32 * 3.0, 60.0 + i as f32, 300.0 + i as f32 * 2.0));
+            cloud.colors.push([10, 10, 10]);
+            cloud.normals.push(-Vector3::z());
+        }
+        let cleaned = remove_speckle(&cloud, 3.0, 0.2).unwrap();
+        assert_eq!(
+            cleaned.points.len(),
+            surface,
+            "the plate should survive whole"
+        );
+        assert_eq!(cleaned.colors.len(), surface);
+        assert_eq!(cleaned.normals.len(), surface);
+        assert!(
+            cleaned.colors.iter().all(|&c| c == [200, 200, 200]),
+            "a speck got through"
+        );
+    }
+
+    #[test]
+    fn a_cloud_too_sparse_to_judge_is_kept_whole() {
+        // Points 400 mm apart: even widened, no point sees another, so
+        // nothing stands out as speckle and the cloud survives. Throwing it
+        // away would lose the scan.
+        let points: Vec<_> = (0..50).map(|i| p(i as f32 * 400.0, 0.0, 400.0)).collect();
+        assert_eq!(dense_points(&points, 2.0, 0.2).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn a_radius_smaller_than_the_spacing_is_widened_until_it_bites() {
+        // A plate 5 mm apart with specks around it, asked for with a 1 mm
+        // radius: too small to see anything, so it grows until it does.
+        let mut cloud = Cloud::default();
+        for i in 0..30 * 30 {
+            cloud
+                .points
+                .push(p((i % 30) as f32 * 5.0, (i / 30) as f32 * 5.0, 400.0));
+            cloud.colors.push([200, 200, 200]);
+            cloud.normals.push(-Vector3::z());
+        }
+        let surface = cloud.points.len();
+        for i in 0..8 {
+            cloud.points.push(p(400.0 + 50.0 * i as f32, -200.0, 300.0));
+            cloud.colors.push([9, 9, 9]);
+            cloud.normals.push(-Vector3::z());
+        }
+        let cleaned = remove_speckle(&cloud, 1.0, 0.2).unwrap();
+        assert_eq!(cleaned.points.len(), surface);
+        assert!(cleaned.colors.iter().all(|&c| c == [200, 200, 200]));
+    }
+
+    #[test]
+    fn a_denser_cloud_loses_the_same_specks() {
+        // The same scene sampled finely and coarsely: the speck goes either
+        // way, because the threshold follows the cloud.
+        for step in [0.5f32, 2.0] {
+            let mut cloud = Cloud::default();
+            let side = (20.0 / step) as i32;
+            for i in 0..side * side {
+                cloud
+                    .points
+                    .push(p((i % side) as f32 * step, (i / side) as f32 * step, 400.0));
+                cloud.colors.push([200, 200, 200]);
+                cloud.normals.push(-Vector3::z());
+            }
+            let surface = cloud.points.len();
+            cloud.points.push(p(100.0, 100.0, 300.0)); // a speck on its own
+            cloud.colors.push([9, 9, 9]);
+            cloud.normals.push(-Vector3::z());
+            let cleaned = remove_speckle(&cloud, 3.0 * step, 0.2).unwrap();
+            assert_eq!(cleaned.points.len(), surface, "step {step}");
+        }
+    }
+
+    #[test]
+    fn the_points_kept_come_back_in_order() {
+        let frame = MockDepthSensor::new(320, 240, 5).unwrap().capture();
+        let kept = dense_points(&frame.points, 5.0, 0.2).unwrap();
+        assert!(
+            kept.windows(2).all(|w| w[0] < w[1]),
+            "out of order or repeated"
+        );
+        assert!(!kept.is_empty() && kept.len() <= frame.points.len());
+        assert!(kept.iter().all(|&i| (i as usize) < frame.points.len()));
+    }
+
+    #[test]
+    fn a_bad_radius_is_refused() {
+        assert!(dense_points(&[p(0.0, 0.0, 400.0)], 0.0, 0.2).is_err());
     }
 
     #[test]

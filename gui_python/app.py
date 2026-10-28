@@ -377,6 +377,12 @@ class MainWindow(QMainWindow):
     # voxel above, so a denser frame only costs time — and the copy into the
     # engine holds the GIL, which the window would feel.
     FUSION_MAX_POINTS = 200_000
+    # Completing a scan drops the points with far fewer neighbours within
+    # this radius than the model's points typically have: the speckle a
+    # depth camera leaves in mid-air. The share is measured against the
+    # model itself, so a sparse scan is not stripped bare.
+    SPECKLE_RADIUS_MM = 3.0
+    SPECKLE_SHARE = 0.2
 
     def __init__(self, sensor=None, open_pop4=None, pop4_present=None) -> None:
         """sensor is the mock to scan with until a POP 4 is picked;
@@ -828,6 +834,27 @@ class MainWindow(QMainWindow):
             wait = 1.0 / self.TARGET_FPS - (now - self._requested_at)
             self._next_frame.start(max(0, int(wait * 1000)))
 
+    def _without_speckle(self, cloud: tuple) -> tuple:
+        """The model with the stray points taken out. A scan leaves specks
+        hanging in mid-air where the depth was a bad match, and they would
+        otherwise be fitted and meshed along with the object."""
+        try:
+            cleaned = engine.remove_speckle(*cloud, radius_mm=self.SPECKLE_RADIUS_MM,
+                                            share=self.SPECKLE_SHARE)
+        except BaseException as exc:
+            print(f"could not remove the speckle: {describe(exc)}", file=sys.stderr,
+                  flush=True)
+            return cloud
+        dropped = len(cloud[0]) - len(cleaned[0])
+        if not len(cleaned[0]):
+            print("every point looked like speckle; keeping the cloud as it was",
+                  file=sys.stderr, flush=True)
+            return cloud
+        print(f"removed {dropped:,} stray points of {len(cloud[0]):,}", flush=True)
+        if dropped:
+            self.viewport.show_toast(f"Removed {dropped:,} stray points", 4000)
+        return cleaned
+
     def _offer_to_fusion(self, frame) -> None:
         """Hands the fusion this frame, unless it is still on the last one."""
         if self._fusing or not len(frame.points):
@@ -912,6 +939,10 @@ class MainWindow(QMainWindow):
                              f"{panel.tracking.currentText()} tracking · "
                              f"{panel.object_type.currentText()}",
         }
+        if fused is not None:
+            fused = self._fused = self._without_speckle(fused)
+            points = fused[0]
+            properties["Points"] = f"{len(points):,} fused from {self._tracked} frames"
         # The cloud already on screen becomes the model: the frames fused
         # together, or the last frame alone when fusion was off.
         if fused is not None:

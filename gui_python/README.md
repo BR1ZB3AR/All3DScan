@@ -158,7 +158,12 @@ the machine allows. Turn Fusion off to see only the newest frame, which is
 what you want when the scene itself is moving.
 
 Completing a scan keeps the fused model, so the REA fits below measure the
-whole object rather than one frame of it.
+whole object rather than one frame of it. The stray points go first: a scan
+leaves specks hanging in mid-air where the depth was a bad match, and they
+would otherwise be fitted and meshed along with the object. A point is
+dropped when far fewer of its neighbours are close by than the model's
+points typically have — measured from the model itself, so a sparse scan is
+not stripped bare. On a real scan this took out 5,029 points of 113,957.
 
 ## Scan to CAD (REA)
 

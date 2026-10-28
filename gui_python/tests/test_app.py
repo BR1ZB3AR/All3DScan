@@ -922,6 +922,47 @@ class FusionTests(WindowTestCase):
         lengths = np.linalg.norm(model.normals, axis=1)
         np.testing.assert_allclose(lengths, 1.0, atol=1e-3)
 
+    def test_completing_takes_the_stray_points_out(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        fused = len(window._fused[0])
+        # A handful of specks hanging in mid-air, as a bad depth match leaves.
+        strays = np.array([[300.0 + 40 * i, -250.0, 250.0 + 30 * i] for i in range(9)],
+                          np.float32)
+        window._fused = (np.vstack([window._fused[0], strays]),
+                         np.vstack([window._fused[1],
+                                    np.zeros((len(strays), 3), np.uint8)]),
+                         np.vstack([window._fused[2],
+                                    np.tile([0.0, 0.0, -1.0], (len(strays), 1)).astype(
+                                        np.float32)]))
+        window.scan_panel.complete()
+        model = window.model_panel.current_model()
+        # Every speck is gone, and the surface is all but untouched: an
+        # outlier filter also trims points at the cloud's edges, which have
+        # fewer neighbours by nature.
+        for speck in strays:
+            nearest = np.linalg.norm(model.points - speck, axis=1).min()
+            self.assertGreater(nearest, 20.0, f"a speck survived at {speck}")
+        self.assertGreater(len(model.points), fused * 0.99)
+        self.assertLessEqual(len(model.points), fused)
+        self.assertEqual(len(model.colors), len(model.points))
+        self.assertEqual(len(model.normals), len(model.points))
+        self.assertIn("stray points", window.viewport.toast.text())
+        self.assertRegex(model.properties["Points"], r"^[\d,]+ fused from \d+ frames$")
+
+    def test_a_cloud_that_is_all_speckle_is_kept_as_it_is(self):
+        # Rather than hand back an empty model, which would lose the scan.
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 1, timeout_s=30)
+        scattered = np.array([[200.0 * i, 150.0 * i, 300.0 + 50 * i] for i in range(20)],
+                             np.float32)
+        window._fused = (scattered, np.zeros((20, 3), np.uint8),
+                         np.tile([0.0, 0.0, -1.0], (20, 1)).astype(np.float32))
+        window.scan_panel.complete()
+        self.assertEqual(len(window.model_panel.current_model().points), 20)
+
     def test_the_points_shown_are_the_models_while_fusing(self):
         window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
         self.scan(window)
