@@ -373,7 +373,10 @@ class ScanPanel(QWidget):
     MODES = {"infrared": "Infrared", "blue laser": "Blue laser (visible)",
              "speckle": "Infrared speckle"}
 
-    def __init__(self) -> None:
+    def __init__(self, mock: bool = False) -> None:
+        """mock offers the stand-in depth camera beside the scanner. It is a
+        development fixture: a scan of it is a scan of nothing, so the app
+        people run does not list it."""
         super().__init__()
         self.connection = QLabel("Connected")
         self.connection.setObjectName("connection")
@@ -381,7 +384,9 @@ class ScanPanel(QWidget):
         # scanner list never claims a connection the app does not have.
         self.connection_ok = True
         self.device = QComboBox()
-        self.device.addItems(["Mock depth sensor", "Revopoint POP 4 (USB)"])
+        if mock:
+            self.device.addItem("Mock depth sensor", "mock")
+        self.device.addItem("Revopoint POP 4 (USB)", "pop4")
         self.set_pop4_present(False)
 
         self.new_scan_button = self._scan_button("New scan", "list-add")
@@ -459,7 +464,7 @@ class ScanPanel(QWidget):
 
     @property
     def pop4(self) -> bool:
-        return self.device.currentIndex() == 1
+        return self.device.currentData() == "pop4"
 
     def set_connection(self, text: str, ok: bool = True) -> None:
         """What the heading beside the scanner list says: Connected,
@@ -469,9 +474,11 @@ class ScanPanel(QWidget):
         self.connection.setStyleSheet("" if ok else "color: #e5484d;")
 
     def set_pop4_present(self, present: bool) -> None:
-        """Lets the POP 4 be picked only while one is plugged in."""
-        item = self.device.model().item(1)
-        item.setEnabled(present)
+        """Lets the POP 4 be picked only while one is plugged in — unless it
+        is the only scanner listed, when there is nothing to fall back to and
+        the connection heading says what is going on instead."""
+        item = self.device.model().item(self.device.findData("pop4"))
+        item.setEnabled(present or self.device.count() == 1)
         item.setToolTip("" if present else "Plug in a POP 4 to scan with it")
 
     def set_ready(self, ready: bool) -> None:

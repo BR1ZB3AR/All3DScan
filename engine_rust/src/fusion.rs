@@ -109,9 +109,16 @@ struct Keyframe {
 }
 
 /// How far the scanner must have moved since the last view kept before
-/// another is worth keeping, and how many are ever held.
+/// another is worth keeping.
 const KEYFRAME_SHIFT_MM: f32 = 8.0;
 const KEYFRAME_TURN: f32 = 0.10; // radians, about 6 degrees
+/// ...but one is kept every this many merged frames however still the
+/// scanner is held. A scanner resting on a desk hardly moves, and without
+/// this it kept three views of a whole scan, which is not enough to melt a
+/// surface out of: the noise has to average over several looks at the same
+/// place to settle.
+const KEYFRAME_EVERY: u64 = 4;
+/// How many are ever held.
 const KEYFRAMES: usize = 120;
 
 /// Builds one point cloud out of a scan's frames.
@@ -126,6 +133,8 @@ pub struct Fusion {
     /// Views kept for building a surface, and where the last one was taken.
     keyframes: Vec<Keyframe>,
     last_kept: Option<(Matrix3<f32>, Vector3<f32>)>,
+    /// Which merged frame the last view was kept from.
+    last_kept_at: u64,
 }
 
 impl Fusion {
@@ -140,6 +149,7 @@ impl Fusion {
             merged: 0,
             keyframes: Vec::new(),
             last_kept: None,
+            last_kept_at: 0,
         })
     }
 
@@ -195,7 +205,8 @@ impl Fusion {
             let turned = (((was_rotation.transpose() * rotation).trace() - 1.0) / 2.0)
                 .clamp(-1.0, 1.0)
                 .acos();
-            if moved < KEYFRAME_SHIFT_MM && turned < KEYFRAME_TURN {
+            let waited = self.merged.saturating_sub(self.last_kept_at) >= KEYFRAME_EVERY;
+            if moved < KEYFRAME_SHIFT_MM && turned < KEYFRAME_TURN && !waited {
                 return;
             }
         }
@@ -220,6 +231,7 @@ impl Fusion {
             pose,
         });
         self.last_kept = Some((rotation, shift));
+        self.last_kept_at = self.merged;
     }
 
     /// How many depth views are being held for the surface.
@@ -296,6 +308,7 @@ impl Fusion {
         self.merged = 0;
         self.keyframes.clear();
         self.last_kept = None;
+        self.last_kept_at = 0;
     }
 }
 
@@ -462,6 +475,30 @@ mod tests {
             coarse.model_points(),
             fine.model_points()
         );
+    }
+
+    #[test]
+    fn a_scanner_held_still_still_keeps_views_to_build_from() {
+        // Measured on a real scan: held almost still, the motion rule kept
+        // three views of a whole scan and the surface came out as 42
+        // triangles. Views have to accrue anyway.
+        let mut fusion = Fusion::new(1.0).unwrap();
+        let frame = corner(0.5);
+        let depth = vec![400u16; 64 * 48];
+        for _ in 0..16 {
+            let fit = fusion.add(&frame).unwrap(); // the same view every time
+            assert!(fit.merged);
+            fusion.keep_view(&depth, 64, 48);
+        }
+        assert!(fusion.views() >= 4, "only {} views kept", fusion.views());
+    }
+
+    #[test]
+    fn a_view_whose_depth_is_the_wrong_size_is_ignored() {
+        let mut fusion = Fusion::new(1.0).unwrap();
+        fusion.add(&corner(2.0)).unwrap();
+        fusion.keep_view(&[400u16; 10], 64, 48);
+        assert_eq!(fusion.views(), 0);
     }
 
     #[test]

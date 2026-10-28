@@ -82,6 +82,9 @@ class FakePop4:
     # How many points the scene shows at a given exposure; a flat scene by
     # default, so only the auto-exposure tests care.
     points_for_exposure = None
+    # Where the scene stands, when a test wants it at one distance rather
+    # than spread over the whole working distance.
+    depth_band = None
 
     def capture_frame(self, voxel_mm=None, timeout_ms=2000):
         if not self.connected:
@@ -92,6 +95,8 @@ class FakePop4:
             return None
         self.frames_taken += 1
         frame = self._mock.capture_frame(voxel_mm)
+        if self.depth_band is not None:
+            frame = AtDistance(frame, *self.depth_band)
         if self.points_for_exposure is not None:
             frame = Thinned(frame, self.points_for_exposure(self.exposure_us))
         return frame
@@ -141,6 +146,22 @@ class Thinned:
         self.ir, self.rgb, self.index = like.ir, like.rgb, like.index
 
 
+class AtDistance:
+    """A frame whose scene stands between two distances, standing in for an
+    object at one distance rather than a scene filling the working range."""
+
+    def __init__(self, like, near: float, far: float) -> None:
+        points = np.asarray(like.points).copy()
+        if len(points):
+            low, high = points[:, 2].min(), points[:, 2].max()
+            span = max(high - low, 1e-6)
+            points[:, 2] = near + (points[:, 2] - low) / span * (far - near)
+        self.points = points
+        self.colors, self.normals = like.colors, like.normals
+        self.depth_mm, self.ir, self.rgb, self.index = (
+            like.depth_mm, like.ir, like.rgb, like.index)
+
+
 class BlankFrame:
     """A frame the scanner found no depth in: the images still arrive, with
     nothing in them, as they do when the object is out of range."""
@@ -157,9 +178,15 @@ class WindowTestCase(unittest.TestCase):
     def open_window(self, sensor=None, pop4=None, present=True) -> app.MainWindow:
         """A window whose POP 4, when picked, is `pop4` (a FakePop4 by
         default): never the real scanner. self.present stands in for the USB
-        bus, so a test can take the scanner off it."""
+        bus, so a test can take the scanner off it.
+
+        The window gets the stand-in depth camera, as `--mock` gives it, so a
+        test can drive the whole window without a scanner. The app people run
+        has none of it: ShippedTests below covers that."""
         self.pop4 = pop4 if pop4 is not None else FakePop4()
         self.present = present
+        if sensor is None:
+            sensor = engine.MockDepthSensor(160, 120, seed=0)
 
         def open_pop4():
             if isinstance(self.pop4, BaseException):
@@ -175,8 +202,15 @@ class WindowTestCase(unittest.TestCase):
         return window
 
     def connect_pop4(self, window: app.MainWindow) -> None:
-        window.scan_panel.device.setCurrentIndex(1)
+        window.scan_panel.device.setCurrentIndex(
+            window.scan_panel.device.findData("pop4"))
         wait_until(lambda: window._pop4 and window.scan_panel.new_scan_button.isEnabled())
+
+    def connect_pop4_badly(self, window: app.MainWindow) -> None:
+        """Picks the POP 4 without waiting for it, for a scanner that will
+        not open."""
+        window.scan_panel.device.setCurrentIndex(
+            window.scan_panel.device.findData("pop4"))
 
     def calls(self, name: str) -> list[tuple]:
         return [args for called, args in self.pop4.calls if called == name]
@@ -616,19 +650,18 @@ class Pop4Tests(WindowTestCase):
     """Picking the POP 4 and driving it from the window, with a FakePop4."""
 
     def test_it_can_be_picked_only_while_plugged_in(self):
-        present = {"now": False}
-        window = app.MainWindow(open_pop4=FakePop4, pop4_present=lambda: present["now"])
-        self.addCleanup(window.close)
-        item = window.scan_panel.device.model().item(1)
+        window = self.open_window(present=False)
+        device = window.scan_panel.device
+        item = device.model().item(device.findData("pop4"))
         self.assertFalse(item.isEnabled())
-        present["now"] = True
+        self.present = True
         window._check_pop4_present()
         self.assertTrue(item.isEnabled())
 
     def test_picking_it_connects_and_sets_it_up_from_the_preset(self):
         window = self.open_window()
         scan = window.scan_panel
-        scan.device.setCurrentIndex(1)
+        scan.device.setCurrentIndex(scan.device.findData("pop4"))
         self.assertFalse(scan.new_scan_button.isEnabled())  # not until it is connected
         self.assertIn("Connecting to the POP 4", window._connection.text())
         wait_until(lambda: window._pop4 and scan.new_scan_button.isEnabled())
@@ -673,6 +706,43 @@ class Pop4Tests(WindowTestCase):
         tried = [args[0] for name, args in self.pop4.calls if name == "set_exposure"]
         self.assertEqual(tried[-len(sweep) - 1 : -1], sweep)
         self.assertEqual(tried[-1], best)
+
+    def test_auto_narrows_the_working_distance_onto_the_object(self):
+        # Measured on a real POP 4: the decoder searches the range it is
+        # given, and a narrower search finds more of the surface. So the Auto
+        # pass also finds the band the object fills and keeps it.
+        window = self.open_window()
+        self.connect_pop4(window)
+        wide = tuple(map(float, window.scan_panel.preset.scale_mm))
+        wait_until(lambda: ("set_depth_range", wide) in self.pop4.calls)
+        # An object standing at one distance, which is what narrowing is for.
+        self.pop4.depth_band = (300.0, 340.0)
+        window.camera_panel.auto_exposure.click()
+        wait_until(lambda: not window._tuning, timeout_s=60)
+
+        narrowed = [args for name, args in self.pop4.calls if name == "set_depth_range"][-1]
+        near, far = narrowed
+        self.assertGreaterEqual(near, wide[0])
+        self.assertLessEqual(far, wide[1])
+        self.assertLess(far - near, wide[1] - wide[0], "the range was not narrowed")
+        self.assertGreaterEqual(far - near, app.ScanWorker.RANGE_LEAST_MM / 2)
+        # It has to hold the object: the points the scanner is sending now.
+        depths = np.asarray(self.pop4.capture_frame().points)[:, 2]
+        kept = float(((depths >= near) & (depths <= far)).mean())
+        self.assertGreater(kept, 0.9, f"only {kept:.0%} of the points are still in range")
+        self.assertIn("mm, where the object is", window.viewport.toast.text())
+
+    def test_auto_leaves_the_working_distance_alone_when_it_sees_nothing(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        wide = tuple(map(float, window.scan_panel.preset.scale_mm))
+        wait_until(lambda: ("set_depth_range", wide) in self.pop4.calls)
+        before = len([1 for name, _ in self.pop4.calls if name == "set_depth_range"])
+        self.pop4.points_for_exposure = lambda us: 0  # no points to judge by
+        window.camera_panel.auto_exposure.click()
+        wait_until(lambda: not window._tuning, timeout_s=60)
+        after = len([1 for name, _ in self.pop4.calls if name == "set_depth_range"])
+        self.assertEqual(after, before, "the range was changed with nothing to go on")
 
     def test_exposure_writes_are_spaced_out(self):
         # Two writes in a row stop a real POP 4 sending frames at all, so
@@ -918,8 +988,8 @@ class Pop4Tests(WindowTestCase):
 
     def test_a_scanner_that_will_not_open_leaves_the_mock_in_use(self):
         window = self.open_window(pop4=OSError("POP 4: no 640x2560 capture node"))
-        window.scan_panel.device.setCurrentIndex(1)
-        wait_until(lambda: window.scan_panel.device.currentIndex() == 0
+        self.connect_pop4_badly(window)
+        wait_until(lambda: not window.scan_panel.pop4
                    and window.scan_panel.new_scan_button.isEnabled())
         self.assertIn("Could not open the POP 4: OSError: POP 4: no 640x2560 capture node",
                       window.viewport.toast.text())
@@ -929,13 +999,70 @@ class Pop4Tests(WindowTestCase):
     def test_going_back_to_the_mock_or_closing_lets_it_go(self):
         window = self.open_window()
         self.connect_pop4(window)
-        window.scan_panel.device.setCurrentIndex(0)
+        window.scan_panel.device.setCurrentIndex(
+            window.scan_panel.device.findData("mock"))
         wait_until(lambda: self.pop4.closed and not window._pop4)
         second = FakePop4()
         self.pop4 = second
         self.connect_pop4(window)
         window.close()
         self.assertTrue(second.closed)
+
+
+class ShippedTests(unittest.TestCase):
+    """The window as the launcher starts it: the POP 4 and nothing else.
+
+    A scan of the stand-in camera is a scan of nothing, so it is not offered
+    unless the app is started with --mock."""
+
+    def open_window(self, present=True) -> app.MainWindow:
+        self.pop4 = FakePop4()
+        self.present = present
+        window = app.MainWindow(open_pop4=lambda: self.pop4,
+                                pop4_present=lambda: self.present)
+        self.addCleanup(window.close)
+        window.show()
+        QTest.qWait(20)
+        return window
+
+    def test_the_pop4_is_the_only_scanner_listed(self):
+        window = self.open_window()
+        self.assertEqual(items(window.scan_panel.device), ["Revopoint POP 4 (USB)"])
+        self.assertTrue(window.scan_panel.pop4)
+
+    def test_with_no_scanner_it_says_so_and_will_not_scan(self):
+        window = self.open_window(present=False)
+        self.assertIn("No scanner", window._connection.text())
+        self.assertEqual(window.scan_panel.connection.text(), "No scanner")
+        self.assertFalse(window.scan_panel.connection_ok)
+        self.assertFalse(window.scan_panel.new_scan_button.isEnabled())
+
+    def test_it_opens_a_scanner_that_is_on_the_bus_without_being_asked(self):
+        window = self.open_window()
+        for _ in range(2):  # the second look, which is what opens it
+            window._check_pop4_present()
+        wait_until(lambda: window._pop4 and window.scan_panel.new_scan_button.isEnabled())
+        self.assertIn("Revopoint POP 4 TEST0001 connected", window._connection.text())
+
+    def test_a_replug_reconnects_however_often_it_has_failed_before(self):
+        window = self.open_window(present=False)
+        window._reconnects = window.MAX_RECONNECTS  # every try used up
+        for _ in range(window.ABSENT_LOOKS + 1):
+            window._check_pop4_present()
+        self.assertEqual(window._reconnects, 0)  # off the bus, so a fresh set
+        self.present = True
+        for _ in range(2):
+            window._check_pop4_present()
+        wait_until(lambda: window._pop4)
+
+    def test_a_scanner_that_will_not_open_leaves_the_window_waiting(self):
+        self.pop4 = FakePop4()
+        window = self.open_window()
+        self.pop4 = OSError("POP 4: no 640x2560 capture node")
+        for _ in range(2):
+            window._check_pop4_present()
+        wait_until(lambda: "disconnected" in window._connection.text())
+        self.assertFalse(window.scan_panel.new_scan_button.isEnabled())
 
 
 class FusionTests(WindowTestCase):

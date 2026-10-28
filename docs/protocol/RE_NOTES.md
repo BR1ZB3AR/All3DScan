@@ -6,6 +6,112 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## A narrower depth search finds more surface (2026-10-28)
+
+**Observed.** The decoder searches the working distance it is given, and
+narrowing that search raises the points in a frame. One scene, one exposure
+(6000 us), each range held for 3 settling frames then 8 measured, with the
+preset's range repeated at the end to rule out drift:
+
+| range | 250–500 | 250–420 | 270–400 | 290–370 | 250–500 again |
+|---|---|---|---|---|---|
+| points a frame | 4,161 | 4,724 | 5,172 | **5,336** | 4,106 |
+
+Widening it does the opposite, measured on the same scene the same way:
+
+| range | 250–500 | 200–600 | 150–800 | 250–1000 | 100–1200 |
+|---|---|---|---|---|---|
+| points a frame | **4,428** | 4,080 | 3,533 | 2,068 | 3,138 |
+
+**Derived.** This is a trade, not a free gain: whatever falls outside the
+band is discarded. It pays when the object stands at one distance and costs
+when the scene fills the whole working distance.
+
+The Auto button now measures where the points are once the exposure is
+settled, keeps the 2nd–98th percentile band with a quarter of its width as
+room on each side, and writes it only when that is really narrower than the
+preset's range (`ScanWorker._narrow_range`). On a real scene it chose
+250–444 mm and the scan went from 95,943 points to 176,998.
+
+**Not established:** why a narrower search yields more. The decoder is the
+Qt app's CUDA stereo matcher; a smaller disparity range plausibly means fewer
+wrong matches surviving its confidence test, but that has not been measured.
+
+## Exposure is capped by the vendor's own presets (2026-10-28)
+
+**Observed.** `resources/param_pop4.json` carries exposures of 60, 200, 800,
+1400, 3000, 4600, 5100 and 5400 us. The backend already allows 6000, above
+every value the vendor app uses, so there is no vendor-sourced ground for
+raising it further and the cap is not the lever it looked like.
+
+## The fused model is furrier than the frames, but its surface is not (2026-10-28)
+
+**Observed.** Local surface thickness — the smallest principal spread of the
+points within 4 mm, median over 4,000 samples — measured on real data over
+the same box, so the same surface in both:
+
+| | single frame | fused model |
+|---|---|---|
+| thickness | 0.44–0.48 mm | 1.18–1.20 mm |
+
+Consistent across four independent frames: the model is 2.5–2.7x furrier
+than the frames it is built from. The voxel thinning already averages each
+cell, so this is pose error, roughly 1 mm a frame.
+
+**Observed, and it rules out the obvious fix.** Pulling each point onto the
+plane of its neighbours ("snapping") thins the cloud to 0.477 mm, matching a
+single frame. It is still wrong: measured against the single frames, which
+it cannot have influenced, the model moves **away** from them, and the real
+curvature halves.
+
+| | as fused | snapped 1x | snapped 2x |
+|---|---|---|---|
+| thickness | 1.177 mm | 0.844 mm | 0.477 mm |
+| distance from an independent frame | **0.359 mm** | 0.524 mm | 0.629 mm |
+| median bend, per metre | **106** | 65.5 | 52.2 |
+
+So the thinning was flattening the shape, not removing noise. Not adopted.
+
+**Derived.** The model's *surface* is already better than a single frame:
+independent frames sit 0.359 mm from it, against 0.467 mm of thickness
+within a frame. The furriness is the scanner's own per-point noise stacked
+over many looks, and the principled place to average it is along the view
+ray — which is what the TSDF reconstruction does. Meshing is the fix; moving
+points is not.
+
+## A scanner held still kept almost no views to mesh from (2026-10-28)
+
+**Observed.** The fusion kept a depth view only when the scanner had moved
+8 mm or turned 6 degrees. Held near still, a whole real scan of 142 frames
+kept **three** views, and the surface built from them was 42 triangles.
+
+`KEYFRAME_EVERY` (4) in `engine_rust/src/fusion.rs` now keeps one view every
+few merged frames however still the scanner is held. On real scans of the
+same scene: 3 views and 42 triangles before, 47–80 views and 8,142–30,532
+triangles after.
+
+## Flatness, and why the bow figure is not evidence (2026-10-28)
+
+**Unresolved.** A flat surface appeared to come back bowed, first measured at
+-3.861 mm per 100 mm. It does not survive repetition. Four single frames of
+one unchanged scene gave, for the same fitted patch:
+
+| | frame 1 | frame 2 | frame 3 | frame 4 |
+|---|---|---|---|---|
+| straight slope, mm/100 mm | -0.71 | -0.69 | -1.50 | -0.94 |
+| quadratic, mm/100 mm | -3.8 | -25.1 | +56.1 | +107.5 |
+
+The flat patches the scene offers span only about 20 mm of radius, and they
+sit 65–110 mm off the optical axis, so fitting a curve in radius and reading
+it at 100 mm is extrapolation by a factor of five. The spread above is that
+extrapolation, not a property of the lens.
+
+**What would settle it:** a flat surface filling the field of view, close
+enough that the patch spans radius from near zero to the edge. Until then
+the lens and rectification model is neither accused nor cleared. Single
+frames do fit a plane to 0.52–0.62 mm RMS, so whatever the bow is, it is
+small against that over the patches measured.
+
 ## Two exposure writes in a row stop the stream (2026-10-28)
 
 **Observed.** Setting the depth exposure twice with no frames between leaves

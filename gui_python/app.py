@@ -105,6 +105,9 @@ class ScanWorker(QObject):
     EXPOSURE_GAP_FRAMES = 6
 
     def __init__(self, sensor, open_pop4) -> None:
+        """sensor is what to scan with until a POP 4 is opened, and None when
+        there is nothing: the window waits for the scanner rather than
+        offering a scan of made-up depth."""
         super().__init__()
         self._mock = self._sensor = sensor
         self._open_pop4 = open_pop4
@@ -112,6 +115,9 @@ class ScanWorker(QObject):
 
     @pyqtSlot()
     def capture(self) -> None:
+        if self._sensor is None:
+            self.failed.emit("there is no scanner to capture from")
+            return
         start = time.perf_counter()
         try:
             frame = self._sensor.capture_frame()
@@ -156,6 +162,8 @@ class ScanWorker(QObject):
 
     @pyqtSlot()
     def use_mock(self) -> None:
+        if self._mock is None:
+            return
         self.close()
         self._sensor = self._mock
         self.sensor_changed.emit({"kind": "mock",
@@ -187,13 +195,22 @@ class ScanWorker(QObject):
         self._sensor.set_exposure(microseconds)
         self._since_exposure = 0
 
+    # How the working distance is narrowed onto the object once the exposure
+    # is settled. The decoder searches the range it is given, and a narrower
+    # search finds more: measured on a POP 4 (2026-10-28), the same scene gave
+    # 4,161 points a frame over 250-500 mm, 5,172 over 270-400 and 5,336 over
+    # 290-370, with the wide range repeated afterwards to rule out drift. So
+    # the band the object occupies is found and kept, with room around it.
+    RANGE_BAND = (2.0, 98.0)  # the depth percentiles the object is taken to fill
+    RANGE_MARGIN = 0.25  # of the band's width, left on each side
+    RANGE_LEAST_MM = 60.0  # ...but never a slab thinner than this
     # Exposures tried, in microseconds, within the range the backend takes.
     EXPOSURES = (1000, 2000, 3500, 5000, 6000)
     SETTLE_FRAMES = 4  # the sensor takes a few frames to follow a change
     MEASURE_FRAMES = 8  # per-frame yield is noisy, so judge on several
 
-    @pyqtSlot()
-    def tune_exposure(self) -> None:
+    @pyqtSlot(tuple)
+    def tune_exposure(self, whole_range: tuple) -> None:
         """Tries each exposure and keeps the one that sees most of the
         object. Measured on a real POP 4: the points in a frame varied three
         to one across this range, so the default is often far from the best.
@@ -234,7 +251,44 @@ class ScanWorker(QObject):
         except BaseException as exc:
             self.exposure_tuned.emit({"error": describe(exc), "tried": tried})
             return
-        self.exposure_tuned.emit({"exposure_us": best, "tried": tried, "trouble": trouble})
+        self.exposure_tuned.emit({"exposure_us": best, "tried": tried, "trouble": trouble,
+                                  "range_mm": self._narrow_range(whole_range)})
+
+    def _narrow_range(self, whole: tuple[float, float]) -> tuple[float, float] | None:
+        """Narrows the depth search onto the band the object fills.
+
+        The decoder is told where to look, and looking over a narrower band
+        finds more of the surface. That is a trade, not a free gain: whatever
+        falls outside the band is lost. So the band is taken from where the
+        points actually are, given room on each side, and only written when
+        it is really narrower than the preset's. An object standing at one
+        distance gets a tighter search; a scene spread over the whole working
+        distance is left alone. None when nothing was changed."""
+        near, far = whole
+        seen = []
+        try:
+            for _ in range(self.MEASURE_FRAMES):
+                frame = self._sensor.capture_frame(timeout_ms=3000)
+                self._since_exposure += 1
+                if frame is not None and len(frame.points):
+                    seen.append(np.asarray(frame.points)[:, 2])
+        except BaseException:
+            return None
+        if not seen:
+            return None
+        depths = np.concatenate(seen)
+        low, high = np.percentile(depths, self.RANGE_BAND)
+        room = max((high - low) * self.RANGE_MARGIN, (self.RANGE_LEAST_MM - (high - low)) / 2)
+        low, high = max(near, low - room), min(far, high + room)
+        if not high - low >= self.RANGE_LEAST_MM / 2:
+            return None  # too thin a slab to scan in
+        if high - low >= (far - near) * 0.95:
+            return None  # the points fill the whole range; nothing to narrow
+        try:
+            self._sensor.set_depth_range(float(low), float(high))
+        except BaseException:
+            return None
+        return float(low), float(high)
 
     def close(self) -> None:
         """Lets the POP 4 go, if it is in use. Also called on the GUI thread
@@ -359,7 +413,7 @@ class MainWindow(QMainWindow):
     surface_requested = pyqtSignal(object, tuple, float)  # the model, intrinsics, voxel
     fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
     fusion_stop_requested = pyqtSignal()
-    tune_exposure_requested = pyqtSignal()
+    tune_exposure_requested = pyqtSignal(tuple)  # the preset's working distance
     pop4_requested = pyqtSignal()
     mock_requested = pyqtSignal()
     control_requested = pyqtSignal(str, tuple)  # a POP 4 method and its arguments
@@ -409,14 +463,18 @@ class MainWindow(QMainWindow):
     FLASH_MS = 500
 
     def __init__(self, sensor=None, open_pop4=None, pop4_present=None) -> None:
-        """sensor is the mock to scan with until a POP 4 is picked;
-        open_pop4() opens a POP 4 and pop4_present() says if one is plugged
-        in (engine.Pop4Sensor and engine.pop4_present unless given)."""
+        """The POP 4 is the scanner: the window opens it as soon as one is on
+        the bus, and waits for it when there is none.
+
+        sensor is a stand-in to scan with instead, for development and the
+        tests; passing one adds it to the scanner list. open_pop4() opens a
+        POP 4 and pop4_present() says if one is plugged in (engine.Pop4Sensor
+        and engine.pop4_present unless given)."""
         super().__init__()
         self.setWindowTitle("All3DScan")
         self.resize(1440, 900)
         self.setMinimumSize(1100, 680)
-        self.sensor = sensor if sensor is not None else engine.MockDepthSensor(640, 480, seed=0)
+        self.sensor = sensor
 
         self.camera_panel = CameraPanel()
         self.model_panel = ModelPanel()
@@ -425,7 +483,7 @@ class MainWindow(QMainWindow):
         self.left.addWidget(self.model_panel)
         self.left.setMinimumWidth(260)
         self.viewport = Viewport()
-        self.scan_panel = ScanPanel()
+        self.scan_panel = ScanPanel(mock=self.sensor is not None)
         self.scan_panel.setMinimumWidth(270)
         for side in (self.left, self.scan_panel):
             side.setObjectName("sidePanel")
@@ -559,6 +617,10 @@ class MainWindow(QMainWindow):
         self._flash_on = False
         self._flash = QTimer(self)
         self._flash.timeout.connect(self._flash_lights)
+        # Nothing to scan with until a scanner is opened, so no scan may
+        # start. After the flash timer: this reaches _on_scan_state, which
+        # asks whether the lights should be flashing.
+        panel.set_ready(self.sensor is not None)
         self._check_pop4_present()
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
@@ -1189,10 +1251,15 @@ class MainWindow(QMainWindow):
         # for a second look before opening it.
         self._present_ticks = self._present_ticks + 1 if present else 0
         self._absent_ticks = 0 if present else self._absent_ticks + 1
+        if self._absent_ticks == self.ABSENT_LOOKS:
+            # Off the bus long enough to count as unplugged. Whenever it comes
+            # back it gets a fresh set of tries, so a replug always reconnects
+            # however many times it has been tried before.
+            self._reconnects = 0
         wanted = self.scan_panel.pop4 and not self._pop4 and not self._connecting
-        if wanted and self._present_ticks >= 2 and 0 < self._reconnects < self.MAX_RECONNECTS:
+        if wanted and self._present_ticks >= 2 and self._reconnects < self.MAX_RECONNECTS:
             self._reconnects += 1
-            print(f"reconnecting to the POP 4 (try {self._reconnects} of "
+            print(f"opening the POP 4 (try {self._reconnects} of "
                   f"{self.MAX_RECONNECTS})", flush=True)
             self._connect_pop4()
 
@@ -1247,11 +1314,17 @@ class MainWindow(QMainWindow):
         if 0 < self._reconnects < self.MAX_RECONNECTS:
             # Lost mid-session and not back yet; _check_pop4_present retries.
             self._show_waiting(reason)
-            self.scan_panel.set_ready(True)
+            self.scan_panel.set_ready(self.sensor is not None)
             return
         self.viewport.show_toast(f"Could not open the POP 4: {reason}", 8000)
+        if self.sensor is None:
+            # The POP 4 is the only scanner there is. Wait for it rather than
+            # leaving a window that looks ready to scan nothing.
+            self._show_waiting(reason)
+            return
         self.viewport.show_warning("")
-        self.scan_panel.device.setCurrentIndex(0)  # back to the mock sensor
+        self.scan_panel.device.setCurrentIndex(
+            self.scan_panel.device.findData("mock"))  # back to the stand-in
 
     def _on_sensor_lost(self, reason: str) -> None:
         """The scanner went away mid-session. Say so, rather than leaving a
@@ -1267,6 +1340,7 @@ class MainWindow(QMainWindow):
         self.camera_panel.set_pop4(False)
         print(f"the POP 4 disconnected: {reason}", file=sys.stderr, flush=True)
         self.scan_panel.cancel()  # a scan cannot go on without the scanner
+        self.scan_panel.set_ready(self.sensor is not None)
         self._show_waiting(reason)
 
     def _show_waiting(self, reason: str) -> None:
@@ -1279,6 +1353,11 @@ class MainWindow(QMainWindow):
             f"and plug it in again if it does not.")
 
     def _show_connection(self, pop4: bool, serial: str = "") -> None:
+        if not pop4 and self.sensor is None:
+            self._connection.setText('<span style="color:#e0a83e">●</span> '
+                                     "No scanner — plug in a POP 4")
+            self.scan_panel.set_connection("No scanner", ok=False)
+            return
         name = f"Revopoint POP 4 {serial}".rstrip() if pop4 else "Mock depth sensor"
         self._connection.setText(f'<span style="color:#5bbf5b">●</span> {name} connected')
         self.scan_panel.set_connection("Connected")
@@ -1314,8 +1393,8 @@ class MainWindow(QMainWindow):
         self.camera_panel.exposure_box.setEnabled(False)
         tries = len(ScanWorker.EXPOSURES)
         self.viewport.show_toast(f"Trying {tries} exposures to see which shows most of the "
-                                 f"object…", 60_000)
-        self.tune_exposure_requested.emit()
+                                 f"object, then narrowing onto where it is…", 60_000)
+        self.tune_exposure_requested.emit(tuple(map(float, self.scan_panel.preset.scale_mm)))
 
     def _on_exposure_tuned(self, result: dict) -> None:
         self._tuning = False
@@ -1332,8 +1411,14 @@ class MainWindow(QMainWindow):
         chosen = result["exposure_us"]
         self.camera_panel.show_exposure(chosen)
         print(f"auto exposure: kept {chosen} us (points a frame — {tried})", flush=True)
-        self.viewport.show_toast(f"Depth exposure {chosen / 1000:.1f} ms, which saw the most "
-                                 f"of the object", 5000)
+        told = f"Depth exposure {chosen / 1000:.1f} ms, which saw the most of the object"
+        band = result.get("range_mm")
+        if band:
+            self.viewport.gauge.set_bands(self.scan_panel.preset.band_edges_mm, band)
+            print(f"auto range: looking {band[0]:.0f}–{band[1]:.0f} mm, where the object is",
+                  flush=True)
+            told += f"; looking {band[0]:.0f}–{band[1]:.0f} mm, where the object is"
+        self.viewport.show_toast(told, 5000)
 
     def _on_light_toggled(self, light: str, on: bool) -> None:
         """The white lights flash while a scan runs, so the button arms them
@@ -1489,6 +1574,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--smoke-test", action="store_true",
                         help="scan 30 frames, complete the scan, fit a plane and a cylinder, "
                              "export them to STEP, then exit")
+    parser.add_argument("--mock", action="store_true",
+                        help="also offer a stand-in depth camera, for working on the app "
+                             "without a scanner. What it produces is not a scan of anything.")
     args, qt_args = parser.parse_known_args(argv)
 
     qt_argv = [sys.argv[0], *qt_args]
@@ -1508,7 +1596,9 @@ def main(argv: list[str] | None = None) -> int:
             app.exit(1)
 
     sys.excepthook = report_unhandled
-    window = MainWindow()
+    # The smoke test runs with no one watching, so it scans the stand-in.
+    mock = engine.MockDepthSensor(640, 480, seed=0) if args.mock or args.smoke_test else None
+    window = MainWindow(mock)
     window.show()
     if args.smoke_test:
         run_smoke_test(app, window)
