@@ -326,3 +326,35 @@ QLabel#warning {
     padding: 10px 20px;
     max-width: 520px;
 }
+
+QMenuBar {
+    background-color: #1e1f22;
+    color: #dfe1e5;
+    border-bottom: 1px solid #141517;
+    padding: 2px 4px;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 10px;
+    border-radius: 4px;
+}
+
+QMenuBar::item:selected {
+    background-color: #34363a;
+}
+
+QMenuBar::item:pressed {
+    background-color: #e5484d;
+    color: #ffffff;
+}
+
+QMenu::item:disabled {
+    color: #5f6369;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #3a3d42;
+    margin: 4px 8px;
+}

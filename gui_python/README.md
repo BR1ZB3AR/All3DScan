@@ -4,7 +4,8 @@ The dark-theme PyQt6 windows live here. They import the compiled engine as
 `all3dscan_engine` and make engine calls from background QThreads, so the
 window stays responsive while a scan is processed.
 
-- `app.py` — the main window, laid out like Revo Scan 6: a ribbon of tools,
+- `app.py` — the main window, laid out like Revo Scan 6: a menu bar (File,
+  Edit, Help, About) over a ribbon of tools,
   the camera parameters and live depth and colour feeds (or, after a scan,
   the models and the primitives fitted to them) on the left, the 3D viewport
   with the scanning-distance gauge in the middle, and the scan controls and
@@ -102,6 +103,10 @@ ALL3DSCAN_POP4_TESTS=1 .venv/bin/python -m unittest gui_python/tests/test_pop4_h
 ALL3DSCAN_POP4_SLOW=1 ...   # also the blue laser, which reboots the scanner
 cd engine_rust && cargo test --release -- --ignored pop4   # the engine's own
 ```
+
+The menu bar offers the ribbon's own actions, so the two never disagree
+about what is available, plus what has no button: Quit (Ctrl+Q), the
+shortcuts (F1), scanning tips, and what the app is built from.
 
 In the main window, Space starts, pauses and resumes a scan, Esc cancels it
 and Shift+M toggles fullscreen. In the 3D view, drag to rotate, Shift+drag

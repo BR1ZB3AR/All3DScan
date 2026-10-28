@@ -25,13 +25,23 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    PYQT_VERSION_STR,
+    QT_VERSION_STR,
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QSplitter,
     QStackedWidget,
     QToolBar,
@@ -385,6 +395,7 @@ class MainWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.setCentralWidget(self.splitter)
         self._build_ribbon()
+        self._build_menus()
 
         # Labels rather than showMessage(), which Qt draws over the bar's widgets.
         self._connection = QLabel()
@@ -566,6 +577,9 @@ class MainWindow(QMainWindow):
             lambda on: self.showFullScreen() if on else self.showNormal())
         self.addAction(self.fullscreen_action)  # so Shift+M works anywhere in the window
 
+        self.point_cloud_actions = point_cloud
+        self.mesh_actions = mesh
+        self.rea_actions = rea_tools
         self.ribbon_groups = {}
         for caption, actions in (
             ("Scan", [self.feature_scan, self.marker_scan]),
@@ -579,6 +593,108 @@ class MainWindow(QMainWindow):
         # Fusion works during a scan, so it is not one of these.
         self.needs_a_model = [a for a in point_cloud if a is not self.fusion_action]
         self.needs_a_model += mesh + rea_tools + [self.export_action]
+
+    def _build_menus(self) -> None:
+        """The menu bar above the ribbon. It offers the ribbon's own actions,
+        so the two never disagree about what is available, plus the things
+        that have no button: quitting, the shortcuts and what this is."""
+        panel = self.scan_panel
+
+        def item(text: str, slot, shortcut: str = "", tip: str = "") -> QAction:
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            if tip:
+                action.setStatusTip(tip)
+            return action
+
+        bar = self.menuBar()
+        file_menu = bar.addMenu("&File")
+        # The scan controls are the panel's buttons; Space and Esc already
+        # reach them, so these carry no shortcut of their own.
+        self.new_scan_item = item("&New scan", panel.new_scan, tip="Space")
+        self.complete_item = item("&Complete scan", panel.complete)
+        self.cancel_item = item("C&ancel scan", panel.cancel, tip="Esc")
+        for action in (self.new_scan_item, self.complete_item, self.cancel_item):
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.export_step_action)
+        file_menu.addAction(self.export_action)
+        file_menu.addSeparator()
+        file_menu.addAction(item("&Quit", self.close, "Ctrl+Q"))
+        file_menu.aboutToShow.connect(self._update_menus)
+
+        edit_menu = bar.addMenu("&Edit")
+        edit_menu.addAction(self.fusion_action)
+        edit_menu.addSeparator()
+        for action in self.point_cloud_actions:
+            if action is not self.fusion_action:
+                edit_menu.addAction(action)
+        edit_menu.addSeparator()
+        for action in self.mesh_actions:
+            edit_menu.addAction(action)
+        edit_menu.addSeparator()
+        for action in self.rea_actions:
+            # Exporting is an output, and File already offers it.
+            if action is not self.export_step_action:
+                edit_menu.addAction(action)
+
+        help_menu = bar.addMenu("&Help")
+        help_menu.addAction(item("&Shortcuts…", self._show_shortcuts, "F1"))
+        help_menu.addAction(item("Scanning &tips…", self._show_tips))
+
+        # A heading of its own rather than a menu, since it holds one thing.
+        bar.addAction(item("&About", self._show_about))
+
+    def _update_menus(self) -> None:
+        """Greys out the scan controls that would do nothing, as the panel's
+        own buttons are."""
+        idle = self.scan_panel.state is ScanState.IDLE
+        self.new_scan_item.setEnabled(self.scan_panel.new_scan_button.isEnabled())
+        self.complete_item.setEnabled(not idle)
+        self.cancel_item.setEnabled(not idle)
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(self, "Shortcuts", (
+            "<table cellpadding=4>"
+            "<tr><td><b>Space</b></td><td>Start a scan, or pause and resume it</td></tr>"
+            "<tr><td><b>Esc</b></td><td>Cancel the scan</td></tr>"
+            "<tr><td><b>Shift+M</b></td><td>Fullscreen</td></tr>"
+            "<tr><td><b>Ctrl+Q</b></td><td>Quit</td></tr>"
+            "<tr><td colspan=2>&nbsp;</td></tr>"
+            "<tr><td><b>Drag</b></td><td>Turn the view</td></tr>"
+            "<tr><td><b>Shift+drag</b></td><td>Move it</td></tr>"
+            "<tr><td><b>Wheel</b></td><td>Zoom</td></tr>"
+            "<tr><td><b>Double-click</b></td><td>Frame the cloud again</td></tr>"
+            "<tr><td><b>Delete</b></td><td>Remove the chosen primitive</td></tr>"
+            "</table>"))
+
+    def _show_tips(self) -> None:
+        near, far = self.scan_panel.preset.scale_mm
+        QMessageBox.information(self, "Scanning tips", (
+            f"<p>Keep the object {near}–{far} mm away — the band this scan setting "
+            f"looks in — with the marker on the distance gauge in Excellent.</p>"
+            "<p>The scanner reads a matte, light-coloured surface best. Black, shiny "
+            "and see-through surfaces return little of its pattern, and mesh or hair "
+            "give it nothing to match.</p>"
+            "<p><b>Auto</b>, beside the depth exposure, tries a few exposures and "
+            "keeps the one that sees most of the object. It is worth doing whenever "
+            "the lighting or the object changes.</p>"
+            "<p>Move slowly: each frame is aligned onto the last, and the Tracking "
+            "count in the status bar shows how many are landing.</p>"))
+
+    def _show_about(self) -> None:
+        backend = "the mock depth camera"
+        if self._pop4:
+            backend = self.scan_panel.device.currentText()
+        QMessageBox.about(self, "About All3DScan", (
+            f"<h3>All3DScan</h3>"
+            f"<p>3D scanning on Linux for the Revopoint POP 4.</p>"
+            f"<p>Engine {engine.__version__} · PyQt {PYQT_VERSION_STR} · "
+            f"Qt {QT_VERSION_STR}<br>Scanning with {backend}.</p>"
+            f"<p>A C++ sensor layer and the Qt app's depth decoder, a Rust engine "
+            f"for the point clouds and the fits, and this PyQt6 window.</p>"))
 
     # Scanning: each frame is asked for when the last one has been shown.
 

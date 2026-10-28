@@ -212,6 +212,81 @@ class LayoutTests(WindowTestCase):
         self.assertTrue(all(w.isEnabled() for w in pop4_only))
 
 
+class MenuTests(WindowTestCase):
+    """The menu bar above the ribbon."""
+
+    def menus(self, window) -> dict[str, list[str]]:
+        bar = window.menuBar()
+        found = {}
+        for action in bar.actions():
+            menu = action.menu()
+            found[action.text()] = ([a.text() for a in menu.actions()] if menu else None)
+        return found
+
+    def test_the_menu_bar_holds_file_edit_help_and_about(self):
+        window = self.open_window()
+        menus = self.menus(window)
+        self.assertEqual(list(menus), ["&File", "&Edit", "&Help", "&About"])
+        self.assertIsNone(menus["&About"])  # one thing to do, so no submenu
+        self.assertIn("&Quit", menus["&File"])
+        self.assertIn("Export STEP", menus["&File"])
+        self.assertIn("Fusion", menus["&Edit"])
+        self.assertIn("Fit plane", menus["&Edit"])
+        self.assertIn("&Shortcuts…", menus["&Help"])
+        # Exporting belongs to File; Edit does not repeat it.
+        self.assertNotIn("Export STEP", menus["&Edit"])
+
+    def test_the_menu_offers_the_ribbon_s_own_actions(self):
+        # The same QAction in both places, so they cannot disagree about
+        # what is available.
+        window = self.open_window()
+        edit = {a.text(): a for a in window.menuBar().actions()[1].menu().actions()}
+        self.assertIs(edit["Fit plane"], window.fit_plane_action)
+        self.assertIs(edit["Fusion"], window.fusion_action)
+        self.assertFalse(edit["Fit plane"].isEnabled())  # no model yet
+
+    def test_the_scan_items_follow_the_scan(self):
+        window = self.open_window()
+        window._update_menus()
+        self.assertTrue(window.new_scan_item.isEnabled())
+        self.assertFalse(window.complete_item.isEnabled())
+        window.scan_panel.new_scan()
+        window._update_menus()
+        self.assertFalse(window.new_scan_item.isEnabled())
+        self.assertTrue(window.complete_item.isEnabled())
+        self.assertTrue(window.cancel_item.isEnabled())
+
+    def test_new_scan_from_the_menu_starts_one(self):
+        window = self.open_window()
+        window.new_scan_item.trigger()
+        self.assertIs(window.scan_panel.state, ScanState.SCANNING)
+        window.complete_item.trigger()
+        self.assertIs(window.scan_panel.state, ScanState.IDLE)
+
+    def test_quit_and_shortcuts_carry_their_keys(self):
+        window = self.open_window()
+        keys = {a.text(): a.shortcut().toString()
+                for menu in (0, 2)
+                for a in window.menuBar().actions()[menu].menu().actions()}
+        self.assertEqual(keys["&Quit"], "Ctrl+Q")
+        self.assertEqual(keys["&Shortcuts…"], "F1")
+
+    def test_the_dialogs_open_and_say_something(self):
+        window = self.open_window()
+        shown = []
+        with mock.patch.object(app.QMessageBox, "information",
+                               side_effect=lambda *a: shown.append(a[2])), \
+             mock.patch.object(app.QMessageBox, "about",
+                               side_effect=lambda *a: shown.append(a[2])):
+            window._show_shortcuts()
+            window._show_tips()
+            window._show_about()
+        self.assertIn("Space", shown[0])
+        self.assertIn("250–500 mm", shown[1])  # the preset's band
+        self.assertIn("All3DScan", shown[2])
+        self.assertIn("mock depth camera", shown[2])
+
+
 class PresetTests(WindowTestCase):
     def test_presets_come_from_the_vendor_file(self):
         presets = load_presets()
