@@ -127,12 +127,14 @@ class CameraPanel(QWidget):
         self.projector_button.setToolTip(
             "The infrared projector that patterns the depth camera's view. Depth comes from\n"
             "a second speckle emitter that stays on, so switching this does not change it.")
-        self.fill_light_button = toggle("Fill light")
-        self.fill_light_button.setToolTip("The scanner's white lights, for the colour camera")
+        self.fill_light_button = toggle("Flash light")
+        self.fill_light_button.setToolTip(
+            "The scanner's white lights, for the colour camera.\n"
+            "They flash while a scan runs rather than staying on.")
         self.fill_light_level, fill_row = slider(0, 255, 255, str)
         form.addRow(self.projector_button)
         form.addRow(self.fill_light_button)
-        form.addRow("Fill level", fill_row)
+        form.addRow("Flash level", fill_row)
         self.projector_button.toggled.connect(
             lambda on: self._syncing or self.light_toggled.emit("projector", on))
         self.fill_light_button.toggled.connect(

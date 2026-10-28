@@ -208,7 +208,7 @@ class LayoutTests(WindowTestCase):
         window = self.open_window()
         camera, scan = window.camera_panel, window.scan_panel
         self.assertEqual([b.text() for b in (camera.projector_button, camera.fill_light_button)],
-                         ["Pattern projector", "Fill light"])
+                         ["Pattern projector", "Flash light"])
         self.assertEqual(items(scan.mode), ["Infrared", "Blue laser (visible)", "Infrared speckle"])
         pop4_only = (camera.lights, camera.exposure_box, scan.mode)
         self.assertFalse(any(w.isEnabled() for w in pop4_only))  # the mock has none of them
@@ -717,6 +717,47 @@ class Pop4Tests(WindowTestCase):
         wait_until(lambda: not window._tuning, timeout_s=60)
         self.assertEqual(self.pop4.exposure_us, best)  # the rest still decided it
         self.assertIn(f"{best / 1000:.1f} ms", window.viewport.toast.text())
+
+    def test_the_white_lights_flash_while_a_scan_runs(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        camera = window.camera_panel
+        self.assertEqual(camera.fill_light_button.text(), "Flash light")
+
+        # Armed while idle, the lights simply come on, so you can see them.
+        camera.fill_light_button.click()
+        self.assertFalse(window._flash.isActive())
+        wait_until(lambda: self.pop4.lights["fill light"][0])
+
+        before = len(self.pop4.calls)
+        window.scan_panel.new_scan()
+        self.assertTrue(window._flash.isActive())
+        wait_until(lambda: len([a for n, a in self.pop4.calls[before:]
+                                if n == "set_light" and a[0] == "fill light"]) >= 4,
+                   timeout_s=30)
+        flashes = [a[1] for n, a in self.pop4.calls[before:]
+                   if n == "set_light" and a[0] == "fill light"]
+        # On, off, on, off: not left sitting in one state.
+        self.assertEqual(flashes[:4], [True, False, True, False])
+
+    def test_the_lights_go_out_when_the_scan_stops(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.camera_panel.fill_light_button.click()
+        window.scan_panel.new_scan()
+        wait_until(lambda: window._flash_on, timeout_s=30)  # catch them lit
+        window.scan_panel.complete()
+        self.assertFalse(window._flash.isActive())
+        wait_until(lambda: not self.pop4.lights["fill light"][0])
+        self.assertFalse(window._flash_on)
+
+    def test_the_projector_still_switches_steadily(self):
+        # Only the white lights flash; the projector is a plain switch.
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.camera_panel.projector_button.click()
+        wait_until(lambda: ("set_light", ("projector", False)) in self.pop4.calls)
+        self.assertFalse(window._flash.isActive())
 
     def test_a_refused_control_says_so(self):
         window = self.open_window()

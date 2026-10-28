@@ -71,8 +71,10 @@ a minute and a half when the scanner has to be reset first, and the window
 says so while it waits. Then:
 
 - **Camera parameters** (left) drive the scanner's own hardware: the
-  pattern projector, the fill light and its brightness, and the depth
-  exposure. Each is sent as the control settles, on the capture thread.
+  pattern projector, the white lights and their brightness, and the depth
+  exposure. The white lights **flash** while a scan runs rather than
+  burning steadily; armed between scans they simply come on, so you can
+  see they work. Each is sent as the control settles, on the capture thread.
 - **Scan mode** (right) switches between infrared, the visible blue laser
   and infrared speckle. Going back to infrared reboots the scanner, which
   takes about 45 seconds; the app disables the scan controls until it is

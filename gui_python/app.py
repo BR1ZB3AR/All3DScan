@@ -383,6 +383,9 @@ class MainWindow(QMainWindow):
     # model itself, so a sparse scan is not stripped bare.
     SPECKLE_RADIUS_MM = 3.0
     SPECKLE_SHARE = 0.2
+    # How long the scanner's white lights stay on, and then off, while a
+    # scan runs. Slow enough that the commands do not crowd the captures.
+    FLASH_MS = 500
 
     def __init__(self, sensor=None, open_pop4=None, pop4_present=None) -> None:
         """sensor is the mock to scan with until a POP 4 is picked;
@@ -512,7 +515,7 @@ class MainWindow(QMainWindow):
         panel.device_changed.connect(self._on_device)
         panel.mode_changed.connect(self._on_mode_picked)
         camera = self.camera_panel
-        camera.light_toggled.connect(lambda light, on: self._control("set_light", light, on))
+        camera.light_toggled.connect(self._on_light_toggled)
         camera.light_level_changed.connect(
             lambda light, level: self._control("set_light_level", light, level))
         camera.exposure_changed.connect(lambda us: self._control("set_exposure", us))
@@ -525,6 +528,11 @@ class MainWindow(QMainWindow):
         self._presence = QTimer(self)
         self._presence.timeout.connect(self._check_pop4_present)
         self._presence.start(2000)
+
+        # The white lights flash while scanning rather than staying on.
+        self._flash_on = False
+        self._flash = QTimer(self)
+        self._flash.timeout.connect(self._flash_lights)
         self._check_pop4_present()
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
@@ -778,6 +786,7 @@ class MainWindow(QMainWindow):
             if state is ScanState.PAUSED:
                 self.viewport.show_toast("Paused. Press Space to resume.")
         self._update_rea_tools()
+        self._update_flashing()
 
     def _start_scan(self) -> None:
         self._fused = None
@@ -1216,6 +1225,24 @@ class MainWindow(QMainWindow):
         if self._pop4:
             self.control_requested.emit(name, args)
 
+    def _flash_lights(self) -> None:
+        """Turns the scanner's white lights on and off while a scan runs."""
+        self._flash_on = not self._flash_on
+        self._control("set_light", "fill light", self._flash_on)
+
+    def _update_flashing(self) -> None:
+        """The lights flash only while a scan is running with them chosen."""
+        wanted = (self._pop4 and self._state is ScanState.SCANNING
+                  and self.camera_panel.fill_light_button.isChecked())
+        if wanted and not self._flash.isActive():
+            self._flash_on = False
+            self._flash.start(self.FLASH_MS)
+        elif not wanted and self._flash.isActive():
+            self._flash.stop()
+            if self._flash_on:  # never leave them lit
+                self._flash_on = False
+                self._control("set_light", "fill light", False)
+
     def _tune_exposure(self) -> None:
         """Has the scanner try a few exposures and keep the best."""
         if not self._pop4 or self._tuning:
@@ -1244,6 +1271,15 @@ class MainWindow(QMainWindow):
         print(f"auto exposure: kept {chosen} us (points a frame — {tried})", flush=True)
         self.viewport.show_toast(f"Depth exposure {chosen / 1000:.1f} ms, which saw the most "
                                  f"of the object", 5000)
+
+    def _on_light_toggled(self, light: str, on: bool) -> None:
+        """The white lights flash while a scan runs, so the button arms them
+        rather than switching a steady light."""
+        if light == "fill light":
+            self._update_flashing()
+            if self._flash.isActive():
+                return
+        self._control("set_light", light, on)
 
     def _on_mode_picked(self, mode: str) -> None:
         if not self._pop4 or mode == self._scan_mode:
