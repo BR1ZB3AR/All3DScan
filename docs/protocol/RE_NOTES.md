@@ -6,6 +6,52 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Two exposure writes in a row stop the stream (2026-10-28)
+
+**Observed.** Setting the depth exposure twice with no frames between leaves
+the scanner on the USB bus and reporting no fault, but it then sends
+**nothing at all**: 0 of 6 frames came back afterwards. The same two writes
+with six frames between them were harmless, 6 of 6.
+
+It surfaced as an auto-exposure sweep that always failed on its first step:
+the window sends the preset's exposure as soon as it connects, and the sweep
+followed immediately. What the app saw was `V4L2 frame timeout`, then
+`POP4 not found while applying CS7 settings` once the scanner re-enumerated,
+which made it look like a disconnection rather than a stalled stream.
+
+`ScanWorker` now lets `EXPOSURE_GAP_FRAMES` (6) frames pass between one
+exposure write and the next, wherever the write comes from — the preset, the
+slider or the sweep.
+
+**Not established:** whether the register write (`0x911`), the CS7 settings
+block, or the pair of them is what stalls the sensor; only that spacing them
+avoids it. `setExposure` sends both.
+
+### Exposure is the largest lever measured on a real scene
+
+With a 3D-printed ring on a cutting mat at about 360 mm, points in a frame
+rose steadily with exposure, with no sign of a peak before the 6000 us the
+backend allows:
+
+| exposure | 1.0 ms | 2.0 ms | 3.5 ms | 5.0 ms | 6.0 ms |
+|---|---|---|---|---|---|
+| points a frame | 7,813 | 9,206 | 10,872 | 12,451 | **13,605** |
+
+An earlier sweep of the same scene measured 1.42% valid depth at 500 us
+against 4.67% at 6000. The preset's 3000 us is therefore well short for this
+scene, and the app's Auto button sweeps and keeps the best.
+
+**This supersedes nothing in the 2026-10-16 auto-exposure note**, which
+measured a continuous climb losing to a fixed exposure; a one-shot sweep of
+twelve frames per step is a different measurement and is what is shipped.
+
+### What a scan looks like once the exposure is right
+
+Through the window, on the same scene: **180 of 182 frames** placed on the
+model by the fusion, against 51 of 136 at the default exposure, 8.2% valid
+depth, and a 90k-point model that fitted a plane (0.75 mm RMS) and a
+cylinder (0.70 mm RMS) and exported them to STEP.
+
 ## Driving the scanner from the new app (2026-10-27)
 
 Measured while wiring the POP4 into the PyQt6 app (`gui_python/app.py`,

@@ -72,6 +72,7 @@ class FakePop4:
         self.exposure_us = 3000
         self.closed = False
         self.connected = True  # False once the scanner has unplugged
+        self.frames_taken = 0
 
     # How many points the scene shows at a given exposure; a flat scene by
     # default, so only the auto-exposure tests care.
@@ -84,6 +85,7 @@ class FakePop4:
         if self.missing:
             self.missing -= 1
             return None
+        self.frames_taken += 1
         frame = self._mock.capture_frame(voxel_mm)
         if self.points_for_exposure is not None:
             frame = Thinned(frame, self.points_for_exposure(self.exposure_us))
@@ -466,6 +468,18 @@ class Pop4Tests(WindowTestCase):
         tried = [args[0] for name, args in self.pop4.calls if name == "set_exposure"]
         self.assertEqual(tried[-len(sweep) - 1 : -1], sweep)
         self.assertEqual(tried[-1], best)
+
+    def test_exposure_writes_are_spaced_out(self):
+        # Two writes in a row stop a real POP 4 sending frames at all, so
+        # frames must pass between them.
+        window = self.open_window()
+        self.connect_pop4(window)
+        wait_until(lambda: ("set_exposure", (3000,)) in self.pop4.calls)
+        taken = self.pop4.frames_taken
+        window.camera_panel.exposure.setValue(4200)
+        wait_until(lambda: ("set_exposure", (4200,)) in self.pop4.calls, timeout_s=30)
+        self.assertGreaterEqual(self.pop4.frames_taken - taken,
+                                app.ScanWorker.EXPOSURE_GAP_FRAMES)
 
     def test_auto_exposure_reports_a_scanner_that_refuses_everything(self):
         window = self.open_window()

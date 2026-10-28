@@ -75,10 +75,17 @@ class ScanWorker(QObject):
     control_done = pyqtSignal(str, str)  # the control, and why it failed or ""
     exposure_tuned = pyqtSignal(dict)  # what each exposure saw, and the one kept
 
+    # Frames that must pass between one exposure write and the next.
+    # Measured on a POP 4 (2026-10-28): two writes back to back left the
+    # scanner on the bus but sent no frames at all afterwards, where the same
+    # two with six frames between them were harmless.
+    EXPOSURE_GAP_FRAMES = 6
+
     def __init__(self, sensor, open_pop4) -> None:
         super().__init__()
         self._mock = self._sensor = sensor
         self._open_pop4 = open_pop4
+        self._since_exposure = 0  # frames since the last exposure write
 
     @pyqtSlot()
     def capture(self) -> None:
@@ -97,6 +104,7 @@ class ScanWorker(QObject):
             else:
                 self.frame_missed.emit(self._sensor.last_error or "no frame came")
         else:
+            self._since_exposure += 1
             self.frame_ready.emit(frame, time.perf_counter() - start)
 
     def _gone(self) -> bool:
@@ -120,6 +128,7 @@ class ScanWorker(QObject):
             return
         self.close()
         self._sensor = pop4
+        self._since_exposure = 0
         self.sensor_changed.emit(settings)
 
     @pyqtSlot()
@@ -134,11 +143,25 @@ class ScanWorker(QObject):
         if self._sensor is self._mock:
             return
         try:
-            getattr(self._sensor, name)(*args)
+            if name == "set_exposure":
+                self._write_exposure(*args)
+            else:
+                getattr(self._sensor, name)(*args)
         except BaseException as exc:
             self.control_done.emit(name, describe(exc))
             return
         self.control_done.emit(name, "")
+
+    def _write_exposure(self, microseconds: int) -> None:
+        """Sets the exposure, after letting enough frames pass since the last
+        time it changed. Two writes in a row stop the scanner sending
+        anything, and it does not report the fault: the frames simply stop."""
+        while self._since_exposure < self.EXPOSURE_GAP_FRAMES:
+            if self._sensor.capture_frame(timeout_ms=3000) is None and self._gone():
+                return
+            self._since_exposure += 1
+        self._sensor.set_exposure(microseconds)
+        self._since_exposure = 0
 
     # Exposures tried, in microseconds, within the range the backend takes.
     EXPOSURES = (1000, 2000, 3500, 5000, 6000)
@@ -161,13 +184,16 @@ class ScanWorker(QObject):
             # re-enumerated, which connecting makes it do. Skip that step
             # rather than lose the sweep: the rest still say which is best.
             try:
-                self._sensor.set_exposure(microseconds)
+                self._write_exposure(microseconds)
                 for _ in range(self.SETTLE_FRAMES):
                     self._sensor.capture_frame(timeout_ms=3000)
-                seen = [len(frame.points)
-                        for frame in (self._sensor.capture_frame(timeout_ms=3000)
-                                      for _ in range(self.MEASURE_FRAMES))
-                        if frame is not None]
+                    self._since_exposure += 1
+                seen = []
+                for _ in range(self.MEASURE_FRAMES):
+                    frame = self._sensor.capture_frame(timeout_ms=3000)
+                    self._since_exposure += 1
+                    if frame is not None:
+                        seen.append(len(frame.points))
             except BaseException as exc:
                 trouble = describe(exc)
                 if self._gone():
@@ -180,7 +206,7 @@ class ScanWorker(QObject):
             return
         best = max(tried, key=lambda t: t[1])[0]
         try:
-            self._sensor.set_exposure(best)
+            self._write_exposure(best)
         except BaseException as exc:
             self.exposure_tuned.emit({"error": describe(exc), "tried": tried})
             return
