@@ -31,8 +31,18 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 # scan is finished, so the two states are told apart at a glance.
 SCAN_BLUE = (0.16, 0.42, 0.86)
 SCAN_GREEN = (0.24, 0.84, 0.33)
-BACKGROUND_TOP = (0.231, 0.239, 0.259)  # #3b3d42
-BACKGROUND_BOTTOM = (0.169, 0.173, 0.188)  # #2b2c30
+# The gradient behind a cloud. common.apply_theme() sets these, so the
+# viewport matches the window it sits in.
+BACKGROUND_TOP = (0.231, 0.239, 0.259)
+BACKGROUND_BOTTOM = (0.169, 0.173, 0.188)
+
+
+def set_background(top: tuple[float, float, float],
+                   bottom: tuple[float, float, float]) -> None:
+    """The gradient drawn behind the cloud, as the theme wants it. Views
+    already open redraw with it on their next paint."""
+    global BACKGROUND_TOP, BACKGROUND_BOTTOM
+    BACKGROUND_TOP, BACKGROUND_BOTTOM = top, bottom
 MAX_SPLAT_PX = 16.0  # the largest a splat is drawn, in logical pixels
 
 # PyOpenGL, loaded by load_gl() once a context is current.

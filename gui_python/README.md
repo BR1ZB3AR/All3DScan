@@ -26,7 +26,9 @@ backend as the legacy app (`src/protocol/RevopointPop4Protocol`).
 - `presets.py` — the vendor's POP 4 scan presets (accuracy, tracking, object
   type), which set the gauge's distance bands
 - `main.py` — a small window that captures from the mock sensor
-- `common.py` — the theme, icon and app id both windows share
+- `theme.py` — the colours, and the Dark and Light themes
+- `common.py` — the icon, app id and OpenGL setup both windows share, and
+  dressing the app in a theme
 - `assets/` — icons, stylesheets and other UI files
 
 ## Setting up
@@ -107,6 +109,15 @@ cd engine_rust && cargo test --release -- --ignored pop4   # the engine's own
 The menu bar offers the ribbon's own actions, so the two never disagree
 about what is available, plus what has no button: Quit (Ctrl+Q), the
 shortcuts (F1), scanning tips, and what the app is built from.
+
+**Theme** switches between Dark and Light, and the choice is remembered.
+There is one set of styling rules, `assets/dark.qss`, written in the dark
+theme's colours; a theme is a table saying what each of those colours
+becomes, so a second theme cannot drift away from the first the way a
+copied stylesheet would. `theme.py` names every colour by what it is for,
+and the window, the distance gauge and the 3D viewport's background all
+follow. The gauge's distance bands are left alone: red for too near and
+green for good say something, whatever the theme.
 
 In the main window, Space starts, pauses and resumes a scan, Esc cancels it
 and Shift+M toggles fullscreen. In the 3D view, drag to rotate, Shift+drag

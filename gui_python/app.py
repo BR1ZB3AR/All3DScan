@@ -49,7 +49,16 @@ from PyQt6.QtWidgets import (
 
 import all3dscan_engine as engine
 import rea_engine as rea
-from common import APP_ICON, APP_ID, apply_dark_theme, configure_opengl, warn_if_platform_differs
+import theme
+from common import (
+    APP_ICON,
+    APP_ID,
+    apply_theme,
+    configure_opengl,
+    current_theme,
+    remember_theme,
+    warn_if_platform_differs,
+)
 from panels import CameraPanel, ModelPanel, ScanModel, ScanPanel, ScanState, Viewport, tint
 from viewport3d import image_pixels
 from widgets import RibbonGroup
@@ -640,12 +649,36 @@ class MainWindow(QMainWindow):
             if action is not self.export_step_action:
                 edit_menu.addAction(action)
 
+        theme_menu = bar.addMenu("&Theme")
+        self.theme_actions = QActionGroup(self)
+        self.theme_actions.setExclusive(True)
+        for name in theme.THEMES:
+            choice = QAction(name, self, checkable=True)
+            choice.setChecked(name == current_theme())
+            choice.triggered.connect(lambda _checked, name=name: self.set_theme(name))
+            self.theme_actions.addAction(choice)
+            theme_menu.addAction(choice)
+
         help_menu = bar.addMenu("&Help")
         help_menu.addAction(item("&Shortcuts…", self._show_shortcuts, "F1"))
         help_menu.addAction(item("Scanning &tips…", self._show_tips))
 
         # A heading of its own rather than a menu, since it holds one thing.
         bar.addAction(item("&About", self._show_about))
+
+    def set_theme(self, name: str) -> None:
+        """Dresses the window in a theme and remembers it for next time."""
+        chosen = theme.THEMES.get(name)
+        if chosen is None:
+            return
+        apply_theme(QApplication.instance(), chosen)
+        remember_theme(name)
+        for action in self.theme_actions.actions():
+            action.setChecked(action.text() == name)
+        # The stylesheet reaches most things on its own; these two draw
+        # themselves and have to be asked.
+        self.viewport.view3d.update()
+        self.viewport.gauge.update()
 
     def _update_menus(self) -> None:
         """Greys out the scan controls that would do nothing, as the panel's
@@ -1311,7 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setDesktopFileName(APP_ID)
     if APP_ICON.exists():
         app.setWindowIcon(QIcon(str(APP_ICON)))
-    apply_dark_theme(app)
+    apply_theme(app, theme.THEMES.get(current_theme(), theme.DARK))
 
     def report_unhandled(exc_type, exc, tb) -> None:
         # With the default hook, PyQt6 aborts the whole app when a slot raises.

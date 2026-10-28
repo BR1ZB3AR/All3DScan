@@ -19,6 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QPalette
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
@@ -33,7 +34,10 @@ if QApplication.instance() is None:
 import all3dscan_engine as engine  # noqa: E402
 import app  # noqa: E402
 import rea_engine as rea  # noqa: E402
+import common  # noqa: E402
+import theme  # noqa: E402
 import viewport3d  # noqa: E402
+import widgets  # noqa: E402
 from panels import ScanState  # noqa: E402
 from presets import load_presets  # noqa: E402
 from widgets import DistanceGauge, center_distance_mm, zone_for  # noqa: E402
@@ -223,10 +227,11 @@ class MenuTests(WindowTestCase):
             found[action.text()] = ([a.text() for a in menu.actions()] if menu else None)
         return found
 
-    def test_the_menu_bar_holds_file_edit_help_and_about(self):
+    def test_the_menu_bar_holds_file_edit_theme_help_and_about(self):
         window = self.open_window()
         menus = self.menus(window)
-        self.assertEqual(list(menus), ["&File", "&Edit", "&Help", "&About"])
+        self.assertEqual(list(menus), ["&File", "&Edit", "&Theme", "&Help", "&About"])
+        self.assertEqual(menus["&Theme"], ["Dark", "Light"])
         self.assertIsNone(menus["&About"])  # one thing to do, so no submenu
         self.assertIn("&Quit", menus["&File"])
         self.assertIn("Export STEP", menus["&File"])
@@ -240,7 +245,8 @@ class MenuTests(WindowTestCase):
         # The same QAction in both places, so they cannot disagree about
         # what is available.
         window = self.open_window()
-        edit = {a.text(): a for a in window.menuBar().actions()[1].menu().actions()}
+        menus = {a.text(): a.menu() for a in window.menuBar().actions()}
+        edit = {a.text(): a for a in menus["&Edit"].actions()}
         self.assertIs(edit["Fit plane"], window.fit_plane_action)
         self.assertIs(edit["Fusion"], window.fusion_action)
         self.assertFalse(edit["Fit plane"].isEnabled())  # no model yet
@@ -266,8 +272,8 @@ class MenuTests(WindowTestCase):
     def test_quit_and_shortcuts_carry_their_keys(self):
         window = self.open_window()
         keys = {a.text(): a.shortcut().toString()
-                for menu in (0, 2)
-                for a in window.menuBar().actions()[menu].menu().actions()}
+                for top in window.menuBar().actions() if top.menu()
+                for a in top.menu().actions()}
         self.assertEqual(keys["&Quit"], "Ctrl+Q")
         self.assertEqual(keys["&Shortcuts…"], "F1")
 
@@ -285,6 +291,66 @@ class MenuTests(WindowTestCase):
         self.assertIn("250–500 mm", shown[1])  # the preset's band
         self.assertIn("All3DScan", shown[2])
         self.assertIn("mock depth camera", shown[2])
+
+
+class ThemeTests(WindowTestCase):
+    """Switching the window's colours."""
+
+    def setUp(self):
+        # Chosen themes are remembered, so put back whatever was set.
+        was = common.current_theme()
+        self.addCleanup(common.remember_theme, was)
+        self.addCleanup(common.apply_theme, qt_app, theme.THEMES[was])
+
+    def test_one_set_of_rules_recoloured_for_each_theme(self):
+        dark, light = theme.DARK.stylesheet(), theme.LIGHT.stylesheet()
+        self.assertNotEqual(dark, light)
+        # Same rules, so the same number of lines and declarations.
+        self.assertEqual(dark.count("{"), light.count("{"))
+        self.assertEqual(len(dark.splitlines()), len(light.splitlines()))
+        # No dark surface is left behind in the light sheet.
+        for colour in (theme.WINDOW, theme.PANEL, theme.BASE, theme.TEXT, theme.EDGE):
+            self.assertIn(theme.DARK.of(colour), dark)
+            self.assertNotIn(theme.DARK.of(colour), light)
+            self.assertIn(theme.LIGHT.of(colour), light)
+
+    def test_a_theme_recolours_the_window_the_gauge_and_the_viewport(self):
+        window = self.open_window()
+        window.set_theme("Light")
+        self.assertIn(theme.LIGHT.of(theme.WINDOW), qt_app.styleSheet())
+        self.assertEqual(qt_app.palette().color(QPalette.ColorRole.Window).name(),
+                         theme.LIGHT.of(theme.WINDOW))
+        self.assertEqual(viewport3d.BACKGROUND_TOP, theme.LIGHT.rgb(theme.VIEWPORT_TOP))
+        self.assertEqual(widgets._theme, theme.LIGHT)
+
+        window.set_theme("Dark")
+        self.assertIn(theme.DARK.of(theme.WINDOW), qt_app.styleSheet())
+        self.assertEqual(viewport3d.BACKGROUND_TOP, theme.DARK.rgb(theme.VIEWPORT_TOP))
+
+    def test_the_chosen_theme_is_ticked_and_remembered(self):
+        window = self.open_window()
+        window.set_theme("Light")
+        ticked = [a.text() for a in window.theme_actions.actions() if a.isChecked()]
+        self.assertEqual(ticked, ["Light"])
+        self.assertEqual(common.current_theme(), "Light")
+        # A window opened afterwards starts in it.
+        later = self.open_window()
+        self.assertEqual([a.text() for a in later.theme_actions.actions() if a.isChecked()],
+                         ["Light"])
+
+    def test_an_unknown_theme_is_ignored(self):
+        window = self.open_window()
+        window.set_theme("Light")
+        window.set_theme("Chartreuse")
+        self.assertEqual(common.current_theme(), "Light")
+
+    def test_the_distance_bands_keep_their_meaning_in_every_theme(self):
+        # Red for too near, green for good: those say something, so a theme
+        # must not repaint them.
+        for name in theme.THEMES:
+            chosen = theme.THEMES[name]
+            self.assertEqual(chosen.of(theme.ZONE_TOO_NEAR), theme.ZONE_TOO_NEAR)
+            self.assertEqual(chosen.of(theme.ZONE_GOOD), theme.ZONE_GOOD)
 
 
 class PresetTests(WindowTestCase):

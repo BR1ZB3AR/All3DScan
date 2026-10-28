@@ -5,11 +5,15 @@ import os
 import sys
 from pathlib import Path
 
+from PyQt6.QtCore import QSettings
 from PyQt6.QtGui import QColor, QGuiApplication, QPalette, QSurfaceFormat
 from PyQt6.QtWidgets import QApplication
 
+import theme
+import viewport3d
+import widgets
+
 HERE = Path(__file__).resolve().parent
-STYLESHEET = HERE / "assets" / "dark.qss"
 APP_ICON = HERE.parent / "resources/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png"
 # The launcher entry's file name (install_desktop_entry.py) and, on Wayland,
 # the window's app id, which is how the panel matches the two.
@@ -82,32 +86,55 @@ def warn_if_platform_differs() -> None:
               file=sys.stderr, flush=True)
 
 
-def apply_dark_theme(app: QApplication) -> None:
-    """Fusion with a dark palette; assets/dark.qss adds the accents."""
+def apply_theme(app: QApplication, chosen: theme.Theme = theme.DARK) -> None:
+    """Dresses the app in a theme: Qt's own palette for the widgets the
+    stylesheet does not reach, then the rules themselves, recoloured."""
     app.setStyle("Fusion")
     palette = QPalette()
-    for role, color in {
-        QPalette.ColorRole.Window: "#1e1f22",
-        QPalette.ColorRole.WindowText: "#dfe1e5",
-        QPalette.ColorRole.Base: "#2b2d30",
-        QPalette.ColorRole.AlternateBase: "#26282b",
-        QPalette.ColorRole.Text: "#dfe1e5",
-        QPalette.ColorRole.Button: "#2b2d30",
-        QPalette.ColorRole.ButtonText: "#dfe1e5",
-        QPalette.ColorRole.Highlight: "#e5484d",
-        QPalette.ColorRole.HighlightedText: "#ffffff",
-        QPalette.ColorRole.ToolTipBase: "#2b2d30",
-        QPalette.ColorRole.ToolTipText: "#dfe1e5",
-        QPalette.ColorRole.PlaceholderText: "#8b8e94",
-        QPalette.ColorRole.Link: "#ff7b7f",
+    for role, colour in {
+        QPalette.ColorRole.Window: theme.WINDOW,
+        QPalette.ColorRole.WindowText: theme.TEXT,
+        QPalette.ColorRole.Base: theme.PALETTE_BASE,
+        QPalette.ColorRole.AlternateBase: theme.ALT,
+        QPalette.ColorRole.Text: theme.TEXT,
+        QPalette.ColorRole.Button: theme.PALETTE_BASE,
+        QPalette.ColorRole.ButtonText: theme.TEXT,
+        QPalette.ColorRole.Highlight: theme.ACCENT,
+        QPalette.ColorRole.HighlightedText: theme.WHITE,
+        QPalette.ColorRole.ToolTipBase: theme.PALETTE_BASE,
+        QPalette.ColorRole.ToolTipText: theme.TEXT,
+        QPalette.ColorRole.PlaceholderText: theme.DIM,
+        QPalette.ColorRole.Link: theme.LINK,
     }.items():
-        palette.setColor(role, QColor(color))
+        palette.setColor(role, QColor(chosen.of(colour)))
     for role in (
         QPalette.ColorRole.WindowText,
         QPalette.ColorRole.Text,
         QPalette.ColorRole.ButtonText,
     ):
-        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#6f737a"))
+        palette.setColor(QPalette.ColorGroup.Disabled, role,
+                         QColor(chosen.of(theme.PALETTE_DISABLED_TEXT)))
     app.setPalette(palette)
-    if STYLESHEET.exists():
-        app.setStyleSheet(STYLESHEET.read_text(encoding="utf-8"))
+    app.setStyleSheet(chosen.stylesheet())
+    viewport3d.set_background(chosen.rgb(theme.VIEWPORT_TOP),
+                              chosen.rgb(theme.VIEWPORT_BOTTOM))
+    widgets.set_theme(chosen)
+
+
+def apply_dark_theme(app: QApplication) -> None:
+    """The dark theme, which is the one the rules are written in."""
+    apply_theme(app, theme.DARK)
+
+
+def _settings() -> QSettings:
+    return QSettings("All3DScan", "All3DScan")
+
+
+def current_theme() -> str:
+    """The theme last chosen, or the default when none has been."""
+    name = _settings().value("theme", theme.DEFAULT)
+    return name if name in theme.THEMES else theme.DEFAULT
+
+
+def remember_theme(name: str) -> None:
+    _settings().setValue("theme", name)

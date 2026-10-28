@@ -1,6 +1,8 @@
 """Widgets the main window is built from."""
 
 import numpy as np
+
+import theme
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
@@ -21,14 +23,27 @@ ZONE_LABELS = {
     "far": "Far",
     "too-far": "Too far",
 }
-# The band colours of the C++ app's distance gauge (src/app/Theme.h).
+# The band colours of the C++ app's distance gauge (src/app/Theme.h). They
+# say how far away the object is, so they mean the same in every theme.
 ZONE_COLORS = {
-    "too-near": "#d95c5c",
-    "excellent": "#12b6b0",
-    "good": "#5bbf5b",
-    "far": "#e0a83e",
-    "too-far": "#d95c5c",
+    "too-near": theme.ZONE_TOO_NEAR,
+    "excellent": theme.ZONE_EXCELLENT,
+    "good": theme.ZONE_GOOD,
+    "far": theme.ZONE_FAR,
+    "too-far": theme.ZONE_TOO_NEAR,
 }
+
+# The theme the gauge draws its text in; common.apply_theme() sets it.
+_theme = theme.DARK
+
+
+def set_theme(chosen: theme.Theme) -> None:
+    global _theme
+    _theme = chosen
+
+
+def _colour(name: str) -> QColor:
+    return QColor(_theme.of(name))
 
 
 def zone_for(mm: float | None, band_edges_mm) -> str:
@@ -99,7 +114,7 @@ class DistanceGauge(QWidget):
             return top + (min(max(mm, lo), hi) - lo) / (hi - lo) * (bottom - top)
 
         strip_x, strip_w = 74.0, 8.0
-        p.setPen(QColor("#a9adb3"))
+        p.setPen(_colour(theme.MUTED))
         p.drawText(QRectF(0, 0, self.width() - 4, 18),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "Unit: mm")
 
@@ -112,12 +127,12 @@ class DistanceGauge(QWidget):
             label = QFont(small)
             label.setBold(zone == current)
             p.setFont(label)
-            p.setPen(QColor("#ffffff") if zone == current else QColor("#b9bcc2"))
+            p.setPen(_colour(theme.WHITE if zone == current else theme.GAUGE_TICK))
             p.drawText(QRectF(0, y(a), strip_x - 8, y(b) - y(a)),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                        ZONE_LABELS[zone])
         p.setFont(small)
-        p.setPen(QColor("#7d8187"))
+        p.setPen(_colour(theme.GAUGE_LINE))
         for mm in edges:
             p.drawText(QRectF(0, y(mm) - 13, strip_x - 8, 12),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, str(mm))
