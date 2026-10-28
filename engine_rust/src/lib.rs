@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 pub mod fitting;
 pub mod fusion;
 pub mod hw;
+pub mod mesh;
 pub mod processing;
 
 /// All3DScan's processing engine, imported by the PyQt6 GUI.
@@ -134,6 +135,17 @@ mod all3dscan_engine {
         #[getter]
         fn frame_index(&self) -> u64 {
             self.frame_index.load(Ordering::Relaxed)
+        }
+
+        /// The pinhole the frames are projected through: fx, fy, cx, cy.
+        #[getter]
+        fn intrinsics(&self) -> (f64, f64, f64, f64) {
+            let lens = self
+                .sensor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .intrinsics();
+            (lens[0], lens[1], lens[2], lens[3])
         }
     }
 
@@ -356,6 +368,14 @@ mod all3dscan_engine {
             self.with(|sensor| sensor.backend_name())
         }
 
+        /// The depth camera's pinhole: fx, fy, cx, cy. All 0 until the
+        /// first frame has come back.
+        #[getter]
+        fn intrinsics(&self) -> PyResult<(f64, f64, f64, f64)> {
+            let lens = self.with(|sensor| sensor.intrinsics())?;
+            Ok((lens[0], lens[1], lens[2], lens[3]))
+        }
+
         /// Why the last call that failed did, such as a capture that returned None.
         #[getter]
         fn last_error(&self) -> PyResult<String> {
@@ -458,6 +478,14 @@ mod all3dscan_engine {
         hw::Pop4Sensor::present()
     }
 
+    /// A surface handed back to Python: vertices, their normals, and the
+    /// triples of indices that make its triangles.
+    type Surface<'py> = (
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<u32>>,
+    );
+
     /// A cloud handed back to Python: its points, colours and normals.
     type Cloud<'py> = (
         Bound<'py, PyArray2<f32>>,
@@ -528,12 +556,18 @@ mod all3dscan_engine {
         /// colours and normals across. Returns how it sat: whether it was
         /// merged, the share of its points on the model's surface, their RMS
         /// distance in millimetres, and the points in the model afterwards.
+        ///
+        /// With `depth_mm`, the frame's (height, width) depth image, the
+        /// view is kept for building a surface later, if the scanner has
+        /// moved far enough since the last one kept.
+        #[pyo3(signature = (points, colors, normals, depth_mm = None))]
         fn add<'py>(
             &self,
             py: Python<'py>,
             points: PyArrayLike2<'py, f32, AllowTypeChange>,
             colors: PyArrayLike2<'py, u8, AllowTypeChange>,
             normals: PyArrayLike2<'py, f32, AllowTypeChange>,
+            depth_mm: Option<PyArrayLike2<'py, u16, AllowTypeChange>>,
         ) -> PyResult<Bound<'py, PyDict>> {
             // Copied while attached: other Python threads may change the
             // arrays once the GIL is released.
@@ -549,8 +583,25 @@ mod all3dscan_engine {
                     frame.points.len()
                 )));
             }
+            let view = depth_mm.map(|image| {
+                let grid = image.as_array();
+                (
+                    grid.iter().copied().collect::<Vec<u16>>(),
+                    grid.ncols() as u32,
+                    grid.nrows() as u32,
+                )
+            });
             let fit = py
-                .detach(|| self.locked().add(&frame))
+                .detach(|| {
+                    let mut fusion = self.locked();
+                    let fit = fusion.add(&frame)?;
+                    if fit.merged
+                        && let Some((depth, width, height)) = view
+                    {
+                        fusion.keep_view(&depth, width, height);
+                    }
+                    Ok::<_, fusion::FusionError>(fit)
+                })
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             self.model_points.store(fit.model_points, Ordering::Relaxed);
             let result = PyDict::new(py);
@@ -566,6 +617,37 @@ mod all3dscan_engine {
         fn cloud<'py>(&self, py: Python<'py>) -> PyResult<Cloud<'py>> {
             let copied = py.detach(|| self.locked().cloud().clone());
             cloud_into_py(py, &copied)
+        }
+
+        /// Melts the depth views kept during the scan into one closed
+        /// surface over the model: its (N, 3) float32 vertices in
+        /// millimetres, an (N, 3) unit normal each, and an (M, 3) uint32
+        /// index per triangle. `intrinsics` is the depth camera's fx, fy,
+        /// cx, cy. Comes back empty when there is nothing to build from.
+        #[pyo3(signature = (intrinsics, voxel_mm = 1.0, smoothing = 8))]
+        fn surface<'py>(
+            &self,
+            py: Python<'py>,
+            intrinsics: (f64, f64, f64, f64),
+            voxel_mm: f32,
+            smoothing: i32,
+        ) -> PyResult<Surface<'py>> {
+            let (fx, fy, cx, cy) = intrinsics;
+            let built = py
+                .detach(|| self.locked().surface([fx, fy, cx, cy], voxel_mm, smoothing))
+                .map_err(|e| PyValueError::new_err(e.what().to_owned()))?;
+            let triangles = built.triangles();
+            Ok((
+                into_array(py, flatten(&built.vertices))?,
+                into_array(py, built.normals)?,
+                PyArray1::from_vec(py, built.indices).reshape([triangles, 3])?,
+            ))
+        }
+
+        /// How many depth views are being held for the surface.
+        #[getter]
+        fn views(&self) -> usize {
+            self.locked().views()
         }
 
         /// Throws the model away and starts again.

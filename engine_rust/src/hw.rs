@@ -31,6 +31,10 @@ mod ffi {
         fn rgb(self: &MockDepthSensor) -> &CxxVector<u8>;
         fn width(self: &MockDepthSensor) -> u32;
         fn height(self: &MockDepthSensor) -> u32;
+        fn fx(self: &MockDepthSensor) -> f64;
+        fn fy(self: &MockDepthSensor) -> f64;
+        fn cx(self: &MockDepthSensor) -> f64;
+        fn cy(self: &MockDepthSensor) -> f64;
         #[cxx_name = "frameIndex"]
         fn frame_index(self: &MockDepthSensor) -> u64;
     }
@@ -60,6 +64,10 @@ mod ffi {
         fn color_width(self: &Pop4Sensor) -> u32;
         #[cxx_name = "colorHeight"]
         fn color_height(self: &Pop4Sensor) -> u32;
+        fn fx(self: &Pop4Sensor) -> f64;
+        fn fy(self: &Pop4Sensor) -> f64;
+        fn cx(self: &Pop4Sensor) -> f64;
+        fn cy(self: &Pop4Sensor) -> f64;
         #[cxx_name = "frameIndex"]
         fn frame_index(self: &Pop4Sensor) -> u64;
         #[cxx_name = "validFraction"]
@@ -174,6 +182,16 @@ impl MockDepthSensor {
             rgb_width: sensor.width(),
             rgb_height: sensor.height(),
         }
+    }
+
+    /// The pinhole the frames are projected through: fx, fy, cx, cy.
+    pub fn intrinsics(&self) -> [f64; 4] {
+        [
+            self.inner.fx(),
+            self.inner.fy(),
+            self.inner.cx(),
+            self.inner.cy(),
+        ]
     }
 
     pub fn width(&self) -> u32 {
@@ -306,6 +324,16 @@ impl Pop4Sensor {
     /// re-enumerated, after which capture() never succeeds again.
     pub fn connected(&self) -> bool {
         self.inner.connected()
+    }
+
+    /// The depth camera's pinhole: fx, fy, cx, cy. All 0 before the first frame.
+    pub fn intrinsics(&self) -> [f64; 4] {
+        [
+            self.inner.fx(),
+            self.inner.fy(),
+            self.inner.cx(),
+            self.inner.cy(),
+        ]
     }
 
     pub fn serial(&self) -> String {

@@ -98,15 +98,33 @@ class Fusion:
 
     def __init__(self, voxel_mm: float = 1.0) -> None: ...
     def add(
-        self, points: npt.ArrayLike, colors: npt.ArrayLike, normals: npt.ArrayLike
+        self,
+        points: npt.ArrayLike,
+        colors: npt.ArrayLike,
+        normals: npt.ArrayLike,
+        depth_mm: npt.ArrayLike | None = None,
     ) -> FrameFit:
-        """Aligns an (N, 3) frame onto the model and merges it."""
+        """Aligns an (N, 3) frame onto the model and merges it. With its
+        (height, width) depth image, the view is also kept for building a
+        surface later."""
     def cloud(
         self,
     ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.uint8], npt.NDArray[np.float32]]:
         """The model so far: its points in millimetres, colours and normals."""
+    def surface(
+        self,
+        intrinsics: tuple[float, float, float, float],
+        voxel_mm: float = 1.0,
+        smoothing: int = 8,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uint32]]:
+        """Melts the depth views kept during the scan into one closed
+        surface: vertices in millimetres, a unit normal each, and three
+        indices per triangle. Empty when there is nothing to build from."""
     def clear(self) -> None:
         """Throws the model away and starts again."""
+    @property
+    def views(self) -> int:
+        """Depth views held for building a surface."""
     @property
     def model_points(self) -> int: ...
     @property
@@ -156,6 +174,9 @@ class MockDepthSensor:
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
+    @property
+    def intrinsics(self) -> tuple[float, float, float, float]:
+        """The pinhole the frames are projected through: fx, fy, cx, cy."""
     @property
     def frame_index(self) -> int:
         """Number of frames captured so far."""

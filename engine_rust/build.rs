@@ -29,12 +29,14 @@ fn main() {
     }
 
     let fusion_cpp = root.join("fusion_cpp");
-    cxx_build::bridges(["src/hw.rs", "src/fusion.rs"])
+    let mesh_cpp = root.join("mesh_cpp");
+    cxx_build::bridges(["src/hw.rs", "src/fusion.rs", "src/mesh.rs"])
         .file(hw_cpp.join("src/MockDepthSensor.cpp"))
         .file(hw_cpp.join("src/Pop4Presence.cpp"))
         .include(hw_cpp.join("include"))
         .include(fusion_cpp.join("include"))
-        .include(&legacy) // FrameFusion.h reaches the registration headers
+        .include(mesh_cpp.join("include"))
+        .include(&legacy) // the shims reach the registration and geometry headers
         .std("c++17")
         .flag_if_supported("-Wall")
         .flag_if_supported("-Wextra")
@@ -49,8 +51,11 @@ fn main() {
         .include(fusion_cpp.join("include"))
         .include(&legacy)
         .file(fusion_cpp.join("src/FrameFusion.cpp"))
+        .file(mesh_cpp.join("src/SurfaceBuilder.cpp"))
         .file(legacy.join("pointcloud/PointCloud.cpp"))
         .file(legacy.join("processing/Registration.cpp"))
+        .file(legacy.join("geometry/TsdfVolume.cpp"))
+        .include(mesh_cpp.join("include"))
         .compile("all3dscan_fusion");
     println!("cargo:rustc-link-lib=gomp");
 
@@ -61,7 +66,7 @@ fn main() {
             .file(hw_cpp.join("src/Pop4SensorStub.cpp"))
             .include(hw_cpp.join("include"))
             .compile("all3dscan_pop4");
-        rerun_if_changed(&[&hw_cpp, &fusion_cpp, &legacy.join("processing")]);
+        rerun_if_changed(&[&hw_cpp, &fusion_cpp, &mesh_cpp, &legacy.join("processing")]);
         return;
     };
 
@@ -151,6 +156,8 @@ fn main() {
     rerun_if_changed(&[
         &hw_cpp,
         &fusion_cpp,
+        &mesh_cpp,
+        &legacy.join("geometry"),
         &legacy.join("usb"),
         &legacy.join("protocol"),
         &legacy.join("decoder"),
@@ -181,6 +188,7 @@ fn find_nvcc() -> Option<PathBuf> {
 fn rerun_if_changed(paths: &[&Path]) {
     println!("cargo:rerun-if-changed=src/hw.rs");
     println!("cargo:rerun-if-changed=src/fusion.rs");
+    println!("cargo:rerun-if-changed=src/mesh.rs");
     for path in paths {
         println!("cargo:rerun-if-changed={}", path.display());
     }

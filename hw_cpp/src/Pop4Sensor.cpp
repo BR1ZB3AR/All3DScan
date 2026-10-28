@@ -123,6 +123,11 @@ bool Pop4Sensor::capture(int32_t timeoutMs) {
     if (metric) {
         width_ = frame->width;
         height_ = frame->height;
+        const auto lens = scanner_->calibration().depth;
+        fx_ = lens.fx;
+        fy_ = lens.fy;
+        cx_ = lens.cx;
+        cy_ = lens.cy;
         depthMm_ = std::move(frame->depthMm);
         depthRgb_ = std::move(frame->rgb);
     } else {

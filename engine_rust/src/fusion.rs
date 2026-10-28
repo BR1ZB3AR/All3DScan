@@ -14,6 +14,7 @@
 
 use nalgebra::{Matrix3, Vector3};
 
+use crate::mesh::{self, Surface};
 use crate::processing::{self, Cloud, ProcessingError};
 
 #[cxx::bridge(namespace = "all3dscan::fusion")]
@@ -97,6 +98,22 @@ pub struct FrameFit {
     pub model_points: u64,
 }
 
+/// A depth view kept so that a surface can be built from the scan later.
+/// Only some frames are kept: enough to see the object from every side,
+/// without holding every frame of a scan in memory.
+struct Keyframe {
+    depth_mm: Vec<u16>,
+    width: u32,
+    height: u32,
+    pose: [f64; 16],
+}
+
+/// How far the scanner must have moved since the last view kept before
+/// another is worth keeping, and how many are ever held.
+const KEYFRAME_SHIFT_MM: f32 = 8.0;
+const KEYFRAME_TURN: f32 = 0.10; // radians, about 6 degrees
+const KEYFRAMES: usize = 120;
+
 /// Builds one point cloud out of a scan's frames.
 pub struct Fusion {
     inner: cxx::UniquePtr<ffi::FrameFusion>,
@@ -106,6 +123,9 @@ pub struct Fusion {
     voxel_mm: f32,
     frames: u64,
     merged: u64,
+    /// Views kept for building a surface, and where the last one was taken.
+    keyframes: Vec<Keyframe>,
+    last_kept: Option<(Matrix3<f32>, Vector3<f32>)>,
 }
 
 impl Fusion {
@@ -118,6 +138,8 @@ impl Fusion {
             voxel_mm,
             frames: 0,
             merged: 0,
+            keyframes: Vec::new(),
+            last_kept: None,
         })
     }
 
@@ -157,6 +179,73 @@ impl Fusion {
             rmse_mm: self.inner.last_rmse_mm(),
             model_points: self.model.points.len() as u64,
         })
+    }
+
+    /// Keeps this frame's depth image, if the scanner has moved far enough
+    /// since the last one kept to show the object from a new side. The
+    /// frame must have just been merged, so that the pose is its own.
+    pub fn keep_view(&mut self, depth_mm: &[u16], width: u32, height: u32) {
+        if depth_mm.len() != (width as usize) * (height as usize) {
+            return;
+        }
+        let (rotation, shift) = self.last_pose();
+        if let Some((was_rotation, was_shift)) = self.last_kept {
+            let moved = (shift - was_shift).norm();
+            // The angle between the two rotations, from the trace of R1ᵀ R2.
+            let turned = (((was_rotation.transpose() * rotation).trace() - 1.0) / 2.0)
+                .clamp(-1.0, 1.0)
+                .acos();
+            if moved < KEYFRAME_SHIFT_MM && turned < KEYFRAME_TURN {
+                return;
+            }
+        }
+        if self.keyframes.len() >= KEYFRAMES {
+            // Keep the spread: drop every other one and carry on, so the
+            // views still cover the whole scan rather than only its start.
+            let mut kept = Vec::with_capacity(KEYFRAMES / 2 + 1);
+            for (at, frame) in std::mem::take(&mut self.keyframes).into_iter().enumerate() {
+                if at % 2 == 0 {
+                    kept.push(frame);
+                }
+            }
+            self.keyframes = kept;
+        }
+        let m = self.inner.last_pose().as_slice();
+        let mut pose = [0.0f64; 16];
+        pose.copy_from_slice(&m[..16]);
+        self.keyframes.push(Keyframe {
+            depth_mm: depth_mm.to_vec(),
+            width,
+            height,
+            pose,
+        });
+        self.last_kept = Some((rotation, shift));
+    }
+
+    /// How many depth views are being held for the surface.
+    pub fn views(&self) -> usize {
+        self.keyframes.len()
+    }
+
+    /// Melts the kept views into one closed surface over the model. The
+    /// intrinsics are the depth camera's: fx, fy, cx, cy.
+    pub fn surface(
+        &self,
+        intrinsics: [f64; 4],
+        voxel_mm: f32,
+        smoothing: i32,
+    ) -> Result<Surface, cxx::Exception> {
+        let mut builder = mesh::SurfaceBuilder::new(voxel_mm)?;
+        for view in &self.keyframes {
+            builder.add_view(
+                &view.depth_mm,
+                view.width,
+                view.height,
+                intrinsics,
+                &view.pose,
+            )?;
+        }
+        builder.build(&self.model.points, smoothing)
     }
 
     /// Where the last merged frame was placed: its rotation, and its shift
@@ -205,6 +294,8 @@ impl Fusion {
         self.model = Cloud::default();
         self.frames = 0;
         self.merged = 0;
+        self.keyframes.clear();
+        self.last_kept = None;
     }
 }
 

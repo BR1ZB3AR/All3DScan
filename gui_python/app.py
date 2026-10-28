@@ -158,7 +158,8 @@ class ScanWorker(QObject):
     def use_mock(self) -> None:
         self.close()
         self._sensor = self._mock
-        self.sensor_changed.emit({"kind": "mock"})
+        self.sensor_changed.emit({"kind": "mock",
+                                  "intrinsics": self._mock.intrinsics})
 
     @pyqtSlot(str, tuple)
     def control(self, name: str, args: tuple) -> None:
@@ -250,7 +251,8 @@ class ScanWorker(QObject):
         lights = {name: (pop4.light_on(name), pop4.light_level(name))
                   for name in ("projector", "fill light")}
         return {"kind": "pop4", "serial": pop4.serial, "backend": pop4.backend,
-                "mode": pop4.scan_mode, "exposure_us": pop4.exposure_us, "lights": lights}
+                "mode": pop4.scan_mode, "exposure_us": pop4.exposure_us,
+                "lights": lights, "intrinsics": pop4.intrinsics}
 
 
 @dataclass(frozen=True, eq=False)
@@ -301,6 +303,7 @@ class FusionWorker(QObject):
     # first two are None for a frame that would not align: the window waits
     # on this either way before offering another, so it is always sent.
     model_ready = pyqtSignal(object, object, dict)
+    surface_ready = pyqtSignal(object, object)  # the surface, and the model it belongs to
     failed = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -319,12 +322,26 @@ class FusionWorker(QObject):
     def stop(self) -> None:
         self._fusion = None
 
-    @pyqtSlot(object, object, object)
-    def add(self, points, colors, normals) -> None:
+    @pyqtSlot(object, tuple, float)
+    def build_surface(self, model, intrinsics: tuple, voxel_mm: float) -> None:
+        """Melts the scan's depth views into one closed surface."""
+        if self._fusion is None or not intrinsics or not intrinsics[0]:
+            self.surface_ready.emit(None, model)
+            return
+        try:
+            surface = self._fusion.surface(intrinsics, voxel_mm=voxel_mm)
+        except BaseException as exc:
+            self.failed.emit(describe(exc))
+            self.surface_ready.emit(None, model)
+            return
+        self.surface_ready.emit(surface if len(surface[2]) else None, model)
+
+    @pyqtSlot(object, object, object, object)
+    def add(self, points, colors, normals, depth_mm) -> None:
         if self._fusion is None:
             return
         try:
-            fit = self._fusion.add(points, colors, normals)
+            fit = self._fusion.add(points, colors, normals, depth_mm=depth_mm)
             cloud = self._fusion.cloud() if fit["merged"] else None
         except BaseException as exc:
             self.failed.emit(describe(exc))
@@ -338,7 +355,8 @@ class FusionWorker(QObject):
 
 class MainWindow(QMainWindow):
     frame_requested = pyqtSignal()
-    fuse_requested = pyqtSignal(object, object, object)  # a frame's points, colours, normals
+    fuse_requested = pyqtSignal(object, object, object, object)  # points, colours, normals, depth
+    surface_requested = pyqtSignal(object, tuple, float)  # the model, intrinsics, voxel
     fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
     fusion_stop_requested = pyqtSignal()
     tune_exposure_requested = pyqtSignal()
@@ -383,6 +401,9 @@ class MainWindow(QMainWindow):
     # model itself, so a sparse scan is not stripped bare.
     SPECKLE_RADIUS_MM = 3.0
     SPECKLE_SHARE = 0.2
+    # The detail the built surface holds. The reconstruction grows it when
+    # the scan covers a large box, so this is a floor rather than a promise.
+    SURFACE_VOXEL_MM = 1.0
     # How long the scanner's white lights stay on, and then off, while a
     # scan runs. Slow enough that the commands do not crowd the captures.
     FLASH_MS = 500
@@ -476,11 +497,14 @@ class MainWindow(QMainWindow):
 
         self._fitting = False
         self._fusing = False  # a frame is with the fusion worker
+        self._meshing = False  # ...and a surface is being built
         self._tuning = False  # the scanner is busy trying exposures
         self._fused: tuple | None = None  # the model built from this scan
         self._tracked = 0  # frames the fusion placed on the model
         self._offered = 0  # frames it was given
         self._shown_model: ScanModel | None = None  # the model in the 3D view
+        # The camera a scan is being taken with, for building its surface.
+        self._intrinsics: tuple = tuple(getattr(self.sensor, "intrinsics", ()))
         self._rea_thread = QThread(self)
         self._rea_worker = ReaWorker()
         self._rea_worker.moveToThread(self._rea_thread)
@@ -498,6 +522,8 @@ class MainWindow(QMainWindow):
         self.fusion_start_requested.connect(self._fusion_worker.start)
         self.fusion_stop_requested.connect(self._fusion_worker.stop)
         self._fusion_worker.model_ready.connect(self._on_model_ready)
+        self._fusion_worker.surface_ready.connect(self._on_surface_ready)
+        self.surface_requested.connect(self._fusion_worker.build_surface)
         self._fusion_worker.failed.connect(self._on_fusion_failed)
         self._fusion_thread.start()
         QApplication.instance().aboutToQuit.connect(self._stop_worker)
@@ -578,8 +604,12 @@ class MainWindow(QMainWindow):
             action("Smooth", "smooth", later, enabled=False),
             action("Simplify", "transform-scale", later, enabled=False),
         ]
+        self.mesh_action = action(
+            "Mesh", "draw-cuboid",
+            "Melt the scan's depth views into one closed surface", enabled=False)
+        self.mesh_action.triggered.connect(self.build_surface)
         mesh = [
-            action("Mesh", "draw-cuboid", later, enabled=False),
+            self.mesh_action,
             action("Fill holes", "fill-color", later, enabled=False),
             action("Smooth", "draw-brush", later, enabled=False),
             action("Simplify", "zoom-select", later, enabled=False),
@@ -872,7 +902,38 @@ class MainWindow(QMainWindow):
         self._offered += 1
         step = max(math.ceil(len(frame.points) / self.FUSION_MAX_POINTS), 1)
         self.fuse_requested.emit(frame.points[::step], frame.colors[::step],
-                                 frame.normals[::step])
+                                 frame.normals[::step], frame.depth_mm)
+
+    def build_surface(self) -> None:
+        """Melts the scan's depth views into one surface and shows it."""
+        model = self.model_panel.current_model()
+        if model is None or self._meshing or not model.intrinsics:
+            return
+        if model.surface is not None:  # built already; just show it again
+            self._show_surface(model)
+            return
+        self._meshing = True
+        self._update_rea_tools()
+        self.viewport.show_toast("Building the surface…", 120_000)
+        self.surface_requested.emit(model, tuple(model.intrinsics), self.SURFACE_VOXEL_MM)
+
+    def _on_surface_ready(self, surface, model) -> None:
+        self._meshing = False
+        self._update_rea_tools()
+        if surface is None:
+            self.viewport.show_toast("No surface could be built from this scan", 6000)
+            print("no surface could be built", file=sys.stderr, flush=True)
+            return
+        model.surface = surface
+        print(f"{model.name}: surface of {len(surface[2]):,} triangles over "
+              f"{len(surface[0]):,} vertices", flush=True)
+        if self.model_panel.current_model() is model:
+            self._show_surface(model)
+
+    def _show_surface(self, model) -> None:
+        vertices, normals, indices = model.surface
+        self.viewport.show_surface(vertices, normals, indices)
+        self.viewport.show_toast(f"{len(indices):,} triangles", 4000)
 
     def _on_model_ready(self, model, display, fit: dict) -> None:
         self._fusing = False
@@ -955,7 +1016,7 @@ class MainWindow(QMainWindow):
         # The cloud already on screen becomes the model: the frames fused
         # together, or the last frame alone when fusion was off.
         if fused is not None:
-            model = ScanModel(name, properties, *fused)
+            model = ScanModel(name, properties, *fused, intrinsics=self._intrinsics)
         elif frame is not None:
             model = ScanModel(name, properties, frame.points, frame.colors, frame.normals)
         else:
@@ -1027,6 +1088,7 @@ class MainWindow(QMainWindow):
                  and model.session is not None)
         self.fit_plane_action.setEnabled(ready)
         self.fit_cylinder_action.setEnabled(ready)
+        self.mesh_action.setEnabled(ready and not self._meshing and bool(model.intrinsics))
         self.export_step_action.setEnabled(ready and bool(model.session.primitives))
         self.model_panel.set_busy(self._fitting)
 
@@ -1159,6 +1221,7 @@ class MainWindow(QMainWindow):
 
     def _on_sensor_changed(self, settings: dict) -> None:
         self._connecting = False
+        self._intrinsics = tuple(settings.get("intrinsics", ()))
         self._pop4 = settings["kind"] == "pop4"
         if self._pop4:
             self._reconnects = 0

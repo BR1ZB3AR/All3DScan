@@ -38,6 +38,12 @@ public:
     const std::vector<uint8_t>& rgb() const noexcept { return rgb_; }
     uint32_t width() const noexcept { return width_; }
     uint32_t height() const noexcept { return height_; }
+
+    // The pinhole capture() projects through, in pixels.
+    double fx() const noexcept { return 0.8 * width_; }
+    double fy() const noexcept { return fx(); }
+    double cx() const noexcept { return 0.5 * (width_ - 1); }
+    double cy() const noexcept { return 0.5 * (height_ - 1); }
     // Number of frames captured so far.
     uint64_t frameIndex() const noexcept { return frameIndex_; }
 

@@ -197,6 +197,10 @@ class ScanModel:
     points: np.ndarray | None = None
     colors: np.ndarray | None = None
     normals: np.ndarray | None = None
+    # The surface built from the scan's depth views, once it has been.
+    surface: tuple | None = None
+    # The depth camera's fx, fy, cx, cy, which the surface is built with.
+    intrinsics: tuple = ()
     session: rea.ReaSession | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -671,11 +675,18 @@ class Viewport(QFrame):
     def set_frame_count(self, count: int) -> None:
         self.frames.setText(f"Rendering frames: {count}")
 
+    def show_surface(self, vertices, normals, indices, frame: bool = False) -> None:
+        """Draws a surface in place of the cloud it was built from."""
+        self.view3d.set_surface(vertices, normals, indices, frame=frame)
+        if self.view3d.error is None:
+            self.message.hide()
+
     def show_cloud(self, points, colors, normals, highlight=None, frame: bool = False) -> None:
         """Draws a cloud (sensor axes, millimetres) with a colour and a normal
         per point, and optionally an (N, 4) RGBA tint per point."""
         self._step = max(math.ceil(len(points) / self.MAX_SHOWN_POINTS), 1)
         shown = slice(None, None, self._step)
+        self.view3d.set_surface(None, None, ())  # a cloud replaces any surface
         self.view3d.set_cloud(points[shown], colors[shown], normals[shown],
                               None if highlight is None else highlight[shown], frame=frame)
         if self.view3d.error is None:

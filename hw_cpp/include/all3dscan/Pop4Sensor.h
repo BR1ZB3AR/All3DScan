@@ -75,6 +75,13 @@ public:
     uint32_t colorHeight() const noexcept { return colorHeight_; }
     // Number of frames captured so far.
     uint64_t frameIndex() const noexcept { return frameIndex_; }
+    // The depth camera's pinhole on the grid the frames come back on, from
+    // the scanner's factory calibration. All 0 before the first frame.
+    double fx() const noexcept { return fx_; }
+    double fy() const noexcept { return fy_; }
+    double cx() const noexcept { return cx_; }
+    double cy() const noexcept { return cy_; }
+
     // Whether the scanner is still there. False once it has unplugged or
     // re-enumerated: capture() then never succeeds again, and this object
     // should be dropped and a new one opened.
@@ -108,6 +115,7 @@ private:
     bool captureFirstFrame();
 
     std::unique_ptr<revoscan::protocol::IScannerProtocol> scanner_;
+    double fx_ = 0.0, fy_ = 0.0, cx_ = 0.0, cy_ = 0.0;
     std::string serial_;
     std::string backend_;
     std::string error_;

@@ -89,6 +89,32 @@ void main() {
 }
 """
 
+# A surface, rather than the points it was built from: no splats, and no
+# discarding, since a triangle has no gl_PointCoord to measure against.
+SURFACE_VERTEX = """
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+uniform mat4 u_mvp;
+uniform mat3 u_view_rotation;
+out vec3 v_normal;
+void main() {
+    gl_Position = u_mvp * vec4(position.x, -position.y, -position.z, 1.0);
+    v_normal = u_view_rotation * vec3(normal.x, -normal.y, -normal.z);
+}
+"""
+
+SURFACE_FRAGMENT = """
+in vec3 v_normal;
+uniform vec3 u_base_color;
+out vec4 frag;
+void main() {
+    // Lit from the viewer, with a little everywhere so the sides that face
+    // away still read as surface rather than going black.
+    float light = 0.25 + 0.75 * abs(normalize(v_normal).z);
+    frag = vec4(u_base_color * light, 1.0);
+}
+"""
+
 BACKGROUND_VERTEX = """
 out float v_height;
 void main() {
@@ -274,12 +300,15 @@ class PointCloudRenderer:
 
     def __init__(self) -> None:
         self.count = 0  # points in the GPU buffers
+        self.triangles = 0  # ...and triangles, when a surface is shown
         self.point_size_limit = MAX_SPLAT_PX  # the driver's, once initialised
         self._pending: dict[int, np.ndarray] = {}  # attribute location -> data to upload
+        self._surface: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._es = False
-        self._points = self._background = 0
-        self._vao = self._background_vao = 0
+        self._points = self._background = self._surface_program = 0
+        self._vao = self._background_vao = self._surface_vao = 0
         self._buffers: list[int] = []
+        self._surface_buffers: list[int] = []
 
     @property
     def initialized(self) -> bool:
@@ -309,6 +338,21 @@ class PointCloudRenderer:
         # Core profiles need a vertex array bound to draw, even one with no buffers.
         self._background_vao = GL.glGenVertexArrays(1)
 
+        self._surface_program = _program(header, SURFACE_VERTEX, SURFACE_FRAGMENT)
+        self._surface_uniforms = {
+            name: GL.glGetUniformLocation(self._surface_program, name)
+            for name in ("u_mvp", "u_view_rotation", "u_base_color")
+        }
+        self._surface_vao = GL.glGenVertexArrays(1)
+        GL.glBindVertexArray(self._surface_vao)
+        # Positions, normals, and the triples of indices making the triangles.
+        self._surface_buffers = list(GL.glGenBuffers(3))
+        for location, buffer in enumerate(self._surface_buffers[:2]):
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, buffer)
+            GL.glEnableVertexAttribArray(location)
+            GL.glVertexAttribPointer(location, 3, GL.GL_FLOAT, False, 0, None)
+        GL.glBindVertexArray(0)
+
     def set_cloud(self, points: np.ndarray, colors: np.ndarray, normals: np.ndarray,
                   highlight: np.ndarray | None = None) -> None:
         """Queues a cloud for the next draw; needs no context. highlight is an
@@ -317,6 +361,24 @@ class PointCloudRenderer:
             highlight = np.zeros((len(points), 4), np.uint8)
         for location, array in enumerate((points, normals, colors, highlight)):
             self._queue(location, array, len(points))
+
+    def set_surface(self, vertices, normals, indices) -> None:
+        """Queues a surface to draw in place of the cloud; needs no context.
+        Passing None for the vertices takes it away again."""
+        if vertices is None or not len(indices):
+            self._surface = None
+            self.triangles = 0
+            return
+        vertices = np.ascontiguousarray(vertices, np.float32)
+        normals = np.ascontiguousarray(normals, np.float32)
+        indices = np.ascontiguousarray(indices, np.uint32).reshape(-1)
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or vertices.shape != normals.shape:
+            raise ValueError(f"a surface needs an (N, 3) vertex and normal each, got "
+                             f"{vertices.shape} and {normals.shape}")
+        if indices.max() >= len(vertices):
+            raise ValueError("a triangle points past the end of the vertices")
+        self._surface = (vertices, normals, indices)
+        self.triangles = len(indices) // 3
 
     def set_highlight(self, highlight: np.ndarray) -> None:
         """Queues a new tint for the points already set; needs no context."""
@@ -344,6 +406,16 @@ class PointCloudRenderer:
         GL.glBindVertexArray(self._background_vao)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
 
+        if self._surface is not None:
+            vertices, normals, indices = self._surface
+            for buffer, array in zip(self._surface_buffers, (vertices, normals)):
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, buffer)
+                GL.glBufferData(GL.GL_ARRAY_BUFFER, array.nbytes, array, GL.GL_STATIC_DRAW)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._surface_buffers[2])
+            GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices,
+                            GL.GL_STATIC_DRAW)
+            self._surface = None
+
         for location, array in self._pending.items():
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers[location])
             GL.glBufferData(GL.GL_ARRAY_BUFFER, array.nbytes, array if array.size else None,
@@ -351,6 +423,23 @@ class PointCloudRenderer:
             if location == 0:
                 self.count = len(array)
         self._pending.clear()
+
+        if self.triangles:
+            # A surface stands in for the cloud it was built from.
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glDepthFunc(GL.GL_LESS)
+            GL.glUseProgram(self._surface_program)
+            GL.glUniformMatrix4fv(self._surface_uniforms["u_mvp"], 1, False,
+                                  np.ascontiguousarray(mvp.T, np.float32))
+            GL.glUniformMatrix3fv(self._surface_uniforms["u_view_rotation"], 1, False,
+                                  np.ascontiguousarray(view_rotation.T, np.float32))
+            GL.glUniform3f(self._surface_uniforms["u_base_color"], *base_color)
+            GL.glBindVertexArray(self._surface_vao)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._surface_buffers[2])
+            GL.glDrawElements(GL.GL_TRIANGLES, self.triangles * 3, GL.GL_UNSIGNED_INT, None)
+            GL.glBindVertexArray(0)
+            GL.glUseProgram(0)
+            return
 
         if self.count:
             # Qt can change GL state between frames, so set everything relied on.
@@ -383,11 +472,15 @@ class PointCloudRenderer:
         """Frees the GL objects; the context must still be current."""
         if self._buffers:
             GL.glDeleteBuffers(len(self._buffers), self._buffers)
-            GL.glDeleteVertexArrays(2, [self._vao, self._background_vao])
+            GL.glDeleteBuffers(len(self._surface_buffers), self._surface_buffers)
+            GL.glDeleteVertexArrays(3, [self._vao, self._background_vao, self._surface_vao])
             GL.glDeleteProgram(self._points)
             GL.glDeleteProgram(self._background)
+            GL.glDeleteProgram(self._surface_program)
             self._buffers = []
+            self._surface_buffers = []
         self.count = 0
+        self.triangles = 0
 
 
 class PointCloudView(QOpenGLWidget):
@@ -404,6 +497,8 @@ class PointCloudView(QOpenGLWidget):
         self.base_color = SCAN_BLUE  # when not showing each point's own colour
         self.splat_mm = 2.0
         self.point_count = 0
+        self.triangle_count = 0
+        self._shown_surface: tuple | None = None
         self.error: str | None = None
         # The cloud shown, kept to frame it again on request and to upload it
         # again if Qt replaces the context.
@@ -429,6 +524,18 @@ class PointCloudView(QOpenGLWidget):
                 self.camera.show(points)
         self.update()
 
+    def set_surface(self, vertices, normals, indices, frame: bool = False) -> None:
+        """Shows a surface in place of the cloud. None for the vertices goes
+        back to the cloud."""
+        self.renderer.set_surface(vertices, normals, indices)
+        self._shown_surface = (None if vertices is None or not len(indices)
+                               else (vertices, normals, indices))
+        self.triangle_count = self.renderer.triangles
+        if self._shown_surface is not None and frame and len(vertices):
+            self.camera.frame(np.asarray(vertices, np.float32))
+            self._framed = True
+        self.update()
+
     def set_highlight(self, highlight: np.ndarray) -> None:
         """Tints the shown cloud afresh."""
         if self._cloud is not None:
@@ -442,6 +549,7 @@ class PointCloudView(QOpenGLWidget):
         self.point_count = 0
         self._cloud = None
         self._framed = False
+        self.set_surface(None, None, ())
         self.update()
 
     def set_color_mode(self, use_color: bool) -> None:
@@ -471,6 +579,8 @@ class PointCloudView(QOpenGLWidget):
         self.context().aboutToBeDestroyed.connect(self._release)
         if self._cloud is not None:  # a new context after the old one went
             self.renderer.set_cloud(*self._cloud)
+        if self._shown_surface is not None:
+            self.renderer.set_surface(*self._shown_surface)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)

@@ -77,6 +77,7 @@ class FakePop4:
         self.closed = False
         self.connected = True  # False once the scanner has unplugged
         self.frames_taken = 0
+        self.intrinsics = self._mock.intrinsics
 
     # How many points the scene shows at a given exposure; a flat scene by
     # default, so only the auto-exposure tests care.
@@ -1003,6 +1004,51 @@ class FusionTests(WindowTestCase):
                          np.tile([0.0, 0.0, -1.0], (20, 1)).astype(np.float32))
         window.scan_panel.complete()
         self.assertEqual(len(window.model_panel.current_model().points), 20)
+
+    def test_a_scan_builds_a_surface_from_its_depth_views(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window, frames=10)
+        wait_until(lambda: window._tracked >= 3, timeout_s=60)
+        window.scan_panel.complete()
+        model = window.model_panel.current_model()
+        self.assertTrue(model.intrinsics, "the scan must remember its camera")
+        self.assertTrue(window.mesh_action.isEnabled())
+
+        window.mesh_action.trigger()
+        self.assertTrue(window._meshing)
+        self.assertFalse(window.mesh_action.isEnabled())  # busy
+        wait_until(lambda: not window._meshing, timeout_s=120)
+
+        self.assertIsNotNone(model.surface, "no surface was built")
+        vertices, normals, indices = model.surface
+        self.assertGreater(len(indices), 100)
+        self.assertEqual(normals.shape, vertices.shape)
+        self.assertLess(indices.max(), len(vertices))
+        np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-3)
+        # The surface stands in the viewport in place of its points.
+        self.assertEqual(window.viewport.view3d.triangle_count, len(indices))
+        self.assertTrue(window.mesh_action.isEnabled())
+
+    def test_showing_a_cloud_puts_away_the_surface(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        view = window.viewport.view3d
+        vertices = np.array([[0, 0, 400], [20, 0, 400], [0, 20, 400]], np.float32)
+        normals = np.tile([0.0, 0.0, -1.0], (3, 1)).astype(np.float32)
+        view.set_surface(vertices, normals, np.array([[0, 1, 2]], np.uint32))
+        self.assertEqual(view.triangle_count, 1)
+        self.scan(window, frames=2)
+        self.assertEqual(view.triangle_count, 0, "a cloud should replace a surface")
+
+    def test_a_surface_with_a_broken_triangle_is_refused(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        view = window.viewport.view3d
+        vertices = np.zeros((3, 3), np.float32)
+        normals = np.zeros((3, 3), np.float32)
+        with self.assertRaises(ValueError):
+            view.set_surface(vertices, normals, np.array([[0, 1, 7]], np.uint32))
+        with self.assertRaises(ValueError):
+            view.set_surface(vertices, np.zeros((2, 3), np.float32),
+                             np.array([[0, 1, 2]], np.uint32))
 
     def test_the_points_shown_are_the_models_while_fusing(self):
         window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))

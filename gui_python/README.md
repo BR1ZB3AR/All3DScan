@@ -167,6 +167,21 @@ dropped when far fewer of its neighbours are close by than the model's
 points typically have — measured from the model itself, so a sparse scan is
 not stripped bare. On a real scan this took out 5,029 points of 113,957.
 
+## The surface
+
+**Mesh**, in the ribbon, melts the scan's depth views into one closed
+surface and shows it in place of the points — the blue output a scanner
+ends with. The reconstruction is the Qt app's own
+(`src/geometry/TsdfVolume`), wrapped by `mesh_cpp`: the views are melted
+into a truncated signed distance field and the surface drawn through it, so
+holes between views close over and the noise a point cloud shows as fur
+averages out.
+
+The views are kept as the scan runs, one whenever the scanner has moved
+8 mm or 6 degrees since the last, up to 120 of them. Keeping every frame
+would cost hundreds of megabytes and tell the reconstruction nothing it
+does not already know.
+
 ## Scan to CAD (REA)
 
 Once a scan is complete, the REA tools in the ribbon work on the selected
