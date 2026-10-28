@@ -486,6 +486,11 @@ class ScanPanel(QWidget):
         self._ready = ready
         self._set_state(self.state)
 
+    def show_scanning_distance(self, near: float, far: float) -> None:
+        """What the scanner is really searching, which Auto narrows onto the
+        object. The preset's own range is shown again when it changes."""
+        self.scale_label.setText(f"{near:.0f} – {far:.0f} mm")
+
     def set_mode(self, mode: str) -> None:
         """Shows the scanner's scan mode, without asking for it again."""
         self.mode.setCurrentIndex(max(self.mode.findData(mode), 0))

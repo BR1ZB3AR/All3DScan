@@ -731,6 +731,11 @@ class Pop4Tests(WindowTestCase):
         kept = float(((depths >= near) & (depths <= far)).mean())
         self.assertGreater(kept, 0.9, f"only {kept:.0%} of the points are still in range")
         self.assertIn("mm, where the object is", window.viewport.toast.text())
+        # The panel has to say what the scanner is really searching.
+        self.assertEqual(window.scan_panel.scale_label.text(), f"{near:.0f} – {far:.0f} mm")
+        window.scan_panel.accuracy.setCurrentIndex(1)  # a new preset, a new range
+        self.assertNotEqual(window.scan_panel.scale_label.text(),
+                            f"{near:.0f} – {far:.0f} mm")
 
     def test_auto_leaves_the_working_distance_alone_when_it_sees_nothing(self):
         window = self.open_window()

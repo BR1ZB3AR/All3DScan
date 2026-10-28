@@ -1415,6 +1415,7 @@ class MainWindow(QMainWindow):
         band = result.get("range_mm")
         if band:
             self.viewport.gauge.set_bands(self.scan_panel.preset.band_edges_mm, band)
+            self.scan_panel.show_scanning_distance(*band)
             print(f"auto range: looking {band[0]:.0f}–{band[1]:.0f} mm, where the object is",
                   flush=True)
             told += f"; looking {band[0]:.0f}–{band[1]:.0f} mm, where the object is"
