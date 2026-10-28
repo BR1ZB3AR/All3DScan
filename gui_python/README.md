@@ -78,10 +78,15 @@ says so while it waits. Then:
   status that claims it is there, stops the scan, and reconnects once it is
   back. Opening one waits for its first frame, so "connected" means frames
   are flowing.
+- **Auto**, beside the depth exposure, tries a few exposures and keeps the
+  one that sees most of the object. Measured on a real POP 4, the points in
+  a frame ran three to one across the range, so the preset's exposure is
+  often far from the best for the scene in front of it.
 - **Coverage**, in the status bar, is the share of the depth camera's pixels
-  that got a distance. Good infrared scanning measures around 28%; under 5%
-  for eight frames, the viewport says what to check, since a scene too far,
-  too dark or too shiny returns no pattern to match.
+  that got a distance. It is only ever a hint: a small object rightly fills
+  little of the frame — a 60 mm ring at 360 mm measured 4.7%, and scanned —
+  so the viewport complains when a frame holds too few *points* to scan
+  with, not when coverage is low.
 - The **depth exposure** and the preset's working distance are sent to the
   scanner whenever they change; the "Depth camera" preview shows the
   infrared image the projector lights, and "RGB camera" the colour camera.
@@ -113,6 +118,9 @@ model so far with point-to-plane ICP and merged into it, carrying its colours
 and normals. A frame that cannot be placed is left out rather than smeared
 across the model, and the status bar's **Tracking** count shows how many were
 placed of those tried.
+
+The cloud is drawn green while scanning and blue once the scan is complete,
+as Revo Scan does, so the two states are told apart at a glance.
 
 Fusing a frame costs far more than capturing one, so it runs on its own
 thread and takes whichever frame is current when it is free, dropping the

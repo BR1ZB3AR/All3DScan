@@ -73,6 +73,7 @@ class ScanWorker(QObject):
     sensor_lost = pyqtSignal(str)  # the POP 4 went away mid-session; why
     open_failed = pyqtSignal(str)
     control_done = pyqtSignal(str, str)  # the control, and why it failed or ""
+    exposure_tuned = pyqtSignal(dict)  # what each exposure saw, and the one kept
 
     def __init__(self, sensor, open_pop4) -> None:
         super().__init__()
@@ -139,6 +140,52 @@ class ScanWorker(QObject):
             return
         self.control_done.emit(name, "")
 
+    # Exposures tried, in microseconds, within the range the backend takes.
+    EXPOSURES = (1000, 2000, 3500, 5000, 6000)
+    SETTLE_FRAMES = 4  # the sensor takes a few frames to follow a change
+    MEASURE_FRAMES = 8  # per-frame yield is noisy, so judge on several
+
+    @pyqtSlot()
+    def tune_exposure(self) -> None:
+        """Tries each exposure and keeps the one that sees most of the
+        object. Measured on a real POP 4: the points in a frame varied three
+        to one across this range, so the default is often far from the best.
+        Runs here, between captures, because it needs the scanner to itself."""
+        if self._sensor is self._mock:
+            return
+        was = self._sensor.exposure_us
+        tried: list[tuple[int, int]] = []
+        trouble = ""
+        for microseconds in self.EXPOSURES:
+            # The scanner refuses a settings write for a while after it has
+            # re-enumerated, which connecting makes it do. Skip that step
+            # rather than lose the sweep: the rest still say which is best.
+            try:
+                self._sensor.set_exposure(microseconds)
+                for _ in range(self.SETTLE_FRAMES):
+                    self._sensor.capture_frame(timeout_ms=3000)
+                seen = [len(frame.points)
+                        for frame in (self._sensor.capture_frame(timeout_ms=3000)
+                                      for _ in range(self.MEASURE_FRAMES))
+                        if frame is not None]
+            except BaseException as exc:
+                trouble = describe(exc)
+                if self._gone():
+                    break
+                continue
+            if seen:
+                tried.append((microseconds, int(np.median(seen))))
+        if not tried:
+            self.exposure_tuned.emit({"error": trouble or "no frames came", "tried": []})
+            return
+        best = max(tried, key=lambda t: t[1])[0]
+        try:
+            self._sensor.set_exposure(best)
+        except BaseException as exc:
+            self.exposure_tuned.emit({"error": describe(exc), "tried": tried})
+            return
+        self.exposure_tuned.emit({"exposure_us": best, "tried": tried, "trouble": trouble})
+
     def close(self) -> None:
         """Lets the POP 4 go, if it is in use. Also called on the GUI thread
         once this one has stopped."""
@@ -201,8 +248,10 @@ class FusionWorker(QObject):
     view keeps its frame rate and the model fills in as fast as the machine
     allows, which is how a scanner tracks."""
 
-    # The model, a thinned copy of it to draw, and how the frame sat.
-    model_ready = pyqtSignal(tuple, tuple, dict)
+    # The model, a thinned copy of it to draw, and how the frame sat. The
+    # first two are None for a frame that would not align: the window waits
+    # on this either way before offering another, so it is always sent.
+    model_ready = pyqtSignal(object, object, dict)
     failed = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -231,11 +280,11 @@ class FusionWorker(QObject):
         except BaseException as exc:
             self.failed.emit(describe(exc))
             return
-        if cloud is not None:
-            # Thinned here rather than on the GUI thread: a model of several
-            # million points costs about 100 ms to cut down, and the window
-            # would stop for it. Arrays themselves pass by reference.
-            self.model_ready.emit(cloud, for_display(cloud), fit)
+        # Thinned here rather than on the GUI thread: a model of several
+        # million points costs about 100 ms to cut down, and the window would
+        # stop for it. Arrays themselves pass by reference.
+        display = for_display(cloud) if cloud is not None else None
+        self.model_ready.emit(cloud, display, fit)
 
 
 class MainWindow(QMainWindow):
@@ -243,6 +292,7 @@ class MainWindow(QMainWindow):
     fuse_requested = pyqtSignal(object, object, object)  # a frame's points, colours, normals
     fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
     fusion_stop_requested = pyqtSignal()
+    tune_exposure_requested = pyqtSignal()
     pop4_requested = pyqtSignal()
     mock_requested = pyqtSignal()
     control_requested = pyqtSignal(str, tuple)  # a POP 4 method and its arguments
@@ -254,13 +304,23 @@ class MainWindow(QMainWindow):
     # Below this share of pixels with depth, the scanner is not really seeing
     # the object: good infrared scanning measured 27.8% (RE_NOTES 2026-10-16),
     # and a scene too far or too dark gives under 1%.
-    LOW_COVERAGE = 0.05
+    # Points in a frame below which the scanner is not seeing enough of
+    # anything to scan. Judged on points rather than on the share of the
+    # depth camera they cover: a small object rightly fills little of the
+    # frame — a 60 mm ring at 360 mm measured 4.7% of it, and scanned.
+    TOO_FEW_POINTS = 1_000
     # Frames in a row under it before saying so, so a glance away is ignored.
     LOW_COVERAGE_FRAMES = 8
     # After the scanner goes away mid-session it usually comes back within a
     # few seconds, so try this many times before giving up on it. Each try
     # waits for two consecutive looks that find one, about four seconds.
     MAX_RECONNECTS = 4
+    # Looks in a row that must find no scanner before it counts as gone. It
+    # leaves the bus and comes back on its own — connecting resets it, which
+    # costs about twelve seconds of re-enumeration — so one empty look means
+    # nothing. A scanner that has really gone is caught by the captures
+    # failing as well, which is immediate.
+    ABSENT_LOOKS = 4
     # One point per cube of this edge in the fused model, as the Qt app's
     # pipeline uses (src/processing/ScanPipeline.cpp).
     FUSION_VOXEL_MM = 1.0
@@ -333,6 +393,7 @@ class MainWindow(QMainWindow):
         self._connecting = False  # an open is on its way to the worker
         self._reconnects = 0  # tries since the scanner was lost
         self._present_ticks = 0  # consecutive looks that found a POP 4
+        self._absent_ticks = 0  # and consecutive looks that did not
         self._scan_mode = "infrared"  # the POP 4's, as last confirmed
         self._scan_mode_asked = "infrared"
         self._thread = QThread(self)
@@ -350,10 +411,13 @@ class MainWindow(QMainWindow):
         self._worker.sensor_lost.connect(self._on_sensor_lost)
         self._worker.open_failed.connect(self._on_open_failed)
         self._worker.control_done.connect(self._on_control_done)
+        self._worker.exposure_tuned.connect(self._on_exposure_tuned)
+        self.tune_exposure_requested.connect(self._worker.tune_exposure)
         self._thread.start()
 
         self._fitting = False
         self._fusing = False  # a frame is with the fusion worker
+        self._tuning = False  # the scanner is busy trying exposures
         self._fused: tuple | None = None  # the model built from this scan
         self._tracked = 0  # frames the fusion placed on the model
         self._offered = 0  # frames it was given
@@ -396,6 +460,7 @@ class MainWindow(QMainWindow):
         camera.light_level_changed.connect(
             lambda light, level: self._control("set_light_level", light, level))
         camera.exposure_changed.connect(lambda us: self._control("set_exposure", us))
+        camera.auto_exposure_requested.connect(self._tune_exposure)
         self._on_preset(panel.preset)
         self._show_connection(False)
 
@@ -573,8 +638,13 @@ class MainWindow(QMainWindow):
         self.fuse_requested.emit(frame.points[::step], frame.colors[::step],
                                  frame.normals[::step])
 
-    def _on_model_ready(self, model: tuple, display: tuple, fit: dict) -> None:
+    def _on_model_ready(self, model, display, fit: dict) -> None:
         self._fusing = False
+        if model is None:
+            # The frame would not sit on the model. Say so, and carry on:
+            # the next one may well align.
+            self._tracking.setText(f"Tracking: {self._tracked}/{self._offered}")
+            return
         self._tracked += 1
         self._fused = model
         self._tracking.setText(f"Tracking: {self._tracked}/{self._offered}")
@@ -590,10 +660,10 @@ class MainWindow(QMainWindow):
 
     def _show_coverage(self, frame) -> None:
         """Reports how much of the depth camera got a distance, and says so
-        when the scanner is getting almost nothing."""
-        coverage = float(np.mean(frame.depth_mm > 0))
-        self._coverage.setText(f"Coverage: {coverage:.1%}")
-        if coverage >= self.LOW_COVERAGE:
+        when the scanner is getting too little to scan with."""
+        points = len(frame.points)
+        self._coverage.setText(f"Coverage: {np.mean(frame.depth_mm > 0):.1%}")
+        if points >= self.TOO_FEW_POINTS:
             self._low_coverage = 0
             self.viewport.show_warning("")
             return
@@ -601,10 +671,11 @@ class MainWindow(QMainWindow):
         if self._low_coverage == self.LOW_COVERAGE_FRAMES:
             near, far = self.scan_panel.preset.scale_mm
             self.viewport.show_warning(
-                f"Almost no depth ({coverage:.1%} of the depth camera). Check that the object "
-                f"is {near}–{far} mm away — the distance this scan setting looks in — and that "
-                f"it is not too dark or too shiny for the scanner's pattern to show on it."
-                if self._pop4 else f"Almost no depth ({coverage:.1%} of the depth camera).")
+                f"Only {points:,} points a frame. Check that the object is {near}–{far} mm "
+                f"away — the distance this scan setting looks in — and that it is not too "
+                f"dark or too shiny for the scanner's pattern to show on it. A longer depth "
+                f"exposure often helps."
+                if self._pop4 else f"Only {points:,} points a frame.")
 
     def _on_frame_missed(self, reason: str) -> None:
         self._in_flight = False
@@ -808,13 +879,14 @@ class MainWindow(QMainWindow):
     def _check_pop4_present(self) -> None:
         present = bool(self._pop4_present())
         self.scan_panel.set_pop4_present(present or self.scan_panel.pop4)
-        if self._pop4 and not present and not self._connecting:
+        if self._pop4 and self._absent_ticks >= self.ABSENT_LOOKS and not self._connecting:
             # Unplugged between scans, where no capture is running to notice.
             self._on_sensor_lost("it is no longer on the USB bus")
             return
         # A scanner just back on the bus re-enumerates for a moment, so wait
         # for a second look before opening it.
         self._present_ticks = self._present_ticks + 1 if present else 0
+        self._absent_ticks = 0 if present else self._absent_ticks + 1
         wanted = self.scan_panel.pop4 and not self._pop4 and not self._connecting
         if wanted and self._present_ticks >= 2 and 0 < self._reconnects < self.MAX_RECONNECTS:
             self._reconnects += 1
@@ -888,7 +960,7 @@ class MainWindow(QMainWindow):
         # asked for and a scan after reconnecting would sit silent.
         self._in_flight = False
         self._reconnects = max(self._reconnects, 1)
-        self._present_ticks = 0
+        self._present_ticks = self._absent_ticks = 0
         self.camera_panel.set_pop4(False)
         print(f"the POP 4 disconnected: {reason}", file=sys.stderr, flush=True)
         self.scan_panel.cancel()  # a scan cannot go on without the scanner
@@ -912,6 +984,35 @@ class MainWindow(QMainWindow):
         """Has the POP 4 run one of its methods, between captures."""
         if self._pop4:
             self.control_requested.emit(name, args)
+
+    def _tune_exposure(self) -> None:
+        """Has the scanner try a few exposures and keep the best."""
+        if not self._pop4 or self._tuning:
+            return
+        self._tuning = True
+        self.camera_panel.exposure_box.setEnabled(False)
+        tries = len(ScanWorker.EXPOSURES)
+        self.viewport.show_toast(f"Trying {tries} exposures to see which shows most of the "
+                                 f"object…", 60_000)
+        self.tune_exposure_requested.emit()
+
+    def _on_exposure_tuned(self, result: dict) -> None:
+        self._tuning = False
+        self.camera_panel.exposure_box.setEnabled(self._pop4)
+        tried = ", ".join(f"{us / 1000:.1f} ms: {points:,}" for us, points in result["tried"])
+        if result.get("trouble"):
+            print(f"auto exposure: {result['trouble']} on the way, settings skipped",
+                  file=sys.stderr, flush=True)
+        if "error" in result:
+            print(f"auto exposure failed: {result['error']} (tried {tried})",
+                  file=sys.stderr, flush=True)
+            self.viewport.show_toast(f"Auto exposure failed: {result['error']}", 6000)
+            return
+        chosen = result["exposure_us"]
+        self.camera_panel.show_exposure(chosen)
+        print(f"auto exposure: kept {chosen} us (points a frame — {tried})", flush=True)
+        self.viewport.show_toast(f"Depth exposure {chosen / 1000:.1f} ms, which saw the most "
+                                 f"of the object", 5000)
 
     def _on_mode_picked(self, mode: str) -> None:
         if not self._pop4 or mode == self._scan_mode:
@@ -955,13 +1056,18 @@ class MainWindow(QMainWindow):
 
 
 def cloud_pixels(window: MainWindow) -> tuple[int, int]:
-    """How many pixels of the 3D view show the cloud in scan blue, and how
-    many in a fitted primitive's tint, as last drawn."""
+    """How many pixels of the 3D view show the cloud in its scan colour —
+    green while scanning, blue once complete — and how many in a fitted
+    primitive's tint, as last drawn."""
     rgb = image_pixels(window.viewport.view3d.grabFramebuffer()).astype(np.int16)
     red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    scan_blue = (blue > red + 30) & (blue > green + 15)
-    tinted = np.maximum(red, green) > blue + 15  # amber, green, pink...: never grey or blue
-    return int(scan_blue.sum()), int(tinted.sum())
+    # By ratio, not by a fixed margin: shading takes a splat down to a third
+    # of full brightness, where any fixed margin stops holding.
+    scan_blue = blue > 1.4 * np.maximum(red, green)
+    scan_green = green > 1.4 * np.maximum(red, blue)
+    # Amber, pink and the rest of the palette: never grey, nor a scan colour.
+    tinted = (np.maximum(red, green) > blue + 15) & ~scan_green
+    return int((scan_blue | scan_green).sum()), int(tinted.sum())
 
 
 def run_smoke_test(app: QApplication, window: MainWindow, frames: int = 30) -> None:
@@ -993,7 +1099,7 @@ def run_smoke_test(app: QApplication, window: MainWindow, frames: int = 30) -> N
         report["previews"] = all(not f.image.pixmap().isNull() for f in feeds)
         report["distance"] = window.viewport.gauge.distance_mm
         report["shown"] = window.viewport.view3d.point_count
-        report["blue pixels"], _ = cloud_pixels(window)
+        report["cloud pixels"], _ = cloud_pixels(window)
         window.scan_panel.complete()
         report["model"] = window.model_panel.models.count() == 1
         window._rea_worker.fitted.connect(on_fitted)
@@ -1018,12 +1124,12 @@ def run_smoke_test(app: QApplication, window: MainWindow, frames: int = 30) -> N
 
     def finish() -> None:
         ok = (report["previews"] and report["shown"] and report["distance"] is not None
-              and report["blue pixels"] > 1000 and report["model"] and report.get("plane")
+              and report["cloud pixels"] > 1000 and report["model"] and report.get("plane")
               and report.get("cylinder") and report["tinted pixels"] > 1000
               and report["STEP bodies"] == ["Cylinder 1", "Plane 1"])
         print(f"smoke test: {frames} frames streamed; previews "
               f"{'filled' if report['previews'] else 'EMPTY'}; 3D view showing "
-              f"{report['shown']:,} points ({report['blue pixels']:,} pixels in scan blue); "
+              f"{report['shown']:,} points ({report['cloud pixels']:,} pixels of cloud); "
               f"distance {report['distance']} mm; model listed: {report['model']}; "
               f"fitted {report.get('fits') or 'nothing'} ({report['tinted pixels']:,} tinted "
               f"pixels); STEP bodies read back: {report['STEP bodies']}; the GUI thread's "

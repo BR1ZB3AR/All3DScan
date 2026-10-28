@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt6.QtCore import QTimer
-from PyQt6.QtTest import QTest
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
 GUI_DIR = Path(__file__).resolve().parents[1]
@@ -33,6 +33,7 @@ if QApplication.instance() is None:
 import all3dscan_engine as engine  # noqa: E402
 import app  # noqa: E402
 import rea_engine as rea  # noqa: E402
+import viewport3d  # noqa: E402
 from panels import ScanState  # noqa: E402
 from presets import load_presets  # noqa: E402
 from widgets import DistanceGauge, center_distance_mm, zone_for  # noqa: E402
@@ -72,6 +73,10 @@ class FakePop4:
         self.closed = False
         self.connected = True  # False once the scanner has unplugged
 
+    # How many points the scene shows at a given exposure; a flat scene by
+    # default, so only the auto-exposure tests care.
+    points_for_exposure = None
+
     def capture_frame(self, voxel_mm=None, timeout_ms=2000):
         if not self.connected:
             self.last_error = "the scanner disconnected (poll revents=0x18)"
@@ -79,7 +84,10 @@ class FakePop4:
         if self.missing:
             self.missing -= 1
             return None
-        return self._mock.capture_frame(voxel_mm)
+        frame = self._mock.capture_frame(voxel_mm)
+        if self.points_for_exposure is not None:
+            frame = Thinned(frame, self.points_for_exposure(self.exposure_us))
+        return frame
 
     def unplug(self) -> None:
         """What a POP 4 leaving the USB bus looks like to the app."""
@@ -102,6 +110,8 @@ class FakePop4:
                 raise OSError(f"{name} was refused")
             if name == "set_light":
                 self.lights[args[0]][0] = args[1]
+            elif name == "set_exposure":
+                self.exposure_us = args[0]
             elif name == "set_scan_mode":
                 if args[0] == "infrared":
                     time.sleep(0.3)  # a reboot, much shortened
@@ -111,6 +121,29 @@ class FakePop4:
 
     def close(self):
         self.closed = True
+
+
+class Thinned:
+    """A frame cut down to a given number of points, standing in for a scene
+    the scanner sees more or less of as the exposure changes."""
+
+    def __init__(self, like, points: int) -> None:
+        keep = max(min(points, len(like.points)), 0)
+        self.points, self.colors = like.points[:keep], like.colors[:keep]
+        self.normals, self.depth_mm = like.normals[:keep], like.depth_mm
+        self.ir, self.rgb, self.index = like.ir, like.rgb, like.index
+
+
+class BlankFrame:
+    """A frame the scanner found no depth in: the images still arrive, with
+    nothing in them, as they do when the object is out of range."""
+
+    def __init__(self, like) -> None:
+        self.depth_mm = np.zeros_like(like.depth_mm)
+        self.ir, self.rgb, self.index = like.ir, like.rgb, like.index
+        self.points = np.zeros((0, 3), np.float32)
+        self.colors = np.zeros((0, 3), np.uint8)
+        self.normals = np.zeros((0, 3), np.float32)
 
 
 class WindowTestCase(unittest.TestCase):
@@ -293,8 +326,8 @@ class StreamingTests(WindowTestCase):
         window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
         window.scan_panel.new_scan()
         wait_until(lambda: window.frames >= 2)
-        blue, tinted = app.cloud_pixels(window)
-        self.assertGreater(blue, 20_000)  # most of the view: the wall, the ball and the pipe
+        cloud, tinted = app.cloud_pixels(window)
+        self.assertGreater(cloud, 20_000)  # most of the view: the wall, ball and pipe
         self.assertEqual(tinted, 0)
 
     def test_a_3d_view_that_cannot_start_says_so(self):
@@ -411,6 +444,62 @@ class Pop4Tests(WindowTestCase):
                          [("projector", False), ("fill light", True)])
         self.assertEqual(self.calls("set_light_level"), [("fill light", 100)])
 
+    def test_auto_exposure_keeps_the_setting_that_sees_most(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        # The fake sees more of the object the longer the exposure, up to a
+        # peak part way through the range, as a real scene does.
+        best = 3500
+        self.pop4.points_for_exposure = lambda us: 9000 - abs(us - best) // 2
+        window.camera_panel.auto_exposure.click()
+        self.assertTrue(window._tuning)
+        self.assertFalse(window.camera_panel.exposure_box.isEnabled())  # busy
+        wait_until(lambda: not window._tuning, timeout_s=60)
+
+        self.assertEqual(self.pop4.exposure_us, best)
+        self.assertEqual(window.camera_panel.exposure.value(), best)
+        self.assertTrue(window.camera_panel.exposure_box.isEnabled())
+        self.assertIn("3.5 ms", window.viewport.toast.text())
+        # Every exposure in the sweep was tried, in order, and the best one
+        # put back at the end. Earlier calls are the preset's, sent on connect.
+        sweep = list(app.ScanWorker.EXPOSURES)
+        tried = [args[0] for name, args in self.pop4.calls if name == "set_exposure"]
+        self.assertEqual(tried[-len(sweep) - 1 : -1], sweep)
+        self.assertEqual(tried[-1], best)
+
+    def test_auto_exposure_reports_a_scanner_that_refuses_everything(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        self.pop4.refuse.add("set_exposure")
+        window.camera_panel.auto_exposure.click()
+        wait_until(lambda: not window._tuning, timeout_s=60)
+        self.assertIn("Auto exposure failed", window.viewport.toast.text())
+        self.assertTrue(window.camera_panel.exposure_box.isEnabled())
+
+    def test_auto_exposure_rides_out_a_setting_the_scanner_refuses(self):
+        # The scanner refuses a settings write for a while after connecting
+        # resets it. One refusal must not lose the whole sweep.
+        window = self.open_window()
+        self.connect_pop4(window)
+        first = app.ScanWorker.EXPOSURES[0]
+        best = app.ScanWorker.EXPOSURES[-1]
+        self.pop4.points_for_exposure = lambda us: 2000 + us // 10
+        original = self.pop4.set_exposure if hasattr(self.pop4, "_set") else None
+        refused = {"once": True}
+
+        def flaky(us):
+            if us == first and refused["once"]:
+                refused["once"] = False
+                raise OSError("POP4 not found while applying CS7 settings")
+            self.pop4.exposure_us = us
+            self.pop4.calls.append(("set_exposure", (us,)))
+
+        self.pop4.set_exposure = flaky
+        window.camera_panel.auto_exposure.click()
+        wait_until(lambda: not window._tuning, timeout_s=60)
+        self.assertEqual(self.pop4.exposure_us, best)  # the rest still decided it
+        self.assertIn(f"{best / 1000:.1f} ms", window.viewport.toast.text())
+
     def test_a_refused_control_says_so(self):
         window = self.open_window()
         self.connect_pop4(window)
@@ -431,15 +520,16 @@ class Pop4Tests(WindowTestCase):
     def test_almost_no_depth_is_reported_with_what_to_check(self):
         window = self.open_window()
         self.connect_pop4(window)
-        # A scanner seeing nothing: every pixel comes back without a distance.
-        blank = self.pop4._mock.capture_frame()
-        blank.depth_mm[:] = 0
+        # A scanner seeing nothing: no pixel comes back with a distance.
+        full = self.pop4._mock.capture_frame()
+        blank = BlankFrame(full)
         self.pop4.capture_frame = lambda voxel_mm=None, timeout_ms=2000: blank
         window.scan_panel.new_scan()
         wait_until(lambda: window.frames >= app.MainWindow.LOW_COVERAGE_FRAMES)
         self.assertEqual(window._coverage.text(), "Coverage: 0.0%")
         warning = window.viewport.warning
         self.assertFalse(warning.isHidden())
+        self.assertIn("Only 0 points a frame", warning.text())
         self.assertIn("250–500 mm away", warning.text())  # the preset's distance band
         self.assertIn("too dark", warning.text())
 
@@ -449,6 +539,22 @@ class Pop4Tests(WindowTestCase):
         window.scan_panel.new_scan()
         wait_until(lambda: window.frames > app.MainWindow.LOW_COVERAGE_FRAMES)
         self.assertRegex(window._coverage.text(), r"^Coverage: 9\d\.\d%$")  # the mock's ~98%
+        self.assertTrue(window.viewport.warning.isHidden())
+
+    def test_a_small_object_filling_little_of_the_frame_is_not_a_complaint(self):
+        # Measured on a real POP 4: a 60 mm ring at 360 mm covered 4.7% of the
+        # depth camera and scanned perfectly well. Judging by coverage alone
+        # would have called that a failure.
+        window = self.open_window()
+        self.connect_pop4(window)
+        small = self.pop4._mock.capture_frame()
+        keep = np.zeros(small.depth_mm.shape, bool)
+        keep[:24, :40] = True  # a corner of the view, about 5% of it
+        small.depth_mm[~keep] = 0
+        self.pop4.capture_frame = lambda voxel_mm=None, timeout_ms=2000: small
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames > app.MainWindow.LOW_COVERAGE_FRAMES + 2)
+        self.assertRegex(window._coverage.text(), r"^Coverage: [1-9]\.\d%$")
         self.assertTrue(window.viewport.warning.isHidden())
 
     def test_a_scanner_that_sends_nothing_stops_the_scan(self):
@@ -530,9 +636,25 @@ class Pop4Tests(WindowTestCase):
         window = self.open_window()
         self.connect_pop4(window)
         self.present = False  # off the USB bus, with nothing capturing
-        wait_until(lambda: not window._pop4, timeout_s=30)
+        wait_until(lambda: not window._pop4, timeout_s=60)
         self.assertIn("disconnected", window._connection.text())
         self.assertIn("no longer on the USB bus", window.viewport.warning.text())
+
+    def test_a_scanner_re_enumerating_is_not_called_gone(self):
+        # Connecting resets the scanner, so it leaves the bus and comes back
+        # about twelve seconds later. One empty look must not tear the
+        # session down, or every connection would end in a false alarm.
+        window = self.open_window()
+        self.connect_pop4(window)
+        self.present = False
+        for _ in range(app.MainWindow.ABSENT_LOOKS - 1):
+            window._check_pop4_present()
+        self.assertTrue(window._pop4, "gone after a few empty looks")
+        self.present = True
+        window._check_pop4_present()
+        self.assertEqual(window._absent_ticks, 0)  # back before it counted
+        self.assertTrue(window._pop4)
+        self.assertIn("TEST0001 connected", window._connection.text())
 
     def test_a_scanner_that_will_not_open_leaves_the_mock_in_use(self):
         window = self.open_window(pop4=OSError("POP 4: no 640x2560 capture node"))
@@ -592,6 +714,30 @@ class FusionTests(WindowTestCase):
         wait_until(lambda: window.frames > frames + 2)
         shown = int(window._points.text().removeprefix("Points: ").replace(",", ""))
         self.assertEqual(shown, len(window._fused[0]))
+
+    def test_a_frame_that_will_not_align_does_not_stall_the_fusion(self):
+        # The worker must report back even when a frame cannot be placed:
+        # the window waits on that before offering another, so staying quiet
+        # would stop the fusion for the rest of the scan.
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        self.scan(window)
+        wait_until(lambda: window._tracked >= 1, timeout_s=30)
+
+        spy = QSignalSpy(window._fusion_worker.model_ready)
+        window._fusion_worker.model_ready.emit(None, None, {"merged": False})
+        self.assertFalse(window._fusing)  # free to take the next frame
+        offered = window._offered
+        wait_until(lambda: window._offered > offered)
+        wait_until(lambda: window._tracked >= 2, timeout_s=30)
+        self.assertGreaterEqual(len(spy), 1)
+
+    def test_the_cloud_is_green_while_scanning_and_blue_once_complete(self):
+        window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
+        view = window.viewport.view3d
+        self.scan(window)
+        self.assertEqual(view.base_color, viewport3d.SCAN_GREEN)
+        window.scan_panel.complete()
+        self.assertEqual(view.base_color, viewport3d.SCAN_BLUE)
 
     def test_with_fusion_off_the_model_is_the_last_frame(self):
         window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))
@@ -797,7 +943,8 @@ class SmokeTestModeTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("previews filled", result.stdout)
-        self.assertRegex(result.stdout, r"3D view showing [1-9][\d,]* points \([1-9][\d,]* pixels")
+        self.assertRegex(result.stdout,
+                         r"3D view showing [1-9][\d,]* points \([1-9][\d,]* pixels of cloud")
         self.assertIn("model listed: True", result.stdout)
         self.assertRegex(result.stdout, r"fitted Plane 1: \d+ × \d+ mm; Cylinder 1: ⌀ 79\.\d mm")
         self.assertIn("STEP bodies read back: ['Cylinder 1', 'Plane 1']", result.stdout)

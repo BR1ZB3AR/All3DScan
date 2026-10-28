@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
 
 import rea_engine as rea
 from presets import ACCURACY, OBJECT_TYPES, TRACKING, Preset, find_preset, load_presets
-from viewport3d import PointCloudView
+from viewport3d import SCAN_BLUE, SCAN_GREEN, PointCloudView
 from widgets import DistanceGauge, VideoPreview
 
 
@@ -94,6 +94,7 @@ class CameraPanel(QWidget):
     light_toggled = pyqtSignal(str, bool)  # "projector" or "fill light", on
     light_level_changed = pyqtSignal(str, int)  # the light, 0..255
     exposure_changed = pyqtSignal(int)  # microseconds
+    auto_exposure_requested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -101,8 +102,15 @@ class CameraPanel(QWidget):
         self.exposure, exposure_row = slider(500, 6000, 3000, lambda us: f"{us / 1000:.1f} ms")
         self.exposure.setSingleStep(100)
         self.exposure.setPageStep(500)
+        self.auto_exposure = QPushButton("Auto")
+        self.auto_exposure.setToolTip(
+            "Try a few exposures and keep the one that sees the most of the object.\n"
+            "Takes about ten seconds, during which the scanner is busy.")
+        self.auto_exposure.clicked.connect(self.auto_exposure_requested)
+        exposure_row.insertWidget(0, self.auto_exposure)
         self._syncing = False  # while showing the scanner's settings, send nothing
-        self._settling = [debounced(self.exposure, self.exposure_changed.emit)]
+        self._settling = [debounced(
+            self.exposure, lambda us: self._syncing or self.exposure_changed.emit(us))]
         self.exposure_box = QWidget()
         form = QFormLayout(self.exposure_box)
         form.setContentsMargins(0, 0, 0, 0)
@@ -160,10 +168,17 @@ class CameraPanel(QWidget):
         self.projector_button.setChecked(lights["projector"][0])
         self.fill_light_button.setChecked(lights["fill light"][0])
         self.fill_light_level.setValue(lights["fill light"][1])
+        self.show_exposure(exposure_us)
+        self._syncing = False
+
+    def show_exposure(self, exposure_us: int) -> None:
+        """Shows an exposure the scanner already has, without sending it back."""
+        was = self._syncing
+        self._syncing = True
         self.exposure.setValue(exposure_us)
         for timer in self._settling:
             timer.stop()
-        self._syncing = False
+        self._syncing = was
 
     def clear_feeds(self) -> None:
         self.depth_view.clear()
@@ -645,9 +660,11 @@ class Viewport(QFrame):
         self.view3d.failed.connect(self._on_3d_failed)
 
     def set_stage(self, scanning: bool) -> None:
-        """Scanning shows the distance gauge; a finished model, the rendering choice."""
+        """Scanning shows the distance gauge and draws the cloud green; a
+        finished model shows the rendering choice and goes blue."""
         self.hint.setText(self.SCAN_HINTS if scanning else self.MODEL_HINTS)
         self.side.setCurrentIndex(0 if scanning else 1)
+        self.view3d.set_base_color(SCAN_GREEN if scanning else SCAN_BLUE)
 
     def set_frame_count(self, count: int) -> None:
         self.frames.setText(f"Rendering frames: {count}")

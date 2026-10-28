@@ -27,7 +27,10 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QOpenGLContext
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
+# Revo Scan draws the cloud green while it is scanning and blue once the
+# scan is finished, so the two states are told apart at a glance.
 SCAN_BLUE = (0.16, 0.42, 0.86)
+SCAN_GREEN = (0.24, 0.84, 0.33)
 BACKGROUND_TOP = (0.231, 0.239, 0.259)  # #3b3d42
 BACKGROUND_BOTTOM = (0.169, 0.173, 0.188)  # #2b2c30
 MAX_SPLAT_PX = 16.0  # the largest a splat is drawn, in logical pixels
@@ -388,6 +391,7 @@ class PointCloudView(QOpenGLWidget):
         self.camera = OrbitCamera()
         self.renderer = PointCloudRenderer()
         self.use_color = False
+        self.base_color = SCAN_BLUE  # when not showing each point's own colour
         self.splat_mm = 2.0
         self.point_count = 0
         self.error: str | None = None
@@ -434,6 +438,11 @@ class PointCloudView(QOpenGLWidget):
         self.use_color = use_color
         self.update()
 
+    def set_base_color(self, color: tuple[float, float, float]) -> None:
+        """The colour a cloud is drawn in while "No color" is chosen."""
+        self.base_color = color
+        self.update()
+
     def _fail(self, reason: str) -> None:
         if self.error is None:
             self.error = reason
@@ -469,7 +478,7 @@ class PointCloudView(QOpenGLWidget):
         mvp = self.camera.projection(width / height) @ view
         focal_px = height / (2 * math.tan(math.radians(OrbitCamera.FOV_Y) / 2))
         self.renderer.draw(width, height, mvp, view[:3, :3], focal_px * self.splat_mm,
-                           MAX_SPLAT_PX * ratio, self.use_color, SCAN_BLUE)
+                           MAX_SPLAT_PX * ratio, self.use_color, self.base_color)
 
     def _release(self) -> None:
         # Qt destroys a context when its view goes, and Python may collect a
