@@ -80,6 +80,7 @@ class FakePop4:
         self.closed = False
         self.connected = True  # False once the scanner has unplugged
         self.frames_taken = 0
+        self.exposure_writes: list[int] = []  # frames_taken at each set_exposure
         self.intrinsics = self._mock.intrinsics
 
     # How many points the scene shows at a given exposure; a flat scene by
@@ -121,6 +122,11 @@ class FakePop4:
 
         def control(*args):
             self.calls.append((name, args))
+            if name == "set_exposure":
+                # How many frames had been taken by the time of this write.
+                # Recorded here, on the thread that does the writing, so a
+                # test need not sample it from the GUI thread and race.
+                self.exposure_writes.append(self.frames_taken)
             if name in self.refuse:
                 raise OSError(f"{name} was refused")
             if name == "set_light":
@@ -765,15 +771,20 @@ class Pop4Tests(WindowTestCase):
 
     def test_exposure_writes_are_spaced_out(self):
         # Two writes in a row stop a real POP 4 sending frames at all, so
-        # frames must pass between them.
+        # frames must pass between them. Measured from what the scanner saw
+        # at each write, which the fake records as it happens: sampling the
+        # count from this thread instead would race with the live preview,
+        # which takes frames of its own between the two writes.
         window = self.open_window()
         self.connect_pop4(window)
         wait_until(lambda: ("set_exposure", (3000,)) in self.pop4.calls)
-        taken = self.pop4.frames_taken
         window.camera_panel.exposure.setValue(4200)
         wait_until(lambda: ("set_exposure", (4200,)) in self.pop4.calls, timeout_s=30)
-        self.assertGreaterEqual(self.pop4.frames_taken - taken,
-                                app.ScanWorker.EXPOSURE_GAP_FRAMES)
+        writes = self.pop4.exposure_writes
+        gaps = [after - before for before, after in zip(writes, writes[1:])]
+        self.assertTrue(gaps, "there was only one exposure write to measure")
+        self.assertGreaterEqual(min(gaps), app.ScanWorker.EXPOSURE_GAP_FRAMES,
+                                f"frames between exposure writes: {gaps}")
 
     def test_auto_exposure_reports_a_scanner_that_refuses_everything(self):
         window = self.open_window()
@@ -1026,6 +1037,79 @@ class Pop4Tests(WindowTestCase):
         self.connect_pop4(window)
         window.close()
         self.assertTrue(second.closed)
+
+
+class LivePreviewTests(WindowTestCase):
+    """The cameras between scans. A scanner is aimed before it is used, so
+    the previews have to be live as soon as it connects — not only once a
+    scan has been started."""
+
+    def showing(self, window):
+        depth = window.camera_panel.depth_view.image.pixmap()
+        colour = window.camera_panel.rgb_view.image.pixmap()
+        return (depth is not None and not depth.isNull(),
+                colour is not None and not colour.isNull())
+
+    def test_the_cameras_come_up_with_the_scanner_before_any_scan(self):
+        window = self.open_window()
+        self.assertEqual(self.showing(window), (False, False), "nothing is connected yet")
+        self.connect_pop4(window)
+        wait_until(lambda: all(self.showing(window)), timeout_s=30)
+        self.assertIs(window.scan_panel.state, ScanState.IDLE, "no scan should be running")
+
+    def test_what_the_previews_show_is_not_counted_as_a_scan(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        wait_until(lambda: all(self.showing(window)), timeout_s=30)
+        taken = self.pop4.frames_taken
+        wait_until(lambda: self.pop4.frames_taken > taken + 2, timeout_s=30)
+        self.assertEqual(window.frames, 0, "preview frames were counted as scan frames")
+        self.assertIsNone(window.last_frame, "a preview frame was kept as the scan's")
+        self.assertEqual(window.model_panel.models.count(), 0)
+
+    def test_the_distance_gauge_is_live_for_aiming(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        wait_until(lambda: any(window.viewport.gauge._histogram), timeout_s=30)
+
+    def test_the_previews_go_back_to_no_signal_when_the_scanner_goes(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        wait_until(lambda: all(self.showing(window)), timeout_s=30)
+        self.pop4.unplug()
+        self.present = False
+        wait_until(lambda: not window._pop4, timeout_s=30)
+        self.assertEqual(self.showing(window), (False, False),
+                         "a frozen last frame looks like the scanner is still looking")
+
+    def test_the_exposure_sweep_gets_the_scanner_to_itself(self):
+        # Two things asking for frames at once is what stopped the stream
+        # dead before; the sweep must not be competing with the preview.
+        window = self.open_window()
+        self.connect_pop4(window)
+        wait_until(lambda: all(self.showing(window)), timeout_s=30)
+        window.camera_panel.auto_exposure.click()
+        self.assertTrue(window._tuning)
+        self.assertFalse(window._previewing(), "the preview kept running during the sweep")
+        wait_until(lambda: not window._tuning, timeout_s=60)
+        self.assertTrue(window._previewing(), "the preview did not come back after the sweep")
+
+    def test_the_previews_carry_on_after_a_scan_ends(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= 3, timeout_s=30)
+        window.scan_panel.complete()
+        wait_until(lambda: window._previewing(), timeout_s=30)
+        taken = self.pop4.frames_taken
+        wait_until(lambda: self.pop4.frames_taken > taken + 2, timeout_s=30)
+
+    def test_nothing_is_asked_for_with_no_scanner(self):
+        window = self.open_window(present=False)
+        self.assertFalse(window._previewing())
+        taken = self.pop4.frames_taken
+        QTest.qWait(300)
+        self.assertEqual(self.pop4.frames_taken, taken, "frames were asked for with no scanner")
 
 
 class InterchangeTests(WindowTestCase):

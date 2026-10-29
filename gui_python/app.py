@@ -420,6 +420,10 @@ class MainWindow(QMainWindow):
     control_requested = pyqtSignal(str, tuple)  # a POP 4 method and its arguments
     fit_requested = pyqtSignal(object)  # FitJob
     TARGET_FPS = 30
+    # Between scans the cameras stay live, so the scanner can be aimed and
+    # the distance gauge read before a scan is started. Slower than scanning:
+    # nothing is being captured, and the frames cost the scanner work.
+    PREVIEW_FPS = 10
     # Captures in a row that may bring no frame before a scan stops: each
     # waits up to two seconds, so this is about six seconds of silence.
     MAX_MISSED_FRAMES = 3
@@ -884,13 +888,15 @@ class MainWindow(QMainWindow):
             if previous is ScanState.IDLE:
                 self._start_scan()
             self._streaming = True
-            self._request_frame()
         else:
             self._streaming = False
             self._fusing = False
             self._next_frame.stop()
             if state is ScanState.PAUSED:
                 self.viewport.show_toast("Paused. Press Space to resume.")
+        # Live while scanning, and live between scans so the scanner can be
+        # aimed. After the timer is stopped above, not before.
+        self._request_frame()
         self._update_rea_tools()
         self._update_flashing()
 
@@ -915,8 +921,18 @@ class MainWindow(QMainWindow):
         self.viewport.set_frame_count(0)
         self.viewport.clear_cloud("Scanning…")
 
+    def _previewing(self) -> bool:
+        """Whether the cameras should be live with no scan running.
+
+        A scanner is aimed before it is used: without this the previews sit
+        at "No signal" until New scan is pressed, so there is no way to see
+        what the scanner is looking at, whether the object is in range, or
+        what Auto exposure did."""
+        return (self._pop4 and self._state is ScanState.IDLE
+                and not self._tuning and not self._connecting)
+
     def _request_frame(self) -> None:
-        if self._streaming and not self._in_flight:
+        if (self._streaming or self._previewing()) and not self._in_flight:
             self._in_flight = True
             self._requested_at = time.perf_counter()
             self.frame_requested.emit()
@@ -924,13 +940,18 @@ class MainWindow(QMainWindow):
     def _on_frame(self, frame, _seconds: float) -> None:
         self._in_flight = False
         self._missed = 0
-        if self._state is ScanState.IDLE:
-            return  # the frame that was on its way when the scan ended
-        self.frames += 1
-        self.last_frame = frame
+        # The cameras and the gauge show what the scanner is looking at
+        # whether or not a scan is running.
         self.camera_panel.depth_view.show_image(frame.ir)
         self.camera_panel.rgb_view.show_image(frame.rgb)
         self.viewport.gauge.set_depths(frame.depth_mm)
+        if self._state is ScanState.IDLE:
+            # Aiming, not scanning: nothing here is counted or kept, and the
+            # frame that was on its way when a scan ended lands here too.
+            self._keep_previewing()
+            return
+        self.frames += 1
+        self.last_frame = frame
         self.viewport.set_frame_count(self.frames)
         if self.fusion_action.isChecked():
             self._offer_to_fusion(frame)
@@ -947,6 +968,12 @@ class MainWindow(QMainWindow):
             self._points.setText(f"Points: {len(frame.points):,}")
         if self._streaming:
             wait = 1.0 / self.TARGET_FPS - (now - self._requested_at)
+            self._next_frame.start(max(0, int(wait * 1000)))
+
+    def _keep_previewing(self) -> None:
+        """Asks for the next preview frame, if the cameras are still live."""
+        if self._previewing():
+            wait = 1.0 / self.PREVIEW_FPS - (time.perf_counter() - self._requested_at)
             self._next_frame.start(max(0, int(wait * 1000)))
 
     def _without_speckle(self, cloud: tuple) -> tuple:
@@ -1053,6 +1080,9 @@ class MainWindow(QMainWindow):
     def _on_frame_missed(self, reason: str) -> None:
         self._in_flight = False
         if self._state is ScanState.IDLE:
+            # Only aiming: a dropped frame costs nothing, so keep looking
+            # rather than giving up on the preview.
+            self._keep_previewing()
             return
         self._missed += 1
         if self._missed >= self.MAX_MISSED_FRAMES:
@@ -1516,6 +1546,7 @@ class MainWindow(QMainWindow):
             self._control("set_depth_range", *map(float, self.scan_panel.preset.scale_mm))
             self.viewport.show_toast(f"POP 4 {settings['serial']} connected: "
                                      f"{settings['backend']}", 5000)
+            self._request_frame()  # the cameras come up with the scanner
             print(f"POP 4 {settings['serial']} connected: {settings['backend']}", flush=True)
         self._show_connection(self._pop4, settings.get("serial", ""))
         self.scan_panel.set_ready(True)
@@ -1550,6 +1581,8 @@ class MainWindow(QMainWindow):
         self._reconnects = max(self._reconnects, 1)
         self._present_ticks = self._absent_ticks = 0
         self.camera_panel.set_pop4(False)
+        self.camera_panel.depth_view.clear()
+        self.camera_panel.rgb_view.clear()
         print(f"the POP 4 disconnected: {reason}", file=sys.stderr, flush=True)
         self.scan_panel.cancel()  # a scan cannot go on without the scanner
         self.scan_panel.set_ready(self.sensor is not None)
@@ -1611,6 +1644,7 @@ class MainWindow(QMainWindow):
     def _on_exposure_tuned(self, result: dict) -> None:
         self._tuning = False
         self.camera_panel.exposure_box.setEnabled(self._pop4)
+        self._request_frame()  # the sweep had the scanner to itself
         tried = ", ".join(f"{us / 1000:.1f} ms: {points:,}" for us, points in result["tried"])
         if result.get("trouble"):
             print(f"auto exposure: {result['trouble']} on the way, settings skipped",
