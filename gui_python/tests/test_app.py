@@ -6,6 +6,7 @@ Run from the repository root after `maturin develop`:
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -212,6 +213,11 @@ class WindowTestCase(unittest.TestCase):
         window.scan_panel.device.setCurrentIndex(
             window.scan_panel.device.findData("pop4"))
 
+    def scan(self, window, frames: int = 4) -> None:
+        """Runs a scan until it has taken `frames` frames."""
+        window.scan_panel.new_scan()
+        wait_until(lambda: window.frames >= frames)
+
     def calls(self, name: str) -> list[tuple]:
         return [args for called, args in self.pop4.calls if called == name]
 
@@ -237,7 +243,13 @@ class LayoutTests(WindowTestCase):
 
     def test_editing_tools_wait_for_a_model(self):
         window = self.open_window()
-        self.assertFalse(any(action.isEnabled() for action in window.needs_a_model))
+        waiting = [action for group in ("Point cloud edit", "Mesh edit", "REA", "Output")
+                   for action in window.ribbon_groups[group].buttons
+                   # Fusion is a setting for the scan to come, and Fullscreen
+                   # is about the window, so neither waits for a model.
+                   if action.text() not in ("Fusion", "Fullscreen")]
+        still_dead = [a.text() for a in waiting if a.isEnabled()]
+        self.assertFalse(still_dead, f"{still_dead} offered themselves with no model")
 
     def test_pop4_lights_and_modes_follow_the_selected_device(self):
         window = self.open_window()
@@ -1014,6 +1026,137 @@ class Pop4Tests(WindowTestCase):
         self.assertTrue(second.closed)
 
 
+class InterchangeTests(WindowTestCase):
+    """Scans from other tools and other scanners: opening them, and saving
+    one where another tool can open it."""
+
+    def scratch(self) -> Path:
+        directory = Path(tempfile.mkdtemp(prefix="all3dscan-files-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        return directory
+
+    def a_model(self, window) -> object:
+        """A completed scan to save, from the stand-in camera."""
+        self.scan(window, frames=3)
+        window.scan_panel.complete()
+        model = window.model_panel.current_model()
+        self.assertIsNotNone(model.points, "the scan produced no cloud to save")
+        return model
+
+    def test_a_scan_can_be_saved_and_opened_again(self):
+        window = self.open_window()
+        model = self.a_model(window)
+        for fmt in ("ply", "ply-text", "obj", "pcd", "asc"):
+            written = window.save_scan(self.scratch() / "saved", format=fmt)
+            self.assertTrue(written.exists(), f"{fmt} wrote nothing")
+            opened = window.open_scan(written)
+            self.assertIsNotNone(opened, f"{fmt} would not open again")
+            self.assertEqual(len(opened.points), len(model.points), f"{fmt} changed the count")
+            np.testing.assert_allclose(opened.points, model.points, atol=1e-3,
+                                       err_msg=f"{fmt} moved the points")
+
+    def test_an_opened_scan_gets_the_whole_toolchain(self):
+        # The point of reading other scanners' files: everything the app does
+        # after capture has to work on what comes in.
+        window = self.open_window()
+        model = self.a_model(window)
+        written = window.save_scan(self.scratch() / "elsewhere.ply", format="ply")
+        opened = window.open_scan(written)
+        self.assertIs(window.model_panel.current_model(), opened)
+        self.assertIsNotNone(opened.session, "an opened scan must be fittable")
+        for action in window.rea_actions:
+            if action is not window.export_step_action:
+                self.assertTrue(action.isEnabled(), f"{action.text()} is dead on an opened scan")
+        # It really fits, not just offers to.
+        window.fit("plane")
+        wait_until(lambda: not window._fitting, timeout_s=60)
+        self.assertTrue(opened.session.primitives, "nothing could be fitted to the opened scan")
+        self.assertTrue(window.export_step_action.isEnabled())
+        # Meshing is the one thing it cannot do, because the surface is built
+        # from the scan's depth views and a file carries none. It has to say
+        # so rather than sit there dead.
+        self.assertFalse(window.mesh_action.isEnabled())
+        self.assertIn("does not carry", window.mesh_action.toolTip())
+
+    def test_a_file_with_no_normals_gets_normals_worked_out(self):
+        # Plain columns of numbers carry no normals, and fitting needs them.
+        window = self.open_window()
+        model = self.a_model(window)
+        written = window.save_scan(self.scratch() / "bare.asc", format="asc")
+        # Rewrite it with the positions only, as a bare .xyz file would be.
+        points = np.asarray(model.points)
+        bare = written.with_suffix(".xyz")
+        np.savetxt(bare, points, fmt="%.6f")
+        opened = window.open_scan(bare)
+        self.assertIsNotNone(opened)
+        judged = np.linalg.norm(opened.normals, axis=1) > 0.5
+        self.assertGreater(judged.mean(), 0.5,
+                           "most points should have had a normal worked out")
+
+    def test_a_mesh_saves_as_its_surface_and_a_cloud_as_its_points(self):
+        window = self.open_window()
+        self.a_model(window)
+        window.mesh_action.trigger()
+        wait_until(lambda: not window._meshing, timeout_s=120)
+        model = window.model_panel.current_model()
+        self.assertIsNotNone(model.surface, "no surface was built to save")
+        directory = self.scratch()
+        # STL holds triangles only, so it must get the surface.
+        stl = window.save_scan(directory / "m.stl", format="stl")
+        back = engine.read_scan(str(stl))
+        self.assertIsNotNone(back["triangles"], "the STL has no triangles in it")
+        self.assertEqual(len(back["triangles"]), len(model.surface[2]))
+        # PCD holds no triangles, so it must get the cloud instead.
+        pcd = window.save_scan(directory / "m.pcd", format="pcd")
+        back = engine.read_scan(str(pcd))
+        self.assertIsNone(back["triangles"])
+        self.assertEqual(len(back["points"]), len(model.points))
+
+    def test_a_cloud_will_not_pretend_to_be_an_stl(self):
+        window = self.open_window()
+        self.a_model(window)  # no mesh built
+        with mock.patch.object(app.QMessageBox, "warning") as warned:
+            self.assertIsNone(window.save_scan(self.scratch() / "c.stl", format="stl"))
+        self.assertIn("mesh it first", warned.call_args[0][2])
+
+    def test_a_file_that_is_not_a_scan_is_reported_not_swallowed(self):
+        window = self.open_window()
+        junk = self.scratch() / "notes.pdf"
+        junk.write_bytes(b"%PDF-1.7 not a scan")
+        with mock.patch.object(app.QMessageBox, "warning") as warned:
+            self.assertIsNone(window.open_scan(junk))
+        self.assertIn("not a scan format", warned.call_args[0][2])
+        self.assertEqual(window.model_panel.models.count(), 0)
+
+    def test_a_file_written_in_metres_is_offered_in_millimetres(self):
+        window = self.open_window()
+        model = self.a_model(window)
+        tiny = self.scratch() / "metres.ply"
+        engine.write_scan(str(tiny), np.asarray(model.points) / 1000.0, format="ply")
+        for answer, factor in ((app.QMessageBox.StandardButton.Yes, 1.0),
+                               (app.QMessageBox.StandardButton.No, 0.001)):
+            with mock.patch.object(app.QMessageBox, "question", return_value=answer):
+                opened = window.open_scan(tiny)
+            np.testing.assert_allclose(opened.points,
+                                       np.asarray(model.points) * factor, atol=1e-2,
+                                       err_msg=f"answering {answer} scaled wrongly")
+
+    def test_the_export_button_wakes_up_once_there_is_something_to_save(self):
+        window = self.open_window()
+        self.assertFalse(window.export_action.isEnabled(), "nothing to save yet")
+        self.a_model(window)
+        self.assertTrue(window.export_action.isEnabled(), "a scan should be saveable")
+        with mock.patch.object(app.QFileDialog, "getSaveFileName",
+                               return_value=(str(self.scratch() / "b.ply"), "")) as dialog:
+            window.export_action.trigger()
+        self.assertTrue(dialog.called, "the Export button did not offer to save")
+
+    def test_saving_needs_a_model_and_says_so_rather_than_failing(self):
+        window = self.open_window()
+        self.assertIsNone(window.save_scan(self.scratch() / "nothing.ply", format="ply"))
+        self.assertIn("no model to save", window.viewport.toast.text())
+
+
 class ShippedTests(unittest.TestCase):
     """The window as the launcher starts it: the POP 4 and nothing else.
 
@@ -1072,10 +1215,6 @@ class ShippedTests(unittest.TestCase):
 
 class FusionTests(WindowTestCase):
     """Building one model out of a scan's frames."""
-
-    def scan(self, window, frames: int = 4) -> None:
-        window.scan_panel.new_scan()
-        wait_until(lambda: window.frames >= frames)
 
     def test_a_scan_fuses_its_frames_into_one_model(self):
         window = self.open_window(engine.MockDepthSensor(160, 120, seed=1))

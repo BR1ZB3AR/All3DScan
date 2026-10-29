@@ -670,6 +670,7 @@ class MainWindow(QMainWindow):
             "Mesh", "draw-cuboid",
             "Melt the scan's depth views into one closed surface", enabled=False)
         self.mesh_action.triggered.connect(self.build_surface)
+        self._mesh_tip = self.mesh_action.toolTip()
         mesh = [
             self.mesh_action,
             action("Fill holes", "fill-color", later, enabled=False),
@@ -688,7 +689,11 @@ class MainWindow(QMainWindow):
         self.fit_cylinder_action.triggered.connect(lambda: self.fit("cylinder"))
         self.export_step_action.triggered.connect(lambda: self.export_step())
         rea_tools = [self.fit_plane_action, self.fit_cylinder_action, self.export_step_action]
-        self.export_action = action("Export", "document-save", later, enabled=False)
+        self.export_action = action(
+            "Export", "document-save",
+            "Save this model as PLY, OBJ, STL, PCD or plain columns, for another tool",
+            enabled=False)
+        self.export_action.triggered.connect(lambda: self.save_scan())
         self.fullscreen_action = action("Fullscreen", "view-fullscreen", "Shift+M",
                                         checkable=True)
         self.fullscreen_action.setShortcut(QKeySequence("Shift+M"))
@@ -709,9 +714,6 @@ class MainWindow(QMainWindow):
         ):
             self.ribbon_groups[caption] = RibbonGroup(caption, actions)
             ribbon.addWidget(self.ribbon_groups[caption])
-        # Fusion works during a scan, so it is not one of these.
-        self.needs_a_model = [a for a in point_cloud if a is not self.fusion_action]
-        self.needs_a_model += mesh + rea_tools + [self.export_action]
 
     def _build_menus(self) -> None:
         """The menu bar above the ribbon. It offers the ribbon's own actions,
@@ -737,6 +739,13 @@ class MainWindow(QMainWindow):
         self.cancel_item = item("C&ancel scan", panel.cancel, tip="Esc")
         for action in (self.new_scan_item, self.complete_item, self.cancel_item):
             file_menu.addAction(action)
+        file_menu.addSeparator()
+        self.open_item = item("&Open scan…", self.open_scan, "Ctrl+O",
+                              tip="A scan from any scanner: PLY, OBJ, STL, PCD, ASC, XYZ, PTS")
+        self.save_item = item("&Save scan as…", self.save_scan, "Ctrl+S",
+                              tip="Save this model where another tool can open it")
+        file_menu.addAction(self.open_item)
+        file_menu.addAction(self.save_item)
         file_menu.addSeparator()
         file_menu.addAction(self.export_step_action)
         file_menu.addAction(self.export_action)
@@ -818,6 +827,9 @@ class MainWindow(QMainWindow):
         self.new_scan_item.setEnabled(self.scan_panel.new_scan_button.isEnabled())
         self.complete_item.setEnabled(not idle)
         self.cancel_item.setEnabled(not idle)
+        model = self.model_panel.current_model()
+        self.save_item.setEnabled(model is not None and model.points is not None)
+        self.open_item.setEnabled(idle)  # not in the middle of a scan
 
     def _show_shortcuts(self) -> None:
         QMessageBox.information(self, "Shortcuts", (
@@ -1150,7 +1162,20 @@ class MainWindow(QMainWindow):
                  and model.session is not None)
         self.fit_plane_action.setEnabled(ready)
         self.fit_cylinder_action.setEnabled(ready)
-        self.mesh_action.setEnabled(ready and not self._meshing and bool(model.intrinsics))
+        # Saving wants points, not a fit: a model with no primitives in it
+        # is still worth keeping.
+        self.export_action.setEnabled(self._state is ScanState.IDLE and model is not None
+                                      and model.points is not None)
+        # Meshing melts the scan's own depth views together, so it needs a
+        # scan taken here. A cloud opened from a file has no views: say why
+        # rather than leaving a dead button.
+        can_mesh = ready and not self._meshing and bool(model.intrinsics)
+        self.mesh_action.setEnabled(can_mesh)
+        self.mesh_action.setToolTip(
+            self._mesh_tip if can_mesh or model is None or model.intrinsics else
+            "Meshing builds the surface from the scan's own depth views, which a scan "
+            "opened from a file does not carry. Open a file that already holds a mesh, "
+            "or scan the object here.")
         self.export_step_action.setEnabled(ready and bool(model.session.primitives))
         self.model_panel.set_busy(self._fitting)
 
@@ -1223,6 +1248,164 @@ class MainWindow(QMainWindow):
         self.viewport.show_toast(f"Exported {count} primitive{'s' * (count != 1)} to "
                                  f"{written.name}", 5000)
         print(f"{model.name}: exported {count} primitives to {written}", flush=True)
+        return written
+
+    # Scans from elsewhere: reading them in and writing them out.
+
+    #: How small a scan has to measure before it is taken to be in metres.
+    #: A real scanned object is tens of millimetres across at the least.
+    METRES_LOOK_LIKE_MM = 10.0
+
+    def _file_filters(self) -> tuple[str, dict[str, str]]:
+        """The save dialog's filters, and which format each one names."""
+        formats, by_filter = [], {}
+        for name, what, extension, _mesh, _colour in engine.scan_formats():
+            text = f"{what} (*.{extension})"
+            formats.append(text)
+            by_filter[text] = name
+        return ";;".join(formats), by_filter
+
+    def open_scan(self, path: str | Path | None = None) -> ScanModel | None:
+        """Opens a scan another tool or another scanner wrote.
+
+        Everything the app does after capture — cleaning, meshing, fitting,
+        exporting — works on it exactly as on a scan taken here, so a
+        scanner All3DScan cannot drive is still a scanner it can work with.
+        """
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open scan", str(Path.home()),
+                "Scans (*.ply *.obj *.stl *.pcd *.asc *.xyz *.pts *.txt *.p3);;"
+                "All files (*)")
+            if not path:
+                return None
+        path = Path(path)
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            read = engine.read_scan(str(path))
+        except (ValueError, OSError) as exc:
+            print(f"opening {path} failed: {describe(exc)}", file=sys.stderr, flush=True)
+            QMessageBox.warning(self, "Could not open that scan", str(exc))
+            return None
+        finally:
+            self.unsetCursor()
+
+        points, colors = read["points"], read["colors"]
+        normals, triangles = read["normals"], read["triangles"]
+        points = self._as_millimetres(path, points, read["extent"])
+        if normals is None:
+            # The fitting needs a normal per point, and a file need not carry
+            # them. Build them from the surface the points already describe.
+            normals = self._normals_for(points, triangles)
+
+        self._scans += 1
+        name = path.stem or f"Scan {self._scans:02d}"
+        low, high = read["extent"]
+        size = tuple(round(h - l, 1) for l, h in zip(low, high))
+        model = ScanModel(name, {
+            "Model name": name,
+            "Scanner": f"Opened from {path.name}",
+            "Rendering state": "Meshed" if triangles is not None else "Raw",
+            "Rendering frames": "—",
+            "Points": f"{len(points):,} read from the file",
+            "Scan settings": f"{size[0]} × {size[1]} × {size[2]} mm"
+                             + (f" · {len(triangles):,} triangles" if triangles is not None else ""),
+        }, points, colors if colors is not None else self._plain_colors(points), normals)
+        if triangles is not None:
+            model.surface = (points, normals, triangles)
+        self._shown_model = None
+        self.left.setCurrentWidget(self.model_panel)
+        self.viewport.set_stage(scanning=False)
+        self.model_panel.add_model(model)
+        print(f"{name}: opened {len(points):,} points"
+              + (f" and {len(triangles):,} triangles" if triangles is not None else "")
+              + f" from {path}", flush=True)
+        self.viewport.show_toast(f"Opened {len(points):,} points from {path.name}", 5000)
+        return model
+
+    def _as_millimetres(self, path: Path, points, extent) -> np.ndarray:
+        """Scans are in millimetres here. A file written in metres measures
+        a thousand times too small, which is plain enough to see, so ask
+        rather than either guessing or leaving a model nothing will fit."""
+        low, high = extent
+        across = max(h - l for l, h in zip(low, high))
+        if not 0 < across < self.METRES_LOOK_LIKE_MM:
+            return points
+        answer = QMessageBox.question(
+            self, "Is this in metres?",
+            f"{path.name} measures {across:.3g} across, which is too small for "
+            f"millimetres — it was probably written in metres.\n\n"
+            f"Scale it by 1000 to millimetres?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer is QMessageBox.StandardButton.Yes:
+            print(f"{path.name}: scaled from metres to millimetres", flush=True)
+            return points * 1000.0
+        return points
+
+    @staticmethod
+    def _plain_colors(points) -> np.ndarray:
+        """One colour per point for a file that carried none."""
+        return np.full((len(points), 3), 200, np.uint8)
+
+    @staticmethod
+    def _normals_for(points, triangles) -> np.ndarray:
+        """Normals for a file that carried none.
+
+        Fitting a plane or a cylinder needs a direction per point, so a file
+        without them would otherwise open into a model nothing will fit.
+        They come from the triangles where there are triangles, and
+        otherwise from the shape the points themselves describe."""
+        if triangles is not None and len(triangles):
+            normals = np.zeros((len(points), 3), np.float32)
+            corners = points[triangles.astype(np.int64)]
+            faces = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            for corner in range(3):
+                np.add.at(normals, triangles[:, corner].astype(np.int64), faces)
+            length = np.linalg.norm(normals, axis=1, keepdims=True)
+            return np.divide(normals, length, out=normals,
+                             where=length > 1e-12).astype(np.float32)
+        return engine.estimate_normals(points)
+
+    def save_scan(self, path: str | Path | None = None,
+                  format: str | None = None) -> Path | None:
+        """Writes the model showing to a file another tool can open."""
+        model = self.model_panel.current_model()
+        if model is None or model.points is None:
+            self.viewport.show_toast("There is no model to save", 4000)
+            return None
+        filters, by_filter = self._file_filters()
+        if path is None:
+            path, chosen = QFileDialog.getSaveFileName(
+                self, "Save scan as", str(Path.home() / f"{model.name}.ply"), filters)
+            if not path:
+                return None
+            format = format or by_filter.get(chosen)
+        path = Path(path)
+        keeps_mesh = dict((name, mesh) for name, _w, _e, mesh, _c in engine.scan_formats())
+        # A meshed model is saved as its surface wherever the format holds
+        # one, and as its points where it does not.
+        as_mesh = model.surface is not None and keeps_mesh.get(format or "ply", False)
+        if as_mesh:
+            vertices, normals, triangles = model.surface
+            points, colors = vertices, None
+        else:
+            points, colors, normals, triangles = (model.points, model.colors,
+                                                  model.normals, None)
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            written = engine.write_scan(str(path), points, colors=colors, normals=normals,
+                                        triangles=triangles, format=format)
+        except (ValueError, OSError) as exc:
+            print(f"saving {path} failed: {describe(exc)}", file=sys.stderr, flush=True)
+            QMessageBox.warning(self, "Could not save that scan", str(exc))
+            return None
+        finally:
+            self.unsetCursor()
+        written = Path(written)
+        what = (f"{len(triangles):,} triangles" if as_mesh else f"{len(points):,} points")
+        print(f"{model.name}: saved {what} to {written}", flush=True)
+        self.viewport.show_toast(f"Saved {what} to {written.name}", 5000)
         return written
 
     # Settings.

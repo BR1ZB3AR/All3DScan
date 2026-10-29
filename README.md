@@ -20,9 +20,17 @@ reverse-engineers the USB protocol directly.
 
 ## Supported hardware
 
-Device IDs live in `resources/devices.json` and are matched at runtime, so new
-models can be added without recompiling. Entries may match a specific product
-or an entire vendor.
+**Any scanner, for everything after the scan.** All3DScan opens and saves
+`.ply`, `.obj`, `.stl`, `.pcd`, `.asc`, `.xyz`, `.pts`, `.txt` and `.p3`, so a
+scan exported by any scanner gets the full toolchain — cleaning, meshing,
+plane and cylinder fitting, STEP — whether or not its live protocol is
+implemented. **File → Open scan** (Ctrl+O), **File → Save scan as** (Ctrl+S).
+
+**Live capture** is per-device, because each vendor's USB protocol has to be
+reverse-engineered with the hardware in hand. Device IDs live in
+`resources/devices.json` and are matched at runtime, so new models can be
+added without recompiling. Entries may match a specific product or an entire
+vendor.
 
 See [`docs/HARDWARE_SUPPORT.md`](docs/HARDWARE_SUPPORT.md) for the
 evidence-based compatibility matrix. Detection does not imply that capture,

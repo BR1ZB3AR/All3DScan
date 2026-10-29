@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 pub mod fitting;
 pub mod fusion;
 pub mod hw;
+pub mod interchange;
 pub mod mesh;
 pub mod processing;
 
@@ -25,7 +26,7 @@ mod all3dscan_engine {
     use pyo3::types::PyDict;
 
     use crate::processing::ProcessingError;
-    use crate::{fitting, fusion, hw, processing};
+    use crate::{fitting, fusion, hw, interchange, processing};
 
     /// The mock depth camera from hw_cpp.
     ///
@@ -900,6 +901,206 @@ mod all3dscan_engine {
         voxel_mm.map_or(Ok(()), |size| {
             processing::check_voxel_size(size).map_err(value_error)
         })
+    }
+
+    /// Works out a unit normal for each point of a cloud that has no order
+    /// to it — one read from a file, rather than laid out as a depth
+    /// camera's pixels.
+    ///
+    /// Each normal is the direction its neighbours within radius_mm are
+    /// least spread in, turned to face `towards` (the sensor's direction,
+    /// (0, 0, -1) by default). A point with too few neighbours to judge gets
+    /// a zero normal rather than a made-up one.
+    #[pyfunction]
+    #[pyo3(signature = (points, radius_mm = 3.0, towards = (0.0, 0.0, -1.0)))]
+    fn estimate_normals<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        radius_mm: f32,
+        towards: (f32, f32, f32),
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let cloud: Vec<Point3<f32>> = triples(&points, "points")?;
+        let facing = Vector3::new(towards.0, towards.1, towards.2);
+        let normals = py
+            .detach(move || processing::estimate_normals(&cloud, radius_mm, facing))
+            .map_err(value_error)?;
+        into_array(py, normals.iter().flat_map(|n| [n.x, n.y, n.z]).collect())
+    }
+
+    /// Reads a scan file that another tool or another scanner wrote.
+    ///
+    /// Takes .ply, .obj, .stl, .pcd, .asc, .xyz, .pts, .txt and .p3, working
+    /// out which from the name and, failing that, from what is inside. Comes
+    /// back as a dict: "points" (N, 3) float32, "colors" (N, 3) uint8 or
+    /// None, "normals" (N, 3) float32 or None, "triangles" (M, 3) uint32 or
+    /// None, and "extent", the (lowest, highest) corner of the box the
+    /// points fill — lengths exactly as the file gave them, so a caller can
+    /// see from the extent whether it was written in metres.
+    #[pyfunction]
+    fn read_scan<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        let owned = path.to_owned();
+        let scene = py
+            .detach(move || interchange::read(std::path::Path::new(&owned)))
+            .map_err(scan_file_error)?;
+        let n = scene.points.len();
+        // Before the arrays below move the scene's parts out of it.
+        let extent = scene
+            .extent()
+            .map(|(low, high)| ((low.x, low.y, low.z), (high.x, high.y, high.z)));
+        let found = PyDict::new(py);
+        found.set_item("points", into_array(py, flatten(&scene.points))?)?;
+        found.set_item(
+            "colors",
+            if scene.has_colors() {
+                let rgb: Vec<u8> = scene.colors.iter().copied().flatten().collect();
+                Some(PyArray1::from_vec(py, rgb).reshape([n, 3])?)
+            } else {
+                None
+            },
+        )?;
+        found.set_item(
+            "normals",
+            if scene.has_normals() {
+                let normals: Vec<f32> =
+                    scene.normals.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
+                Some(into_array(py, normals)?)
+            } else {
+                None
+            },
+        )?;
+        let triangles = scene.triangles();
+        found.set_item(
+            "triangles",
+            if triangles > 0 {
+                Some(PyArray1::from_vec(py, scene.indices).reshape([triangles, 3])?)
+            } else {
+                None
+            },
+        )?;
+        found.set_item("extent", extent)?;
+        Ok(found)
+    }
+
+    /// Writes a scan for another tool to open.
+    ///
+    /// `format` is one of the names scan_formats() gives, or None to take it
+    /// from the path's extension. Triangles are (M, 3) indices into the
+    /// points; passing them to a format that holds no mesh drops them, and
+    /// passing none to STL, which holds nothing else, is an error.
+    #[pyfunction]
+    #[pyo3(signature = (path, points, colors = None, normals = None, triangles = None, format = None))]
+    fn write_scan(
+        py: Python<'_>,
+        path: &str,
+        points: PyArrayLike2<'_, f32, AllowTypeChange>,
+        colors: Option<PyArrayLike2<'_, u8, AllowTypeChange>>,
+        normals: Option<PyArrayLike2<'_, f32, AllowTypeChange>>,
+        triangles: Option<PyArrayLike2<'_, u32, AllowTypeChange>>,
+        format: Option<&str>,
+    ) -> PyResult<String> {
+        let scene = interchange::Scene {
+            points: triples(&points, "points")?,
+            colors: match &colors {
+                Some(rgb) => colour_rows(rgb, points.shape()[0])?,
+                None => Vec::new(),
+            },
+            normals: match &normals {
+                Some(n) => triples(n, "normals")?,
+                None => Vec::new(),
+            },
+            indices: match &triangles {
+                Some(faces) => {
+                    let shape = faces.shape();
+                    if shape.len() != 2 || shape[1] != 3 {
+                        return Err(PyValueError::new_err(format!(
+                            "triangles must be an (M, 3) array, got {shape:?}"
+                        )));
+                    }
+                    faces.as_array().iter().copied().collect()
+                }
+                None => Vec::new(),
+            },
+        };
+        let chosen = match format {
+            Some(name) => Some(named_format(name)?),
+            None => None,
+        };
+        let owned = path.to_owned();
+        let written = py
+            .detach(move || {
+                let path = std::path::Path::new(&owned);
+                let path = match chosen {
+                    Some(f) if interchange::Format::of_path(path) != Some(f) => {
+                        interchange::with_extension(path, f)
+                    }
+                    _ => path.to_path_buf(),
+                };
+                interchange::write(&path, &scene, chosen).map(|()| path)
+            })
+            .map_err(scan_file_error)?;
+        Ok(written.display().to_string())
+    }
+
+    /// The formats write_scan() takes: each a (name, what it is, file
+    /// extension, whether it keeps triangles, whether it keeps colour).
+    #[pyfunction]
+    fn scan_formats() -> Vec<(&'static str, &'static str, &'static str, bool, bool)> {
+        use interchange::Format;
+        [
+            (Format::Ply, "ply", "PLY, binary — points, colour, normals and mesh"),
+            (Format::PlyText, "ply-text", "PLY, text — the same, readable"),
+            (Format::Stl, "stl", "STL, binary — a mesh on its own, for printing"),
+            (Format::StlText, "stl-text", "STL, text"),
+            (Format::Obj, "obj", "OBJ — a mesh or a cloud, widely read"),
+            (Format::Pcd, "pcd", "PCD — the point cloud format of PCL"),
+            (Format::Asc, "asc", "Plain columns of numbers"),
+        ]
+        .into_iter()
+        .map(|(format, name, what)| {
+            (
+                name,
+                what,
+                match format {
+                    Format::Ply | Format::PlyText => "ply",
+                    Format::Stl | Format::StlText => "stl",
+                    Format::Obj => "obj",
+                    Format::Pcd => "pcd",
+                    Format::Asc => "asc",
+                },
+                format.keeps_triangles(),
+                format.keeps_colors(),
+            )
+        })
+        .collect()
+    }
+
+    fn named_format(name: &str) -> PyResult<interchange::Format> {
+        use interchange::Format;
+        Ok(match name {
+            "ply" => Format::Ply,
+            "ply-text" => Format::PlyText,
+            "stl" => Format::Stl,
+            "stl-text" => Format::StlText,
+            "obj" => Format::Obj,
+            "pcd" => Format::Pcd,
+            "asc" => Format::Asc,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "{other} is not a scan format: try ply, ply-text, stl, stl-text, \
+                     obj, pcd or asc"
+                )))
+            }
+        })
+    }
+
+    /// A file that would not read or write, as the Python error that fits
+    /// it: something the caller got wrong, or something the disk did.
+    fn scan_file_error(why: interchange::InterchangeError) -> PyErr {
+        use interchange::InterchangeError;
+        match why {
+            InterchangeError::Io(_) => PyOSError::new_err(why.to_string()),
+            _ => PyValueError::new_err(why.to_string()),
+        }
     }
 
     fn flatten(points: &[Point3<f32>]) -> Vec<f32> {

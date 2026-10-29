@@ -173,6 +173,122 @@ fn neighbour_counts(
         .collect())
 }
 
+/// How many neighbours a normal wants before it is worth believing. Three
+/// points define a plane, so fewer than that cannot; a few more than that
+/// averages the sensor's noise without reaching around a corner.
+const NORMAL_NEIGHBOURS: usize = 6;
+
+/// How many times the search radius may be doubled looking for enough
+/// neighbours, for a cloud thinner than the radius first guessed.
+const NORMAL_WIDENINGS: u32 = 5;
+
+/// A unit normal for every point of a cloud that has no order to it.
+///
+/// `organized_normals` needs the cloud laid out as the depth camera's
+/// pixels. A cloud read from a file has no such layout, so each normal is
+/// taken instead from the points within `radius_mm`: the direction in which
+/// they are most tightly packed, which is across the surface they lie on.
+///
+/// Normals are turned to face `towards` — the direction the surface is
+/// looked at from, which for a scan is the sensor at the origin. A point
+/// with too few neighbours to judge gets a zero normal rather than a made-up
+/// one, so a caller can tell the difference.
+pub fn estimate_normals(
+    points: &[Point3<f32>],
+    radius_mm: f32,
+    towards: Vector3<f32>,
+) -> Result<Vec<Vector3<f32>>, ProcessingError> {
+    check_voxel_size(radius_mm)?;
+    if points.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A radius that finds nothing makes every normal zero, which is useless
+    // and silent. Widen until a typical point has neighbours to work with.
+    let mut radius = radius_mm;
+    for _ in 0..NORMAL_WIDENINGS {
+        let counts = neighbour_counts(points, radius)?;
+        let mut near: Vec<u32> = counts.iter().map(|(_, n)| *n).collect();
+        let middle = near.len() / 2;
+        near.select_nth_unstable(middle);
+        if near[middle] as usize > NORMAL_NEIGHBOURS {
+            break;
+        }
+        radius *= 2.0;
+    }
+
+    let keyed = voxel_keys(points, radius)?;
+    let mut cubes: HashMap<[i64; 3], &[([i64; 3], u32)]> = HashMap::new();
+    for run in keyed.chunk_by(|a, b| a.0 == b.0) {
+        cubes.insert(run[0].0, run);
+    }
+    let within = radius * radius;
+    let mut normals = vec![Vector3::zeros(); points.len()];
+    let found: Vec<(u32, Vector3<f32>)> = keyed
+        .par_iter()
+        .map(|(key, index)| {
+            let here = points[*index as usize];
+            let mut near: Vec<Point3<f32>> = Vec::with_capacity(32);
+            for offset in 0..27 {
+                let beside = [
+                    key[0] + offset / 9 - 1,
+                    key[1] + offset / 3 % 3 - 1,
+                    key[2] + offset % 3 - 1,
+                ];
+                if let Some(cube) = cubes.get(&beside) {
+                    near.extend(
+                        cube.iter()
+                            .map(|(_, other)| points[*other as usize])
+                            .filter(|p| (p - here).norm_squared() <= within),
+                    );
+                }
+            }
+            (*index, plane_normal(&near).unwrap_or_else(Vector3::zeros))
+        })
+        .collect();
+    for (index, mut normal) in found {
+        // Facing the viewer, so neighbouring normals agree with each other
+        // and a fit can use them. A cloud from a scanner is seen from the
+        // sensor, which sits at the origin.
+        if normal.dot(&towards) < 0.0 {
+            normal = -normal;
+        }
+        normals[index as usize] = normal;
+    }
+    Ok(normals)
+}
+
+/// The direction a handful of points are least spread in, which is the
+/// normal of the plane through them. None when there are too few to say.
+fn plane_normal(near: &[Point3<f32>]) -> Option<Vector3<f32>> {
+    if near.len() <= NORMAL_NEIGHBOURS {
+        return None;
+    }
+    let middle = near
+        .iter()
+        .fold(Vector3::<f64>::zeros(), |sum, p| sum + p.coords.cast::<f64>())
+        / near.len() as f64;
+    // The covariance of the neighbourhood, whose least eigenvector is the
+    // normal. Only the upper triangle is built; it is symmetric.
+    let mut covariance = nalgebra::Matrix3::<f64>::zeros();
+    for point in near {
+        let offset = point.coords.cast::<f64>() - middle;
+        for row in 0..3 {
+            for column in row..3 {
+                covariance[(row, column)] += offset[row] * offset[column];
+            }
+        }
+    }
+    for row in 1..3 {
+        for column in 0..row {
+            covariance[(row, column)] = covariance[(column, row)];
+        }
+    }
+    let eigen = covariance.symmetric_eigen();
+    let least = (0..3).min_by(|a, b| eigen.eigenvalues[*a].total_cmp(&eigen.eigenvalues[*b]))?;
+    let axis = eigen.eigenvectors.column(least);
+    Vector3::new(axis[0] as f32, axis[1] as f32, axis[2] as f32).try_normalize(1e-12)
+}
+
 /// How many times the radius may be doubled while looking for one at which
 /// the points can see each other at all.
 const SPECKLE_WIDENINGS: u32 = 4;
@@ -344,6 +460,70 @@ fn tangent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normals_of_a_cloud_with_no_order_point_out_of_its_surface() {
+        // A flat sheet in the z = 300 plane, as a scan of a wall would be.
+        let mut points = Vec::new();
+        for x in 0..40 {
+            for y in 0..40 {
+                points.push(Point3::new(x as f32 * 2.0 - 40.0, y as f32 * 2.0 - 40.0, 300.0));
+            }
+        }
+        let normals = estimate_normals(&points, 5.0, -Vector3::z()).unwrap();
+        assert_eq!(normals.len(), points.len());
+        let judged = normals.iter().filter(|n| n.norm() > 0.5).count();
+        assert!(judged > points.len() * 9 / 10, "only {judged} normals were worked out");
+        for normal in normals.iter().filter(|n| n.norm() > 0.5) {
+            assert!(
+                (normal.z + 1.0).abs() < 0.05,
+                "a sheet in z should have a normal along z, got {normal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normals_face_the_way_they_are_looked_at() {
+        let mut points = Vec::new();
+        for x in 0..30 {
+            for y in 0..30 {
+                points.push(Point3::new(x as f32, y as f32, 100.0));
+            }
+        }
+        for towards in [Vector3::z(), -Vector3::z()] {
+            let normals = estimate_normals(&points, 3.0, towards).unwrap();
+            for normal in normals.iter().filter(|n| n.norm() > 0.5) {
+                assert!(normal.dot(&towards) >= 0.0, "{normal:?} faces away from {towards:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_with_nothing_near_it_gets_no_normal_rather_than_a_guess() {
+        let points = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1e4, 1e4, 1e4)];
+        let normals = estimate_normals(&points, 1.0, -Vector3::z()).unwrap();
+        assert!(normals.iter().all(|n| n.norm() == 0.0), "{normals:?}");
+    }
+
+    #[test]
+    fn the_radius_widens_until_the_points_can_see_each_other() {
+        // Spaced 10 mm apart, asked for with a 0.5 mm radius: too small to
+        // find anything, so it has to widen rather than give up.
+        let mut points = Vec::new();
+        for x in 0..12 {
+            for y in 0..12 {
+                points.push(Point3::new(x as f32 * 10.0, y as f32 * 10.0, 50.0));
+            }
+        }
+        let normals = estimate_normals(&points, 0.5, -Vector3::z()).unwrap();
+        let judged = normals.iter().filter(|n| n.norm() > 0.5).count();
+        assert!(judged > points.len() / 2, "only {judged} of {} were judged", points.len());
+    }
+
+    #[test]
+    fn an_empty_cloud_has_no_normals_and_does_not_fall_over() {
+        assert!(estimate_normals(&[], 2.0, -Vector3::z()).unwrap().is_empty());
+    }
+
     use super::*;
     use crate::hw::MockDepthSensor;
 
