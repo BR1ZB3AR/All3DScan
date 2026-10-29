@@ -5,6 +5,7 @@ Run from the repository root after `maturin develop`:
     .venv/bin/python -m unittest discover -s gui_python/tests
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ if QApplication.instance() is None:
 import all3dscan_engine as engine  # noqa: E402
 import app  # noqa: E402
 import rea_engine as rea  # noqa: E402
+import scanners  # noqa: E402
 import common  # noqa: E402
 import theme  # noqa: E402
 import viewport3d  # noqa: E402
@@ -1155,6 +1157,131 @@ class InterchangeTests(WindowTestCase):
         window = self.open_window()
         self.assertIsNone(window.save_scan(self.scratch() / "nothing.ply", format="ply"))
         self.assertIn("no model to save", window.viewport.toast.text())
+
+
+class ScannerListTests(unittest.TestCase):
+    """Finding scanners on the USB bus and saying what can be done with
+    each, against a stand-in /sys tree so no hardware is needed."""
+
+    DEVICES = {"devices": [
+        {"vendor": "Revopoint", "vendorId": "2207", "productId": "110c", "label": "POP4"},
+        {"vendor": "Revopoint", "vendorId": "2207", "productId": "*", "label": "any Revopoint"},
+        {"vendor": "Creality", "vendorId": "2bc5", "productId": "06da", "label": "CR-Scan Otter"},
+        {"vendor": "Einstar", "vendorId": "2231", "productId": "*", "enabled": False,
+         "label": "unconfirmed"},
+    ]}
+
+    def bus(self, *ids) -> Path:
+        """A stand-in /sys/bus/usb/devices holding these VID:PIDs."""
+        root = Path(tempfile.mkdtemp(prefix="all3dscan-sysfs-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        for at, (vendor, product) in enumerate(ids):
+            device = root / f"1-{at}"
+            device.mkdir()
+            (device / "idVendor").write_text(f"{vendor}\n")
+            (device / "idProduct").write_text(f"{product}\n")
+        (root / "1-hub").mkdir()  # a hub has no idVendor at all
+        return root
+
+    def listing(self) -> Path:
+        path = Path(tempfile.mkdtemp(prefix="all3dscan-devices-"))
+        self.addCleanup(shutil.rmtree, path, True)
+        listed = path / "devices.json"
+        listed.write_text(json.dumps(self.DEVICES))
+        return listed
+
+    def found(self, *ids):
+        return scanners.plugged_in(sysfs=self.bus(*ids), devices=self.listing())
+
+    def test_a_scanner_it_can_drive_is_named_as_one(self):
+        found = self.found(("2207", "110c"))
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].drivable)
+        self.assertEqual(found[0].name, "Revopoint POP 4 (USB)")
+
+    def test_a_scanner_it_cannot_drive_is_still_found_and_explained(self):
+        found = self.found(("2bc5", "06da"))
+        self.assertEqual(len(found), 1)
+        self.assertFalse(found[0].drivable)
+        self.assertEqual(found[0].vendor, "Creality")
+        why = found[0].why_not()
+        self.assertIn("File → Open scan", why, "it has to say what does work")
+        self.assertIn("2bc5:06da", why)
+
+    def test_the_ones_it_can_drive_come_first(self):
+        found = self.found(("2bc5", "06da"), ("2207", "110c"))
+        self.assertEqual([s.drivable for s in found], [True, False])
+
+    def test_an_exact_entry_beats_a_whole_vendor_one(self):
+        # 2207:110c matches both the POP4 line and the vendor-wide line.
+        found = self.found(("2207", "110c"))
+        self.assertEqual(found[0].label, "POP4")
+
+    def test_a_vendor_wide_entry_still_names_an_unknown_model(self):
+        found = self.found(("2207", "9999"))
+        self.assertEqual(len(found), 1)
+        self.assertFalse(found[0].drivable)
+        self.assertEqual(found[0].label, "any Revopoint")
+
+    def test_an_entry_turned_off_is_not_matched(self):
+        self.assertEqual(self.found(("2231", "0001")), [])
+
+    def test_things_that_are_not_scanners_are_ignored(self):
+        self.assertEqual(self.found(("1d6b", "0002"), ("046d", "c52b")), [])
+
+    def test_a_missing_or_broken_device_list_does_not_stop_the_app(self):
+        missing = Path(tempfile.mkdtemp(prefix="all3dscan-none-")) / "gone.json"
+        self.addCleanup(shutil.rmtree, missing.parent, True)
+        self.assertEqual(scanners.known_devices(missing), [])
+        broken = missing.with_name("broken.json")
+        broken.write_text("{not json at all")
+        self.assertEqual(scanners.known_devices(broken), [])
+
+    def test_a_sysfs_that_cannot_be_read_gives_nothing_rather_than_raising(self):
+        self.assertEqual(scanners.usb_devices(Path("/no/such/place")), [])
+
+
+class ScannerListInTheWindowTests(WindowTestCase):
+    """What the window does with a scanner it cannot drive."""
+
+    def other(self, vendor="Creality", vendor_id="2bc5", product_id="06da"):
+        return scanners.Scanner(vendor_id, product_id, vendor, "CR-Scan Otter")
+
+    def test_a_scanner_it_cannot_drive_is_listed_not_hidden(self):
+        window = self.open_window()
+        with mock.patch.object(scanners, "plugged_in", return_value=[self.other()]):
+            window._look_for_scanners()
+        self.assertIn("Creality 06da — cannot scan yet", items(window.scan_panel.device))
+
+    def test_picking_it_says_what_does_work_instead_of_failing(self):
+        window = self.open_window()
+        with mock.patch.object(scanners, "plugged_in", return_value=[self.other()]):
+            window._look_for_scanners()
+        device = window.scan_panel.device
+        device.setCurrentIndex(device.findData("2bc5:06da"))
+        QTest.qWait(20)
+        self.assertIn("no Linux protocol yet", window._connection.text())
+        self.assertEqual(window.scan_panel.connection.text(), "Cannot scan")
+        self.assertIn("File → Open scan", window.viewport.warning.text())
+        self.assertFalse(window.scan_panel.new_scan_button.isEnabled())
+
+    def test_one_that_goes_away_is_taken_off_the_list(self):
+        window = self.open_window()
+        with mock.patch.object(scanners, "plugged_in", return_value=[self.other()]):
+            window._look_for_scanners()
+        device = window.scan_panel.device
+        device.setCurrentIndex(device.findData("2bc5:06da"))
+        with mock.patch.object(scanners, "plugged_in", return_value=[]):
+            window._look_for_scanners()
+        self.assertEqual(device.findData("2bc5:06da"), -1, "it should be gone from the list")
+        self.assertNotEqual(window.scan_panel.device_key, "2bc5:06da",
+                            "the selection should move off a scanner that unplugged")
+
+    def test_the_scanner_list_stays_usable_with_nothing_connected(self):
+        # It is where the app says which scanners it can see, so it must not
+        # grey out just because none of them can be scanned from.
+        window = self.open_window(present=False)
+        self.assertTrue(window.scan_panel.device.isEnabled())
 
 
 class ShippedTests(unittest.TestCase):

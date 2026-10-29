@@ -32,6 +32,16 @@ The one thing an opened file cannot do is **Mesh**, which melts a scan's own
 depth views together and so needs a scan taken here. A file that already
 holds a mesh keeps it.
 
+## What the app says about a scanner it finds
+
+Every scanner in `resources/devices.json` that is on the USB bus appears in
+the scanner list, whether or not it can be driven. One that cannot says so
+in plain words and points at File → Open scan, rather than being left out as
+though the app had not noticed it.
+
+A model joins the drivable list in `gui_python/scanners.py` only once
+scanning has actually been tested on it.
+
 ## Live capture
 
 Support levels are evidence-based:

@@ -368,7 +368,7 @@ class ScanPanel(QWidget):
     completed = pyqtSignal()
     cancelled = pyqtSignal()
     preset_changed = pyqtSignal(object)  # Preset
-    device_changed = pyqtSignal(bool)  # True when the POP 4 is the device
+    device_changed = pyqtSignal(str)  # the chosen scanner: "pop4", "mock" or its USB id
     mode_changed = pyqtSignal(str)  # "infrared", "blue laser" or "speckle", as picked
     MODES = {"infrared": "Infrared", "blue laser": "Blue laser (visible)",
              "speckle": "Infrared speckle"}
@@ -466,6 +466,27 @@ class ScanPanel(QWidget):
     def pop4(self) -> bool:
         return self.device.currentData() == "pop4"
 
+    @property
+    def device_key(self) -> str:
+        return self.device.currentData() or ""
+
+    def show_other_scanners(self, found) -> None:
+        """Lists the scanners that are plugged in but cannot be scanned from.
+
+        Leaving them out would look like the app had not noticed them. They
+        are named instead, and picking one says what can be done with it."""
+        wanted = {scanner.key: scanner.name for scanner in found if not scanner.drivable}
+        listed = {self.device.itemData(i) for i in range(self.device.count())}
+        for key, name in wanted.items():
+            if key not in listed:
+                self.device.addItem(name, key)
+        for at in reversed(range(self.device.count())):
+            key = self.device.itemData(at)
+            if key not in ("pop4", "mock") and key not in wanted:
+                if at == self.device.currentIndex():
+                    self.device.setCurrentIndex(max(self.device.findData("pop4"), 0))
+                self.device.removeItem(at)
+
     def set_connection(self, text: str, ok: bool = True) -> None:
         """What the heading beside the scanner list says: Connected,
         Connecting… or Disconnected."""
@@ -545,7 +566,10 @@ class ScanPanel(QWidget):
     def _update_settings_enabled(self) -> None:
         # Settings are fixed for the length of a scan.
         idle = self.state is ScanState.IDLE
-        for combo in (self.device, self.accuracy, self.tracking, self.object_type):
+        # The scanner list stays usable with nothing connected: it is where
+        # the app says which scanners it can see.
+        self.device.setEnabled(idle)
+        for combo in (self.accuracy, self.tracking, self.object_type):
             combo.setEnabled(idle and self._ready)
         self.mode.setEnabled(idle and self._ready and self.pop4)
 
@@ -583,7 +607,7 @@ class ScanPanel(QWidget):
 
     def _on_device(self) -> None:
         self._update_settings_enabled()
-        self.device_changed.emit(self.pop4)
+        self.device_changed.emit(self.device_key)
 
 
 class Viewport(QFrame):

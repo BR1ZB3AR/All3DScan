@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
 
 import all3dscan_engine as engine
 import rea_engine as rea
+import scanners
 import theme
 from common import (
     APP_ICON,
@@ -532,6 +533,7 @@ class MainWindow(QMainWindow):
         self._reconnects = 0  # tries since the scanner was lost
         self._present_ticks = 0  # consecutive looks that found a POP 4
         self._absent_ticks = 0  # and consecutive looks that did not
+        self._other_scanners: list = []  # found on the bus, but not drivable
         self._scan_mode = "infrared"  # the POP 4's, as last confirmed
         self._scan_mode_asked = "infrared"
         self._thread = QThread(self)
@@ -1423,7 +1425,18 @@ class MainWindow(QMainWindow):
 
     # The POP 4: picking it, its lights, exposure and scan mode.
 
+    def _look_for_scanners(self) -> None:
+        """Keeps the scanner list up to date with what is on the USB bus,
+        including the scanners this cannot drive."""
+        try:
+            self._other_scanners = [s for s in scanners.plugged_in() if not s.drivable]
+        except OSError as exc:  # sysfs unreadable: carry on with what we have
+            print(f"looking for scanners failed: {describe(exc)}", file=sys.stderr, flush=True)
+            return
+        self.scan_panel.show_other_scanners(self._other_scanners)
+
     def _check_pop4_present(self) -> None:
+        self._look_for_scanners()
         present = bool(self._pop4_present())
         self.scan_panel.set_pop4_present(present or self.scan_panel.pop4)
         if self._pop4 and self._absent_ticks >= self.ABSENT_LOOKS and not self._connecting:
@@ -1446,16 +1459,32 @@ class MainWindow(QMainWindow):
                   f"{self.MAX_RECONNECTS})", flush=True)
             self._connect_pop4()
 
-    def _on_device(self, pop4: bool) -> None:
+    def _on_device(self, key: str) -> None:
         self.camera_panel.set_pop4(False)
         self.scan_panel.set_ready(False)
         self._reconnects = 0
-        if pop4:
+        if key == "pop4":
             self._connect_pop4()
-        else:
-            self._connecting = False
-            self.viewport.show_warning("")
+            return
+        self._connecting = False
+        self.viewport.show_warning("")
+        if key == "mock":
             self.mock_requested.emit()
+            return
+        # A scanner this cannot drive. Say what it is and what does work
+        # with it, rather than failing to connect to it.
+        self._explain_other_scanner(key)
+
+    def _explain_other_scanner(self, key: str) -> None:
+        found = next((s for s in self._other_scanners if s.key == key), None)
+        if found is None:
+            return
+        self.scan_panel.set_connection("Cannot scan", ok=False)
+        self._connection.setText('<span style="color:#e0a83e">●</span> '
+                                 f"{found.vendor} {found.key} — no Linux protocol yet")
+        print(f"{found.key} is recognised but cannot be scanned from: {found.label}",
+              flush=True)
+        self.viewport.show_warning(found.why_not())
 
     def _connect_pop4(self) -> None:
         self._connecting = True
