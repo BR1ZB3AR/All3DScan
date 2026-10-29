@@ -473,6 +473,82 @@ mod all3dscan_engine {
         cloud_into_py(py, &kept)
     }
 
+    /// Keeps the object and drops the room around it.
+    ///
+    /// A scan of something on a desk is mostly desk, and the clutter behind
+    /// it comes too. This takes out the flat surface the object stands on or
+    /// in front of, and then everything not joined to the largest remaining
+    /// piece — in that order, since the object is usually joined to the rest
+    /// of the room through the surface it stands on.
+    ///
+    /// Both steps are guarded: a cloud that is mostly one flat thing is
+    /// taken to be a scan of something flat and kept whole, and a step that
+    /// would leave almost nothing is not taken. `gap_mm` is how far apart
+    /// two points may be and still count as joined; None works it out from
+    /// the cloud's own spacing.
+    ///
+    /// Returns the kept cloud, the indices it kept, whether a surface was
+    /// removed, and how many separate pieces the cloud fell into.
+    #[pyfunction]
+    #[pyo3(signature = (points, colors, normals, gap_mm = None))]
+    fn isolate<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        colors: PyArrayLike2<'py, u8, AllowTypeChange>,
+        normals: PyArrayLike2<'py, f32, AllowTypeChange>,
+        gap_mm: Option<f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rows = points.as_array().nrows();
+        let cloud = processing::Cloud {
+            points: triples(&points, "points")?,
+            colors: colour_rows(&colors, rows)?,
+            // Normals are optional here: without them no surface is looked
+            // for, and only the joined-up step runs.
+            normals: if normals.as_array().nrows() == 0 {
+                Vec::new()
+            } else {
+                triples(&normals, "normals")?
+            },
+        };
+        if !cloud.normals.is_empty() && cloud.normals.len() != cloud.points.len() {
+            return Err(PyValueError::new_err(format!(
+                "normals must match points, got {} normals for {} points",
+                cloud.normals.len(),
+                cloud.points.len()
+            )));
+        }
+        let found = py
+            .detach(|| processing::isolate(&cloud, gap_mm))
+            .map_err(value_error)?;
+        let (kept_points, kept_colors, kept_normals) = cloud_into_py(py, &found.cloud)?;
+        let out = PyDict::new(py);
+        out.set_item("points", kept_points)?;
+        out.set_item("colors", kept_colors)?;
+        out.set_item("normals", kept_normals)?;
+        out.set_item("kept", PyArray1::from_vec(py, found.kept))?;
+        out.set_item("surface_removed", found.surface_removed)?;
+        out.set_item("pieces", found.pieces)?;
+        Ok(out)
+    }
+
+    /// The pieces a cloud falls into, largest first, as arrays of indices.
+    ///
+    /// Two points belong to the same piece when a chain of points no more
+    /// than `gap_mm` apart joins them.
+    #[pyfunction]
+    #[pyo3(signature = (points, gap_mm))]
+    fn pieces<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        gap_mm: f32,
+    ) -> PyResult<Vec<Bound<'py, PyArray1<u32>>>> {
+        let cloud: Vec<Point3<f32>> = triples(&points, "points")?;
+        let found = py
+            .detach(move || processing::pieces(&cloud, gap_mm))
+            .map_err(value_error)?;
+        Ok(found.into_iter().map(|piece| PyArray1::from_vec(py, piece)).collect())
+    }
+
     /// Whether a POP 4 is plugged in, without opening it.
     #[pyfunction]
     fn pop4_present() -> bool {

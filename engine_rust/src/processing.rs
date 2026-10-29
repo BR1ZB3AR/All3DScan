@@ -289,6 +289,216 @@ fn plane_normal(near: &[Point3<f32>]) -> Option<Vector3<f32>> {
     Vector3::new(axis[0] as f32, axis[1] as f32, axis[2] as f32).try_normalize(1e-12)
 }
 
+/// The pieces a cloud falls into, as index lists, largest first.
+///
+/// Two points belong to the same piece when a chain of points no more than
+/// `gap_mm` apart joins them. Measured on the voxel grid rather than
+/// point-to-point, so it costs one pass rather than a search per point: two
+/// points in touching cubes of edge `gap_mm` are within `gap_mm * sqrt(3)`
+/// of each other, which is the usual trade and is why the gap is generous
+/// rather than exact.
+pub fn pieces(points: &[Point3<f32>], gap_mm: f32) -> Result<Vec<Vec<u32>>, ProcessingError> {
+    check_voxel_size(gap_mm)?;
+    let keyed = voxel_keys(points, gap_mm)?;
+    // Number the occupied cubes in the order their first point appears, so
+    // the answer never depends on hash order.
+    let mut id_of: HashMap<[i64; 3], usize> = HashMap::new();
+    let mut cube_of: Vec<usize> = Vec::with_capacity(keyed.len());
+    for (key, _) in &keyed {
+        let next = id_of.len();
+        let id = *id_of.entry(*key).or_insert(next);
+        cube_of.push(id);
+    }
+    let mut parent: Vec<usize> = (0..id_of.len()).collect();
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
+        while parent[at] != at {
+            parent[at] = parent[parent[at]]; // halve the path as we go
+            at = parent[at];
+        }
+        at
+    }
+    for (key, id) in &id_of {
+        for offset in 0..27 {
+            let beside = [
+                key[0] + offset / 9 - 1,
+                key[1] + offset / 3 % 3 - 1,
+                key[2] + offset % 3 - 1,
+            ];
+            if let Some(other) = id_of.get(&beside) {
+                let (a, b) = (root(&mut parent, *id), root(&mut parent, *other));
+                if a != b {
+                    // Join towards the lower number, so the result is the
+                    // same however the map was walked.
+                    let (low, high) = if a < b { (a, b) } else { (b, a) };
+                    parent[high] = low;
+                }
+            }
+        }
+    }
+    let mut members: HashMap<usize, Vec<u32>> = HashMap::new();
+    for (at, (_, index)) in keyed.iter().enumerate() {
+        members.entry(root(&mut parent, cube_of[at])).or_default().push(*index);
+    }
+    let mut found: Vec<Vec<u32>> = members.into_values().collect();
+    for piece in &mut found {
+        piece.sort_unstable();
+    }
+    // Largest first, and ties broken by the lowest index, so the order is
+    // the same on every run.
+    found.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+    Ok(found)
+}
+
+/// How far apart two points may be and still count as the same piece, as a
+/// multiple of the cloud's own typical spacing. Loose enough to bridge the
+/// holes a scan leaves, tight enough not to join an object to the table.
+const PIECE_GAP: f32 = 3.0;
+/// A plane is only worth removing if it holds at least this share of the
+/// cloud: anything less is a face of the object, not the thing it stands on.
+const SURFACE_SHARE: f32 = 0.12;
+/// ...and only if this much of the cloud is left afterwards. Below it the
+/// plane *is* the object, and taking it out would leave nothing worth having.
+const LEAST_LEFT: f32 = 0.05;
+/// How far from the plane a point must be to count as off it.
+const SURFACE_BAND_MM: f32 = 3.0;
+/// How many hypotheses the search for that surface tries.
+const SURFACE_TRIES: u32 = 400;
+
+/// What isolation did, so a caller can say it rather than silently throwing
+/// most of the scan away.
+#[derive(Debug, Clone)]
+pub struct Isolated {
+    pub cloud: Cloud,
+    /// Indices into the cloud given, in order.
+    pub kept: Vec<u32>,
+    /// Whether a surface the object was standing on was found and taken out.
+    pub surface_removed: bool,
+    /// How many separate pieces the rest fell into.
+    pub pieces: usize,
+}
+
+/// Keeps the object and drops the room around it.
+///
+/// A scan of something on a desk is mostly desk, and the walls and clutter
+/// behind it come too: on a real POP 4 scan the object is a minority of the
+/// points. Two steps, in this order because they depend on each other — the
+/// object is usually joined to everything else *through* the surface it
+/// stands on, so the surface has to go first or the largest piece is the
+/// whole room:
+///
+/// 1. the flat surface the object stands on or in front of, if the cloud is
+///    largely one, and everything behind it;
+/// 2. everything not joined to the largest remaining piece.
+///
+/// Both steps are guarded. A cloud that is mostly one flat thing is probably
+/// a scan *of* something flat, so the surface is kept; and if a step would
+/// leave almost nothing, it is not taken. `normals` may be empty, in which
+/// case no surface is looked for and only step 2 runs.
+pub fn isolate(cloud: &Cloud, gap_mm: Option<f32>) -> Result<Isolated, ProcessingError> {
+    let n = cloud.points.len();
+    let whole = |reason: &str| {
+        let _ = reason;
+        Isolated {
+            cloud: cloud.clone(),
+            kept: (0..n as u32).collect(),
+            surface_removed: false,
+            pieces: 1,
+        }
+    };
+    if n < 32 {
+        return Ok(whole("too few points to judge"));
+    }
+    let gap = match gap_mm {
+        Some(given) => {
+            check_voxel_size(given)?;
+            given
+        }
+        None => typical_spacing(&cloud.points)? * PIECE_GAP,
+    };
+
+    // 1. The surface it stands on, if there is one and it is not the object.
+    let mut candidates: Vec<u32> = (0..n as u32).collect();
+    let mut surface_removed = false;
+    if cloud.normals.len() == n {
+        if let Some(plane) = crate::fitting::fit_plane(
+            &cloud.points,
+            &cloud.normals,
+            &candidates,
+            crate::fitting::Ransac {
+                threshold_mm: SURFACE_BAND_MM,
+                min_inliers: (n as f32 * SURFACE_SHARE) as usize,
+                iterations: SURFACE_TRIES,
+                // Fixed, so isolating the same cloud twice gives the same
+                // answer: a tool that moves under you is not usable.
+                seed: 0x1501A7E,
+            },
+        ) {
+            // The normal faces the sensor, so the object is on the positive
+            // side: in front of a wall, above a desk.
+            let in_front: Vec<u32> = candidates
+                .iter()
+                .copied()
+                .filter(|&k| {
+                    (cloud.points[k as usize] - plane.origin).dot(&plane.normal)
+                        > SURFACE_BAND_MM
+                })
+                .collect();
+            if in_front.len() as f32 >= n as f32 * LEAST_LEFT {
+                candidates = in_front;
+                surface_removed = true;
+            }
+        }
+    }
+
+    // 2. The largest piece of what is left.
+    let kept_points: Vec<Point3<f32>> =
+        candidates.iter().map(|&k| cloud.points[k as usize]).collect();
+    let found = pieces(&kept_points, gap)?;
+    let Some(largest) = found.first() else {
+        return Ok(whole("nothing left to judge"));
+    };
+    let kept: Vec<u32> = largest.iter().map(|&at| candidates[at as usize]).collect();
+    if (kept.len() as f32) < n as f32 * LEAST_LEFT {
+        return Ok(whole("the largest piece is too small to be the object"));
+    }
+    Ok(Isolated {
+        cloud: take(cloud, &kept),
+        kept,
+        surface_removed,
+        pieces: found.len(),
+    })
+}
+
+/// The points a cloud holds at these indices, with their colours and normals.
+fn take(cloud: &Cloud, which: &[u32]) -> Cloud {
+    let has_colors = cloud.colors.len() == cloud.points.len();
+    let has_normals = cloud.normals.len() == cloud.points.len();
+    Cloud {
+        points: which.iter().map(|&k| cloud.points[k as usize]).collect(),
+        colors: if has_colors {
+            which.iter().map(|&k| cloud.colors[k as usize]).collect()
+        } else {
+            Vec::new()
+        },
+        normals: if has_normals {
+            which.iter().map(|&k| cloud.normals[k as usize]).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Roughly how far apart neighbouring points are, from how many share a
+/// cube: a surface spaced s apart crossing a cube of edge c puts about
+/// (c / s)^2 points in it.
+fn typical_spacing(points: &[Point3<f32>]) -> Result<f32, ProcessingError> {
+    const PROBE_MM: f32 = 10.0;
+    let keyed = voxel_keys(points, PROBE_MM)?;
+    let cubes = keyed.chunk_by(|a, b| a.0 == b.0).count().max(1);
+    let per_cube = (keyed.len() as f32 / cubes as f32).max(1.0);
+    Ok(PROBE_MM / per_cube.sqrt())
+}
+
 /// How many times the radius may be doubled while looking for one at which
 /// the points can see each other at all.
 const SPECKLE_WIDENINGS: u32 = 4;
@@ -460,6 +670,165 @@ fn tangent(
 
 #[cfg(test)]
 mod tests {
+
+    /// A cloud with colours and normals per point, for the isolation tests.
+    fn dressed(points: Vec<Point3<f32>>, normals: Vec<Vector3<f32>>) -> Cloud {
+        let n = points.len();
+        Cloud { points, colors: vec![[200, 200, 200]; n], normals }
+    }
+
+    /// A ball of `across` points on a sphere, centred where asked.
+    fn ball(centre: Point3<f32>, radius: f32, across: usize) -> (Vec<Point3<f32>>, Vec<Vector3<f32>>) {
+        let (mut points, mut normals) = (Vec::new(), Vec::new());
+        for i in 0..across {
+            for j in 0..across {
+                let theta = std::f32::consts::PI * (i as f32 + 0.5) / across as f32;
+                let phi = 2.0 * std::f32::consts::PI * j as f32 / across as f32;
+                let n = Vector3::new(
+                    theta.sin() * phi.cos(),
+                    theta.sin() * phi.sin(),
+                    theta.cos(),
+                );
+                points.push(centre + n * radius);
+                normals.push(n);
+            }
+        }
+        (points, normals)
+    }
+
+    /// A flat sheet in the z = `at` plane, `span` mm across, `step` apart.
+    fn sheet(at: f32, span: f32, step: f32) -> (Vec<Point3<f32>>, Vec<Vector3<f32>>) {
+        let (mut points, mut normals) = (Vec::new(), Vec::new());
+        let n = (span / step) as i32;
+        for x in -n..=n {
+            for y in -n..=n {
+                points.push(Point3::new(x as f32 * step, y as f32 * step, at));
+                normals.push(-Vector3::z()); // facing the sensor
+            }
+        }
+        (points, normals)
+    }
+
+    #[test]
+    fn a_cloud_in_two_lumps_falls_into_two_pieces() {
+        let (mut points, _) = ball(Point3::new(0.0, 0.0, 300.0), 20.0, 20);
+        let (far, _) = ball(Point3::new(400.0, 0.0, 300.0), 20.0, 20);
+        let near_count = points.len();
+        points.extend(far);
+        let found = pieces(&points, 12.0).unwrap();
+        assert_eq!(found.len(), 2, "two separated balls should be two pieces");
+        assert_eq!(found[0].len(), near_count, "both balls have the same number of points");
+        // Largest first, and every point accounted for exactly once.
+        let mut all: Vec<u32> = found.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..points.len() as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_pieces_of_a_cloud_are_the_same_on_every_run() {
+        let (mut points, _) = ball(Point3::new(0.0, 0.0, 300.0), 20.0, 14);
+        let (far, _) = ball(Point3::new(300.0, 0.0, 300.0), 15.0, 12);
+        points.extend(far);
+        let once = pieces(&points, 12.0).unwrap();
+        for _ in 0..4 {
+            assert_eq!(pieces(&points, 12.0).unwrap(), once);
+        }
+    }
+
+    #[test]
+    fn isolation_keeps_the_object_and_drops_the_desk_it_stands_on() {
+        // A ball sitting in front of a large flat surface, with a scrap of
+        // clutter off to one side: a scan of something on a desk.
+        let (mut points, mut normals) = sheet(400.0, 150.0, 4.0);
+        let desk = points.len();
+        let (object, object_normals) = ball(Point3::new(0.0, 0.0, 360.0), 30.0, 30);
+        let kept_count = object.len();
+        points.extend(object);
+        normals.extend(object_normals);
+        let (clutter, clutter_normals) = ball(Point3::new(250.0, 100.0, 330.0), 8.0, 8);
+        points.extend(clutter);
+        normals.extend(clutter_normals);
+
+        let found = isolate(&dressed(points, normals), None).unwrap();
+        assert!(found.surface_removed, "the flat surface should have been taken out");
+        assert_eq!(found.cloud.points.len(), kept_count,
+                   "should be exactly the ball: {} of {} kept", found.cloud.points.len(), kept_count);
+        assert!(found.kept.iter().all(|&k| k as usize >= desk),
+                "a desk point survived isolation");
+        assert_eq!(found.cloud.colors.len(), found.cloud.points.len());
+        assert_eq!(found.cloud.normals.len(), found.cloud.points.len());
+    }
+
+    #[test]
+    fn isolation_will_not_eat_a_scan_that_is_itself_flat() {
+        // Scanning a flat panel: the dominant plane *is* the object, and
+        // taking it out would leave nothing.
+        let (points, normals) = sheet(350.0, 120.0, 3.0);
+        let whole = points.len();
+        let found = isolate(&dressed(points, normals), None).unwrap();
+        assert!(!found.surface_removed, "it removed the very thing being scanned");
+        assert_eq!(found.cloud.points.len(), whole);
+    }
+
+    #[test]
+    fn isolation_drops_the_scattered_bits_even_with_no_surface_to_find() {
+        let (mut points, mut normals) = ball(Point3::new(0.0, 0.0, 300.0), 25.0, 26);
+        let object = points.len();
+        for away in [300.0f32, -280.0, 420.0] {
+            let (bit, bit_normals) = ball(Point3::new(away, away / 3.0, 300.0), 5.0, 5);
+            points.extend(bit);
+            normals.extend(bit_normals);
+        }
+        let found = isolate(&dressed(points, normals), None).unwrap();
+        assert!(!found.surface_removed);
+        assert!(found.pieces >= 4, "the scattered bits should be separate pieces");
+        assert_eq!(found.cloud.points.len(), object);
+    }
+
+    #[test]
+    fn isolation_leaves_a_cloud_it_cannot_judge_alone() {
+        let few = Cloud {
+            points: (0..10).map(|i| Point3::new(i as f32, 0.0, 300.0)).collect(),
+            colors: vec![[1, 2, 3]; 10],
+            normals: vec![-Vector3::z(); 10],
+        };
+        let found = isolate(&few, None).unwrap();
+        assert_eq!(found.cloud.points.len(), 10);
+        assert_eq!(found.kept, (0..10).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn isolation_without_normals_still_drops_the_scattered_bits() {
+        let (mut points, _) = ball(Point3::new(0.0, 0.0, 300.0), 25.0, 24);
+        let object = points.len();
+        let (bit, _) = ball(Point3::new(350.0, 0.0, 300.0), 6.0, 6);
+        points.extend(bit);
+        let n = points.len();
+        let bare = Cloud { points, colors: vec![[9, 9, 9]; n], normals: Vec::new() };
+        let found = isolate(&bare, None).unwrap();
+        assert_eq!(found.cloud.points.len(), object);
+        assert!(found.cloud.normals.is_empty(), "normals were invented from nowhere");
+    }
+
+    #[test]
+    fn isolating_the_same_cloud_twice_gives_the_same_answer() {
+        let (mut points, mut normals) = sheet(400.0, 100.0, 4.0);
+        let (object, object_normals) = ball(Point3::new(0.0, 0.0, 360.0), 28.0, 24);
+        points.extend(object);
+        normals.extend(object_normals);
+        let cloud = dressed(points, normals);
+        let once = isolate(&cloud, None).unwrap();
+        for _ in 0..3 {
+            assert_eq!(isolate(&cloud, None).unwrap().kept, once.kept);
+        }
+    }
+
+    #[test]
+    fn a_silly_gap_is_refused() {
+        let cloud = dressed(ball(Point3::origin(), 10.0, 10).0, ball(Point3::origin(), 10.0, 10).1);
+        assert!(isolate(&cloud, Some(0.0)).is_err());
+        assert!(isolate(&cloud, Some(f32::NAN)).is_err());
+    }
     #[test]
     fn normals_of_a_cloud_with_no_order_point_out_of_its_surface() {
         // A flat sheet in the z = 300 plane, as a scan of a wall would be.

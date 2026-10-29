@@ -464,8 +464,14 @@ class MainWindow(QMainWindow):
     # the scan covers a large box, so this is a floor rather than a promise.
     SURFACE_VOXEL_MM = 1.0
     # How long the scanner's white lights stay on, and then off, while a
-    # scan runs. Slow enough that the commands do not crowd the captures.
-    FLASH_MS = 500
+    # scan runs. This was 500 ms on the reasoning that the commands would
+    # otherwise crowd the captures; measured on a POP 4 (2026-10-29), that
+    # is not so. Flashing every 500, 250, 160, 120, 80 and 50 ms all held
+    # 7.44-7.51 frames a second, against 6.56 with no flashing at all, with
+    # the 500 ms run repeated at the end to rule out drift. Below about
+    # 130 ms nothing more is gained: the light is only switched between
+    # captures, and a capture takes that long.
+    FLASH_MS = 120
 
     def __init__(self, sensor=None, open_pop4=None, pop4_present=None) -> None:
         """The POP 4 is the scanner: the window opens it as soon as one is on
@@ -665,9 +671,14 @@ class MainWindow(QMainWindow):
             "Build one model from the scan's frames, aligning each onto the last.\n"
             "Off, the view shows only the newest frame.", checkable=True)
         self.fusion_action.setChecked(True)
+        self.isolate_action = action(
+            "Isolation", "edit-delete",
+            "Keep the object and drop the room: the surface it stands on, and "
+            "everything not joined to it.\nPress again to put it back.", enabled=False)
+        self.isolate_action.triggered.connect(self.isolate_object)
         point_cloud = [
             self.fusion_action,
-            action("Isolation", "edit-delete", later, enabled=False),
+            self.isolate_action,
             action("Overlap", "edit-select-all", later, enabled=False),
             action("Smooth", "smooth", later, enabled=False),
             action("Simplify", "transform-scale", later, enabled=False),
@@ -1194,6 +1205,9 @@ class MainWindow(QMainWindow):
                  and model.session is not None)
         self.fit_plane_action.setEnabled(ready)
         self.fit_cylinder_action.setEnabled(ready)
+        self.isolate_action.setEnabled(ready)
+        self.isolate_action.setText("Isolation" if model is None or model.whole is None
+                                    else "Undo isolation")
         # Saving wants points, not a fit: a model with no primitives in it
         # is still worth keeping.
         self.export_action.setEnabled(self._state is ScanState.IDLE and model is not None
@@ -1281,6 +1295,63 @@ class MainWindow(QMainWindow):
                                  f"{written.name}", 5000)
         print(f"{model.name}: exported {count} primitives to {written}", flush=True)
         return written
+
+    def isolate_object(self) -> None:
+        """Keeps the object and drops the room around it, or puts it back.
+
+        A scan of something on a desk is mostly desk, with the clutter
+        behind it as well: on a real POP 4 scan the object was 28% of the
+        points. What is dropped is kept, so this undoes."""
+        model = self.model_panel.current_model()
+        if model is None or model.points is None:
+            return
+        if model.whole is not None:  # put it back
+            model.points, model.colors, model.normals = model.whole
+            model.whole = None
+            model.properties["Points"] = f"{len(model.points):,} (isolation undone)"
+            self._after_cloud_changed(model, "Isolation undone")
+            return
+        whole = (model.points, model.colors, model.normals)
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            found = engine.isolate(model.points, model.colors, model.normals)
+        except (ValueError, OSError) as exc:
+            print(f"isolation failed: {describe(exc)}", file=sys.stderr, flush=True)
+            self.viewport.show_toast(f"Isolation failed: {exc}", 6000)
+            return
+        finally:
+            self.unsetCursor()
+        kept = found["points"]
+        if len(kept) == len(whole[0]):
+            # The guards decided there was nothing safe to take out.
+            self.viewport.show_toast(
+                "Nothing to isolate: this scan is one piece, or it is a scan of "
+                "the flat surface itself", 6000)
+            return
+        model.points, model.colors, model.normals = kept, found["colors"], found["normals"]
+        model.whole = whole
+        share = len(kept) / max(len(whole[0]), 1)
+        model.properties["Points"] = (f"{len(kept):,} isolated of {len(whole[0]):,} "
+                                      f"({share:.0%})")
+        said = ("the surface it stood on and " if found["surface_removed"] else "")
+        print(f"{model.name}: isolated {len(kept):,} of {len(whole[0]):,} points "
+              f"({share:.0%}); removed {said}{found['pieces'] - 1} loose piece(s)", flush=True)
+        self._after_cloud_changed(
+            model, f"Kept {len(kept):,} of {len(whole[0]):,} points ({share:.0%})")
+
+    def _after_cloud_changed(self, model, said: str) -> None:
+        """Puts the view and the fits back in step with a cloud that has
+        just been edited."""
+        # The fits were measured against the old points, and a surface built
+        # from the old cloud no longer describes this one.
+        model.session = rea.ReaSession(model.points, model.normals)
+        model.surface = None
+        self._shown_model = None
+        self.model_panel.refresh_primitives()
+        self.model_panel._show(self.model_panel.models.currentItem())
+        self.viewport.show_cloud(model.points, model.colors, model.normals)
+        self._update_rea_tools()
+        self.viewport.show_toast(said, 5000)
 
     # Scans from elsewhere: reading them in and writing them out.
 

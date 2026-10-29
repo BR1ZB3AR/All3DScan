@@ -201,6 +201,9 @@ class ScanModel:
     surface: tuple | None = None
     # The depth camera's fx, fy, cx, cy, which the surface is built with.
     intrinsics: tuple = ()
+    # The cloud as it was before isolation, so it can be put back. None
+    # while the model is whole.
+    whole: tuple | None = None
     session: rea.ReaSession | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:

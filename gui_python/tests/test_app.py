@@ -1112,6 +1112,90 @@ class LivePreviewTests(WindowTestCase):
         self.assertEqual(self.pop4.frames_taken, taken, "frames were asked for with no scanner")
 
 
+class IsolationTests(WindowTestCase):
+    """Keeping the object and dropping the room around it."""
+
+    def model_of(self, window, points, colors=None, normals=None):
+        """Puts a cloud in front of the window as a model."""
+        if colors is None:
+            colors = np.full((len(points), 3), 200, np.uint8)
+        if normals is None:
+            normals = engine.estimate_normals(points)
+        model = app.ScanModel("Test", {"Model name": "Test", "Points": f"{len(points):,}"},
+                              points, colors, normals)
+        window.model_panel.add_model(model)
+        return model
+
+    def object_on_a_desk(self):
+        """A ball in front of a large flat surface, with a loose scrap."""
+        points = []
+        for x in range(-30, 31):
+            for y in range(-30, 31):
+                points.append([x * 4.0, y * 4.0, 400.0])
+        desk = len(points)
+        for i in range(34):
+            for j in range(34):
+                theta = np.pi * (i + 0.5) / 34
+                phi = 2 * np.pi * j / 34
+                n = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi),
+                              np.cos(theta)])
+                points.append(list(np.array([0.0, 0.0, 360.0]) + n * 30.0))
+        ball = len(points) - desk
+        for i in range(8):
+            for j in range(8):
+                points.append([240.0 + i, 90.0 + j, 330.0])
+        return np.asarray(points, np.float32), desk, ball
+
+    def test_it_keeps_the_object_and_drops_the_desk(self):
+        window = self.open_window()
+        points, desk, ball = self.object_on_a_desk()
+        model = self.model_of(window, points)
+        window.isolate_action.trigger()
+        self.assertLess(len(model.points), desk, "the desk was kept")
+        self.assertGreater(len(model.points), ball * 0.8,
+                           "most of the object should have survived")
+        self.assertIn("isolated", model.properties["Points"])
+
+    def test_it_undoes(self):
+        window = self.open_window()
+        points, _, _ = self.object_on_a_desk()
+        model = self.model_of(window, points)
+        window.isolate_action.trigger()
+        self.assertIsNotNone(model.whole)
+        self.assertEqual(window.isolate_action.text(), "Undo isolation")
+        window.isolate_action.trigger()
+        self.assertIsNone(model.whole)
+        np.testing.assert_array_equal(model.points, points)
+        self.assertEqual(window.isolate_action.text(), "Isolation")
+
+    def test_a_scan_of_something_flat_is_left_alone_and_says_so(self):
+        window = self.open_window()
+        flat = np.asarray([[x * 3.0, y * 3.0, 350.0] for x in range(-40, 41)
+                           for y in range(-40, 41)], np.float32)
+        model = self.model_of(window, flat)
+        window.isolate_action.trigger()
+        self.assertEqual(len(model.points), len(flat), "it ate a scan of a flat object")
+        self.assertIsNone(model.whole)
+        self.assertIn("Nothing to isolate", window.viewport.toast.text())
+
+    def test_the_fits_and_the_mesh_are_dropped_when_the_cloud_changes(self):
+        # A plane fitted to the old points does not describe the new ones.
+        window = self.open_window()
+        points, _, _ = self.object_on_a_desk()
+        model = self.model_of(window, points)
+        window.fit("plane")
+        wait_until(lambda: not window._fitting, timeout_s=60)
+        self.assertTrue(model.session.primitives, "nothing was fitted to fit")
+        model.surface = (points, points, np.zeros((1, 3), np.uint32))
+        window.isolate_action.trigger()
+        self.assertFalse(model.session.primitives, "a stale fit survived isolation")
+        self.assertIsNone(model.surface, "a stale surface survived isolation")
+
+    def test_it_waits_for_a_model_like_the_other_tools(self):
+        window = self.open_window()
+        self.assertFalse(window.isolate_action.isEnabled())
+
+
 class InterchangeTests(WindowTestCase):
     """Scans from other tools and other scanners: opening them, and saving
     one where another tool can open it."""
