@@ -1242,11 +1242,17 @@ class InterchangeTests(WindowTestCase):
         wait_until(lambda: not window._fitting, timeout_s=60)
         self.assertTrue(opened.session.primitives, "nothing could be fitted to the opened scan")
         self.assertTrue(window.export_step_action.isEnabled())
-        # Meshing is the one thing it cannot do, because the surface is built
-        # from the scan's depth views and a file carries none. It has to say
-        # so rather than sit there dead.
-        self.assertFalse(window.mesh_action.isEnabled())
-        self.assertIn("does not carry", window.mesh_action.toolTip())
+        # Meshing works on it too, by fitting a surface through the points
+        # rather than melting depth views it does not have.
+        self.assertTrue(window.mesh_action.isEnabled())
+        self.assertIn("Fits one surface through the points", window.mesh_action.toolTip())
+        window.mesh_action.trigger()
+        wait_until(lambda: not window._meshing, timeout_s=180)
+        self.assertIsNotNone(opened.surface, "no surface was fitted to the opened cloud")
+        vertices, normals, triangles = opened.surface
+        self.assertGreater(len(triangles), 100)
+        self.assertEqual(normals.shape, vertices.shape)
+        self.assertLess(triangles.max(), len(vertices))
 
     def test_a_file_with_no_normals_gets_normals_worked_out(self):
         # Plain columns of numbers carry no normals, and fitting needs them.
@@ -1450,6 +1456,66 @@ class ScannerListInTheWindowTests(WindowTestCase):
         # grey out just because none of them can be scanned from.
         window = self.open_window(present=False)
         self.assertTrue(window.scan_panel.device.isEnabled())
+
+
+class CloudSurfaceTests(WindowTestCase):
+    """Fitting a surface through a cloud that has no depth views behind it."""
+
+    def ball(self, radius=25.0, across=48):
+        points, normals = [], []
+        for i in range(across):
+            for j in range(across):
+                theta = np.pi * (i + 0.5) / across
+                phi = 2 * np.pi * j / across
+                n = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi),
+                              np.cos(theta)])
+                points.append(n * radius)
+                normals.append(n)
+        return (np.asarray(points, np.float32), np.asarray(normals, np.float32))
+
+    def test_a_ball_of_points_comes_back_the_right_size(self):
+        points, normals = self.ball(25.0)
+        built = engine.cloud_surface(points, normals, detail=8, trim=0.0)
+        vertices = built["vertices"]
+        across = vertices.max(0) - vertices.min(0)
+        np.testing.assert_allclose(across, 50.0, atol=1.5,
+                                   err_msg=f"a 25 mm ball came back {across}")
+        self.assertGreater(len(built["triangles"]), 1000)
+
+    def test_trimming_cuts_the_surface_it_invented_over_a_hole(self):
+        # Half a ball: the fit closes over the missing half, and trimming is
+        # what takes that invented part off again.
+        points, normals = self.ball(25.0)
+        front = points[:, 2] > 0
+        whole = engine.cloud_surface(points[front], normals[front], detail=8, trim=0.0)
+        cut = engine.cloud_surface(points[front], normals[front], detail=8, trim=0.25)
+        self.assertEqual(whole["trimmed_triangles"], 0)
+        self.assertGreater(cut["trimmed_triangles"], 0)
+        self.assertLess(len(cut["triangles"]), len(whole["triangles"]))
+        self.assertGreater(len(cut["triangles"]), 200, "trimming ate the surface")
+
+    def test_it_refuses_a_cloud_too_small_to_be_a_surface(self):
+        points, normals = self.ball(10.0, across=4)
+        with self.assertRaises(ValueError) as refused:
+            engine.cloud_surface(points, normals)
+        self.assertIn("too few", str(refused.exception))
+
+    def test_it_refuses_normals_that_do_not_match_the_points(self):
+        points, normals = self.ball(25.0, across=12)
+        with self.assertRaises(ValueError):
+            engine.cloud_surface(points, normals[:10])
+
+    def test_a_failure_is_reported_and_does_not_wedge_the_button(self):
+        window = self.open_window()
+        model = app.ScanModel("Tiny", {"Model name": "Tiny", "Points": "4"},
+                              np.zeros((4, 3), np.float32),
+                              np.zeros((4, 3), np.uint8),
+                              np.zeros((4, 3), np.float32))
+        window.model_panel.add_model(model)
+        window.mesh_action.trigger()
+        wait_until(lambda: not window._meshing, timeout_s=60)
+        self.assertIsNone(model.surface)
+        self.assertTrue(window.mesh_action.isEnabled(), "the button stayed stuck")
 
 
 class ShippedTests(unittest.TestCase):

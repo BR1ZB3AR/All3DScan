@@ -26,6 +26,12 @@ scan exported by any scanner gets the full toolchain — cleaning, meshing,
 plane and cylinder fitting, STEP — whether or not its live protocol is
 implemented. **File → Open scan** (Ctrl+O), **File → Save scan as** (Ctrl+S).
 
+Third-party code lives in `third_party/`, each with its own licence and a
+`NOTICE.md` saying where it came from and what has been checked. There is
+one: a subset of [PoissonRecon](https://github.com/mkazhdan/PoissonRecon)
+(BSD-3-Clause), which fits a surface through a point cloud that has no depth
+views behind it.
+
 **Live capture** is per-device, because each vendor's USB protocol has to be
 reverse-engineered with the hardware in hand. Device IDs live in
 `resources/devices.json` and are matched at runtime, so new models can be

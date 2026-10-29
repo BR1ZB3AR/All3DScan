@@ -378,6 +378,26 @@ class FusionWorker(QObject):
         self._fusion = None
 
     @pyqtSlot(object, tuple, float)
+    @pyqtSlot(object, int, float)
+    def build_cloud_surface(self, model, detail: int, trim: float) -> None:
+        """Fits one surface through a cloud that has no depth views.
+
+        A scan taken here keeps its views and build_surface() uses them,
+        which is better: it knows where the scanner looked and saw nothing,
+        so a hole stays a hole. A cloud opened from a file has no such
+        record, only points."""
+        try:
+            built = engine.cloud_surface(model.points, model.normals,
+                                         detail=detail, trim=trim)
+        except BaseException as exc:
+            self.failed.emit(describe(exc))
+            self.surface_ready.emit(None, model)
+            return
+        triangles = built["triangles"]
+        self.surface_ready.emit(
+            (built["vertices"], built["normals"].reshape(-1, 3), triangles)
+            if len(triangles) else None, model)
+
     def build_surface(self, model, intrinsics: tuple, voxel_mm: float) -> None:
         """Melts the scan's depth views into one closed surface."""
         if self._fusion is None or not intrinsics or not intrinsics[0]:
@@ -412,6 +432,7 @@ class MainWindow(QMainWindow):
     frame_requested = pyqtSignal()
     fuse_requested = pyqtSignal(object, object, object, object)  # points, colours, normals, depth
     surface_requested = pyqtSignal(object, tuple, float)  # the model, intrinsics, voxel
+    cloud_surface_requested = pyqtSignal(object, int, float)  # the model, detail, trim
     fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
     fusion_stop_requested = pyqtSignal()
     tune_exposure_requested = pyqtSignal(tuple)  # the preset's working distance
@@ -463,6 +484,15 @@ class MainWindow(QMainWindow):
     # The detail the built surface holds. The reconstruction grows it when
     # the scan covers a large box, so this is a floor rather than a promise.
     SURFACE_VOXEL_MM = 1.0
+    # Fitting a surface through a cloud that has no depth views behind it.
+    # Each step of detail doubles the work; 8 suits a scan of an object.
+    CLOUD_SURFACE_DETAIL = 8
+    # That fit closes over everything, including where the scan never
+    # reached, so the least-supported part is cut away again. Measured on a
+    # real POP 4 scan whose points spanned 270 x 152 x 131 mm: untrimmed the
+    # surface spanned 297 x 233 x 214, and at a tenth it came back to
+    # 276 x 156 x 129, which is the data's own extent.
+    CLOUD_SURFACE_TRIM = 0.10
     # How long the scanner's white lights stay on, and then off, while a
     # scan runs. This was 500 ms on the reasoning that the commands would
     # otherwise crowd the captures; measured on a POP 4 (2026-10-29), that
@@ -594,6 +624,7 @@ class MainWindow(QMainWindow):
         self._fusion_worker.model_ready.connect(self._on_model_ready)
         self._fusion_worker.surface_ready.connect(self._on_surface_ready)
         self.surface_requested.connect(self._fusion_worker.build_surface)
+        self.cloud_surface_requested.connect(self._fusion_worker.build_cloud_surface)
         self._fusion_worker.failed.connect(self._on_fusion_failed)
         self._fusion_thread.start()
         QApplication.instance().aboutToQuit.connect(self._stop_worker)
@@ -1019,17 +1050,30 @@ class MainWindow(QMainWindow):
                                  frame.normals[::step], frame.depth_mm)
 
     def build_surface(self) -> None:
-        """Melts the scan's depth views into one surface and shows it."""
+        """Builds a surface over the model and shows it.
+
+        A scan taken here is melted out of its own depth views, which is the
+        better answer where they exist: the views record where the scanner
+        looked and saw nothing, so holes stay holes. A cloud opened from a
+        file has no views, so one surface is fitted through its points
+        instead."""
         model = self.model_panel.current_model()
-        if model is None or self._meshing or not model.intrinsics:
+        if model is None or self._meshing or model.points is None:
             return
         if model.surface is not None:  # built already; just show it again
             self._show_surface(model)
             return
         self._meshing = True
         self._update_rea_tools()
-        self.viewport.show_toast("Building the surface…", 120_000)
-        self.surface_requested.emit(model, tuple(model.intrinsics), self.SURFACE_VOXEL_MM)
+        if model.intrinsics:
+            self.viewport.show_toast("Building the surface from the scan's depth views…",
+                                     120_000)
+            self.surface_requested.emit(model, tuple(model.intrinsics),
+                                        self.SURFACE_VOXEL_MM)
+        else:
+            self.viewport.show_toast("Fitting a surface through the points…", 120_000)
+            self.cloud_surface_requested.emit(model, self.CLOUD_SURFACE_DETAIL,
+                                              self.CLOUD_SURFACE_TRIM)
 
     def _on_surface_ready(self, surface, model) -> None:
         self._meshing = False
@@ -1213,15 +1257,14 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(self._state is ScanState.IDLE and model is not None
                                       and model.points is not None)
         # Meshing melts the scan's own depth views together, so it needs a
-        # scan taken here. A cloud opened from a file has no views: say why
-        # rather than leaving a dead button.
-        can_mesh = ready and not self._meshing and bool(model.intrinsics)
+        # scan taken here. A cloud opened from a file has no views, so one
+        # surface is fitted through its points instead.
+        can_mesh = ready and not self._meshing and model is not None and model.points is not None
         self.mesh_action.setEnabled(can_mesh)
         self.mesh_action.setToolTip(
-            self._mesh_tip if can_mesh or model is None or model.intrinsics else
-            "Meshing builds the surface from the scan's own depth views, which a scan "
-            "opened from a file does not carry. Open a file that already holds a mesh, "
-            "or scan the object here.")
+            self._mesh_tip if model is None or model.intrinsics else
+            "Fits one surface through the points. A scan taken here is built from its "
+            "own depth views instead, which keeps the holes the scanner never saw into.")
         self.export_step_action.setEnabled(ready and bool(model.session.primitives))
         self.model_panel.set_busy(self._fitting)
 

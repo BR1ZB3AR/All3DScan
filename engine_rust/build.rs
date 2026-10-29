@@ -30,6 +30,9 @@ fn main() {
 
     let fusion_cpp = root.join("fusion_cpp");
     let mesh_cpp = root.join("mesh_cpp");
+    // Screened Poisson reconstruction, for clouds with no depth views behind
+    // them. Header-only: an include path is the whole of it.
+    let poisson = root.join("third_party/PoissonRecon/Src");
     cxx_build::bridges(["src/hw.rs", "src/fusion.rs", "src/mesh.rs"])
         .file(hw_cpp.join("src/MockDepthSensor.cpp"))
         .file(hw_cpp.join("src/Pop4Presence.cpp"))
@@ -57,6 +60,19 @@ fn main() {
         .file(legacy.join("geometry/TsdfVolume.cpp"))
         .include(mesh_cpp.join("include"))
         .compile("all3dscan_fusion");
+
+    // Poisson is built on its own: it is third-party template code whose
+    // warnings are not ours to fix, and it takes a while, so it does not
+    // share a target with anything that changes often.
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .warnings(false)
+        .flag("-fopenmp")
+        .include(mesh_cpp.join("include"))
+        .include(&poisson)
+        .file(mesh_cpp.join("src/CloudSurface.cpp"))
+        .compile("all3dscan_cloud_surface");
     println!("cargo:rustc-link-lib=gomp");
 
     let Some(libusb) = libusb else {

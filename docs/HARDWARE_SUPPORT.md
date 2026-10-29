@@ -28,9 +28,16 @@ drive is still a scanner it can work with today. Normals are worked out for a
 file that carries none, since fitting needs them; a file written in metres is
 noticed and offered in millimetres.
 
-The one thing an opened file cannot do is **Mesh**, which melts a scan's own
-depth views together and so needs a scan taken here. A file that already
-holds a mesh keeps it.
+**Mesh** works on an opened file too, by a different route. A scan taken here
+is melted out of its own depth views, which is better where they exist: the
+views record where the scanner looked and saw nothing, so a hole stays a
+hole. A file carries no such record, so one smooth surface is fitted through
+its points instead (`third_party/PoissonRecon`, wrapped by
+`mesh_cpp/CloudSurface`). That fit closes over everything, including places
+the scan never reached, so the least-supported tenth of it is cut away
+again — measured on a real POP 4 scan, that brings the surface back from
+297 x 233 x 214 mm to 276 x 156 x 129, against points spanning
+270 x 152 x 131.
 
 ## What the app says about a scanner it finds
 

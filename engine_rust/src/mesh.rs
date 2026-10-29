@@ -50,7 +50,105 @@ mod ffi {
         fn normals(self: &SurfaceBuilder) -> &CxxVector<f32>;
         fn indices(self: &SurfaceBuilder) -> &CxxVector<u32>;
         fn triangles(self: &SurfaceBuilder) -> u64;
+
+        include!("all3dscan/CloudSurface.h");
+
+        type CloudSurfaceBuilder;
+
+        #[cxx_name = "makeCloudSurfaceBuilder"]
+        fn make_cloud_surface_builder() -> UniquePtr<CloudSurfaceBuilder>;
+
+        /// # Safety
+        /// `xyz` and `normals` must each point to `count * 3` floats,
+        /// readable for the length of the call.
+        unsafe fn build(
+            self: Pin<&mut CloudSurfaceBuilder>,
+            xyz: *const f32,
+            normals: *const f32,
+            count: u64,
+            depth: i32,
+            trim: f32,
+        ) -> Result<bool>;
+
+        fn vertices(self: &CloudSurfaceBuilder) -> &CxxVector<f32>;
+        fn normals(self: &CloudSurfaceBuilder) -> &CxxVector<f32>;
+        fn indices(self: &CloudSurfaceBuilder) -> &CxxVector<u32>;
+        fn trimmed_vertices(self: &CloudSurfaceBuilder) -> u64;
+        fn trimmed_triangles(self: &CloudSurfaceBuilder) -> u64;
     }
+}
+
+// SAFETY: a CloudSurfaceBuilder is the mesh it last built and nothing else; it
+// holds no thread-local state. Calls go through & and &mut, so they never
+// overlap.
+unsafe impl Send for ffi::CloudSurfaceBuilder {}
+
+/// How much detail the fitted surface holds, and how much of its edge to
+/// cut away. See CloudSurface.h for what these cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloudSurfaceSettings {
+    pub depth: i32,
+    pub trim: f32,
+}
+
+impl Default for CloudSurfaceSettings {
+    fn default() -> Self {
+        // Measured on a real POP 4 scan: the points spanned 270 x 152 x 131
+        // mm, the untrimmed surface 297 x 233 x 214, and trimming the
+        // thinnest tenth brought it back to 276 x 156 x 129.
+        Self { depth: 8, trim: 0.10 }
+    }
+}
+
+/// What a Poisson reconstruction removed as unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Trimmed {
+    pub vertices: u64,
+    pub triangles: u64,
+}
+
+/// Fits one smooth surface through a cloud, using its normals.
+///
+/// For a cloud with no depth views behind it — opened from a file, or from a
+/// scanner All3DScan cannot drive. A scan taken here has its views, and
+/// SurfaceBuilder makes a better job of those because it knows where the
+/// scanner looked and saw nothing.
+pub fn cloud_surface(
+    points: &[Point3<f32>],
+    normals: &[nalgebra::Vector3<f32>],
+    settings: CloudSurfaceSettings,
+) -> Result<(Surface, Trimmed), cxx::Exception> {
+    let xyz: Vec<f32> = points.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+    let directions: Vec<f32> = normals.iter().flat_map(|n| [n.x, n.y, n.z]).collect();
+    let mut builder = ffi::make_cloud_surface_builder();
+    // SAFETY: both slices hold 3 * points.len() floats and outlive the call.
+    let built = unsafe {
+        builder.pin_mut().build(
+            xyz.as_ptr(),
+            directions.as_ptr(),
+            points.len() as u64,
+            settings.depth,
+            settings.trim,
+        )
+    }?;
+    if !built {
+        return Ok((Surface::default(), Trimmed::default()));
+    }
+    let vertices = builder.vertices().as_slice();
+    Ok((
+        Surface {
+            vertices: vertices
+                .chunks_exact(3)
+                .map(|v| Point3::new(v[0], v[1], v[2]))
+                .collect(),
+            normals: builder.normals().as_slice().to_vec(),
+            indices: builder.indices().as_slice().to_vec(),
+        },
+        Trimmed {
+            vertices: builder.trimmed_vertices(),
+            triangles: builder.trimmed_triangles(),
+        },
+    ))
 }
 
 // SAFETY: a SurfaceBuilder is the depth views it was given and the field
@@ -155,6 +253,96 @@ impl SurfaceBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sphere of oriented points, as a scan of a ball would be. The
+    /// `ball` below is a different thing: a depth image of one.
+    fn oriented_ball(
+        radius: f32,
+        across: usize,
+    ) -> (Vec<Point3<f32>>, Vec<nalgebra::Vector3<f32>>) {
+        let (mut points, mut normals) = (Vec::new(), Vec::new());
+        for i in 0..across {
+            for j in 0..across {
+                let theta = std::f32::consts::PI * (i as f32 + 0.5) / across as f32;
+                let phi = 2.0 * std::f32::consts::PI * j as f32 / across as f32;
+                let n = nalgebra::Vector3::new(
+                    theta.sin() * phi.cos(),
+                    theta.sin() * phi.sin(),
+                    theta.cos(),
+                );
+                points.push(Point3::from(n * radius));
+                normals.push(n);
+            }
+        }
+        (points, normals)
+    }
+
+    fn surface_extent(surface: &Surface) -> [f32; 3] {
+        let mut low = [f32::MAX; 3];
+        let mut high = [f32::MIN; 3];
+        for vertex in &surface.vertices {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(vertex[axis]);
+                high[axis] = high[axis].max(vertex[axis]);
+            }
+        }
+        [high[0] - low[0], high[1] - low[1], high[2] - low[2]]
+    }
+
+    #[test]
+    fn poisson_fits_a_surface_to_a_cloud_with_no_views_behind_it() {
+        let (points, normals) = oriented_ball(25.0, 60);
+        let (surface, _) = cloud_surface(&points, &normals, CloudSurfaceSettings::default()).unwrap();
+        assert!(surface.triangles() > 1000, "only {} triangles", surface.triangles());
+        for across in surface_extent(&surface) {
+            assert!(
+                (across - 50.0).abs() < 1.5,
+                "a 25 mm ball should come back 50 mm across, got {across}"
+            );
+        }
+        assert_eq!(surface.normals.len(), surface.vertices.len() * 3);
+        assert!(surface.indices.iter().all(|&i| (i as usize) < surface.vertices.len()));
+    }
+
+    #[test]
+    fn trimming_cuts_the_surface_poisson_invented_where_there_was_no_data() {
+        // Half a ball: Poisson closes over the missing half, and trimming
+        // is what takes that invented part off again.
+        let (whole, whole_normals) = oriented_ball(25.0, 60);
+        let (points, normals): (Vec<_>, Vec<_>) = whole
+            .iter()
+            .zip(&whole_normals)
+            .filter(|(p, _)| p.z > 0.0)
+            .map(|(p, n)| (*p, *n))
+            .unzip();
+        let untrimmed =
+            cloud_surface(&points, &normals, CloudSurfaceSettings { depth: 8, trim: 0.0 }).unwrap();
+        let trimmed =
+            cloud_surface(&points, &normals, CloudSurfaceSettings { depth: 8, trim: 0.25 }).unwrap();
+        assert_eq!(untrimmed.1.vertices, 0, "nothing should be cut at trim 0");
+        assert!(trimmed.1.vertices > 0, "trimming removed nothing");
+        assert!(
+            trimmed.0.triangles() < untrimmed.0.triangles(),
+            "trimming should leave fewer triangles"
+        );
+        // The half that was scanned has to survive it.
+        assert!(trimmed.0.triangles() > 500, "trimming ate the surface");
+    }
+
+    #[test]
+    fn poisson_refuses_a_cloud_too_small_to_be_a_surface() {
+        let (points, normals) = oriented_ball(10.0, 4); // 16 points
+        let err = cloud_surface(&points, &normals, CloudSurfaceSettings::default()).unwrap_err();
+        assert!(err.what().contains("too few"), "{}", err.what());
+    }
+
+    #[test]
+    fn poisson_refuses_settings_it_cannot_work_with() {
+        let (points, normals) = oriented_ball(25.0, 20);
+        for silly in [CloudSurfaceSettings { depth: 2, trim: 0.1 }, CloudSurfaceSettings { depth: 8, trim: 1.5 }] {
+            assert!(cloud_surface(&points, &normals, silly).is_err(), "{silly:?}");
+        }
+    }
     use super::*;
     use nalgebra::{Matrix3, Vector3};
 

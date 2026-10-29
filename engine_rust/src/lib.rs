@@ -26,7 +26,7 @@ mod all3dscan_engine {
     use pyo3::types::PyDict;
 
     use crate::processing::ProcessingError;
-    use crate::{fitting, fusion, hw, interchange, processing};
+    use crate::{fitting, fusion, hw, interchange, mesh, processing};
 
     /// The mock depth camera from hw_cpp.
     ///
@@ -547,6 +547,56 @@ mod all3dscan_engine {
             .detach(move || processing::pieces(&cloud, gap_mm))
             .map_err(value_error)?;
         Ok(found.into_iter().map(|piece| PyArray1::from_vec(py, piece)).collect())
+    }
+
+    /// Fits one smooth surface through a point cloud, using its normals.
+    ///
+    /// For a cloud with no depth views behind it: one opened from a file, or
+    /// from a scanner All3DScan cannot drive. A scan taken here keeps its
+    /// views, and Fusion.surface() makes a better job of those, because it
+    /// knows where the scanner looked and saw nothing.
+    ///
+    /// `detail` is how finely space is divided — each step doubles the
+    /// detail and roughly doubles the work. `trim` cuts away the share of
+    /// the surface with the least data behind it: the reconstruction closes
+    /// over everything, including the places a scan never reached, and this
+    /// is what takes that invented part off again. 0 keeps it closed.
+    ///
+    /// Returns the (N, 3) float32 vertices in millimetres, an (N, 3) unit
+    /// normal each, the (M, 3) uint32 triangles, and what the trim removed.
+    #[pyfunction]
+    #[pyo3(signature = (points, normals, detail = 8, trim = 0.10))]
+    fn cloud_surface<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        normals: PyArrayLike2<'py, f32, AllowTypeChange>,
+        detail: i32,
+        trim: f32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let cloud: Vec<Point3<f32>> = triples(&points, "points")?;
+        let directions: Vec<Vector3<f32>> = triples(&normals, "normals")?;
+        if directions.len() != cloud.len() {
+            return Err(PyValueError::new_err(format!(
+                "normals must match points, got {} normals for {} points",
+                directions.len(),
+                cloud.len()
+            )));
+        }
+        let settings = mesh::CloudSurfaceSettings { depth: detail, trim };
+        let (surface, trimmed) = py
+            .detach(move || mesh::cloud_surface(&cloud, &directions, settings))
+            .map_err(|e| PyValueError::new_err(e.what().to_owned()))?;
+        let triangles = surface.triangles();
+        let found = PyDict::new(py);
+        found.set_item("vertices", into_array(py, flatten(&surface.vertices))?)?;
+        found.set_item("normals", into_array(py, surface.normals)?)?;
+        found.set_item(
+            "triangles",
+            PyArray1::from_vec(py, surface.indices).reshape([triangles, 3])?,
+        )?;
+        found.set_item("trimmed_vertices", trimmed.vertices)?;
+        found.set_item("trimmed_triangles", trimmed.triangles)?;
+        Ok(found)
     }
 
     /// Whether a POP 4 is plugged in, without opening it.
