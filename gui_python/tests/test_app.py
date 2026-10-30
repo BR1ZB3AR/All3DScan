@@ -244,7 +244,7 @@ class LayoutTests(WindowTestCase):
         self.assertEqual(groups, {
             "Scan": ["Feature scan", "Marker scan"],
             "Point cloud edit": ["Fusion", "Isolation", "Overlap", "Smooth", "Simplify"],
-            "Mesh edit": ["Mesh", "Fill holes", "Smooth", "Simplify"],
+            "Mesh edit": ["Mesh", "Live mesh", "Fill holes", "Smooth", "Simplify"],
             "REA": ["Fit plane", "Fit cylinder", "Export STEP"],
             "Output": ["Export", "Fullscreen"],
         })
@@ -253,9 +253,10 @@ class LayoutTests(WindowTestCase):
         window = self.open_window()
         waiting = [action for group in ("Point cloud edit", "Mesh edit", "REA", "Output")
                    for action in window.ribbon_groups[group].buttons
-                   # Fusion is a setting for the scan to come, and Fullscreen
-                   # is about the window, so neither waits for a model.
-                   if action.text() not in ("Fusion", "Fullscreen")]
+                   # Fusion and Live mesh are settings for the scan to come,
+                   # and Fullscreen is about the window: none waits for a
+                   # model.
+                   if action.text() not in ("Fusion", "Live mesh", "Fullscreen")]
         still_dead = [a.text() for a in waiting if a.isEnabled()]
         self.assertFalse(still_dead, f"{still_dead} offered themselves with no model")
 
@@ -1758,6 +1759,67 @@ class MarkerSheetTests(WindowTestCase):
             self.assertIsNone(window.save_marker_sheet(into / "sheet.pdf"))
         self.assertTrue(warned.called)
         self.assertFalse((into / "sheet.pdf").exists())
+
+
+class LiveMeshTests(WindowTestCase):
+    """Melting a rough surface while the scan is still running."""
+
+    def test_it_is_off_until_asked_for(self):
+        window = self.open_window()
+        self.assertFalse(window.live_mesh_action.isChecked())
+        self.assertTrue(window.live_mesh_action.isEnabled(),
+                        "it is a setting for the scan to come, not a model tool")
+
+    def test_it_waits_for_enough_views_to_be_worth_the_frames(self):
+        window = self.open_window()
+        window.live_mesh_action.setChecked(True)
+        self.scan(window, frames=2)
+        # Two frames cannot have built up the views it needs.
+        self.assertFalse(window._meshing)
+        window.scan_panel.cancel()
+
+    def test_it_does_not_ask_again_while_one_is_being_built(self):
+        window = self.open_window()
+        window.live_mesh_action.setChecked(True)
+        window._meshing = True
+        asked = []
+        window.surface_requested.connect(lambda *a: asked.append(a))
+        window._offer_live_mesh()
+        self.assertEqual(asked, [], "it asked for a second surface mid-build")
+
+    def test_it_leaves_a_gap_between_surfaces(self):
+        window = self.open_window()
+        window.live_mesh_action.setChecked(True)
+        window._last_live_mesh = time.perf_counter()  # one just went
+        asked = []
+        window.surface_requested.connect(lambda *a: asked.append(a))
+        window._offer_live_mesh()
+        self.assertEqual(asked, [], "it asked again with no gap")
+
+    def test_a_live_surface_is_shown_but_not_kept(self):
+        # It is a look at progress, not a result: it must not be hung on a
+        # model, or the finished surface would be the rough one.
+        window = self.open_window()
+        model = app.ScanModel("Scan", {"Model name": "Scan"},
+                              np.zeros((4, 3), np.float32),
+                              np.zeros((4, 3), np.uint8),
+                              np.zeros((4, 3), np.float32))
+        window.model_panel.add_model(model)
+        vertices = np.array([[0, 0, 300], [10, 0, 300], [0, 10, 300]], np.float32)
+        surface = (vertices, vertices, np.array([[0, 1, 2]], np.uint32))
+        window._on_surface_ready(surface, None)   # a live one
+        self.assertIsNone(model.surface, "a live surface was kept as the scan's")
+        self.assertEqual(window.viewport.view3d.triangle_count, 1)
+
+    def test_turning_it_off_puts_the_cloud_back(self):
+        window = self.open_window()
+        window.live_mesh_action.setChecked(True)
+        vertices = np.array([[0, 0, 300], [10, 0, 300], [0, 10, 300]], np.float32)
+        window._on_surface_ready((vertices, vertices, np.array([[0, 1, 2]], np.uint32)), None)
+        self.assertEqual(window.viewport.view3d.triangle_count, 1)
+        window.live_mesh_action.setChecked(False)
+        self.assertEqual(window.viewport.view3d.triangle_count, 0,
+                         "the rough surface stayed after it stopped being updated")
 
 
 class ShippedTests(unittest.TestCase):

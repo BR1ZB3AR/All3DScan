@@ -414,7 +414,8 @@ class FusionWorker(QObject):
             self.surface_ready.emit(None, model)
             return
         try:
-            surface = self._fusion.surface(intrinsics, voxel_mm=voxel_mm)
+            surface = self._fusion.surface(intrinsics, voxel_mm=voxel_mm,
+                                           smoothing=4 if model is None else 8)
         except BaseException as exc:
             self.failed.emit(describe(exc))
             self.surface_ready.emit(None, model)
@@ -441,6 +442,8 @@ class FusionWorker(QObject):
 class MainWindow(QMainWindow):
     frame_requested = pyqtSignal()
     fuse_requested = pyqtSignal(object, object, object, object)  # points, colours, normals, depth
+    # The model may be None: a live surface mid-scan belongs to no
+    # finished scan.
     surface_requested = pyqtSignal(object, tuple, float)  # the model, intrinsics, voxel
     cloud_surface_requested = pyqtSignal(object, int, float)  # the model, detail, trim
     fusion_start_requested = pyqtSignal(float)  # the model's voxel, in mm
@@ -503,6 +506,15 @@ class MainWindow(QMainWindow):
     # surface spanned 297 x 233 x 214, and at a tenth it came back to
     # 276 x 156 x 129, which is the data's own extent.
     CLOUD_SURFACE_TRIM = 0.10
+    # Melting the surface while the scan runs. The reconstruction holds the
+    # same lock the fusion does, so every live surface is time the fusion is
+    # not merging frames: measured at 1.8 s for a finished scan's 30,532
+    # triangles. Hence coarse, and seldom.
+    LIVE_MESH_VOXEL_MM = 3.0
+    #: The least time between one live surface and the next.
+    LIVE_MESH_GAP_S = 4.0
+    #: It needs enough views to melt together to be worth the frames.
+    LIVE_MESH_LEAST_VIEWS = 6
     # How long the scanner's white lights stay on, and then off, while a
     # scan runs. This was 500 ms on the reasoning that the commands would
     # otherwise crowd the captures; measured on a POP 4 (2026-10-29), that
@@ -611,6 +623,7 @@ class MainWindow(QMainWindow):
         self._fitting = False
         self._fusing = False  # a frame is with the fusion worker
         self._meshing = False  # ...and a surface is being built
+        self._last_live_mesh = 0.0  # when the last live surface was asked for
         self._tuning = False  # the scanner is busy trying exposures
         self._fused: tuple | None = None  # the model built from this scan
         self._tracked = 0  # frames the fusion placed on the model
@@ -732,8 +745,16 @@ class MainWindow(QMainWindow):
             "Melt the scan's depth views into one closed surface", enabled=False)
         self.mesh_action.triggered.connect(self.build_surface)
         self._mesh_tip = self.mesh_action.toolTip()
+        self.live_mesh_action = action(
+            "Live mesh", "view-refresh",
+            "Melt the surface as the scan runs, roughly, so what has been covered "
+            "can be seen while there is still time to go back over it.\n"
+            "Coarser than the surface built at the end, and it costs frames.",
+            checkable=True)
+        self.live_mesh_action.toggled.connect(self._on_live_mesh)
         mesh = [
             self.mesh_action,
+            self.live_mesh_action,
             action("Fill holes", "fill-color", later, enabled=False),
             action("Smooth", "draw-brush", later, enabled=False),
             action("Simplify", "zoom-select", later, enabled=False),
@@ -1082,6 +1103,7 @@ class MainWindow(QMainWindow):
         self.viewport.set_frame_count(self.frames)
         if self.fusion_action.isChecked():
             self._offer_to_fusion(frame)
+            self._offer_live_mesh()
         if self._fused is None:
             self.viewport.show_cloud(frame.points, frame.colors, frame.normals)
         self._show_coverage(frame)
@@ -1154,6 +1176,42 @@ class MainWindow(QMainWindow):
             self.viewport.show_toast(f"Removed {dropped:,} stray points", 4000)
         return cleaned
 
+    def _on_live_mesh(self, on: bool) -> None:
+        """Turning live meshing off puts the cloud back, since the rough
+        surface on screen is no longer being kept up to date."""
+        if on:
+            self._last_live_mesh = 0.0  # one straight away, if there is enough
+            return
+        self.viewport.show_surface(None, None, None)
+        model = self.model_panel.current_model()
+        if self._state is ScanState.IDLE and model is not None and model.surface is not None:
+            self._show_surface(model)
+
+    def _offer_live_mesh(self) -> None:
+        """Melts a rough surface mid-scan, now and then.
+
+        It shows what has been covered while there is still time to go back
+        over what has not. It is not free: the reconstruction holds the same
+        lock the fusion does, so each one is frames not merged. Hence a
+        coarse voxel and a gap between them, and never while one is already
+        being built."""
+        if (not self.live_mesh_action.isChecked() or self._meshing
+                or self._fusion_worker is None):
+            return
+        fusion = self._fusion_worker._fusion
+        if fusion is None or fusion.views < self.LIVE_MESH_LEAST_VIEWS:
+            return
+        now = time.perf_counter()
+        if now - self._last_live_mesh < self.LIVE_MESH_GAP_S:
+            return
+        self._last_live_mesh = now
+        self._meshing = True
+        # None for the model: mid-scan there is no finished scan to hang a
+        # surface on, and this one is a look at progress rather than a
+        # result to keep.
+        self.surface_requested.emit(None, tuple(self._intrinsics),
+                                    self.LIVE_MESH_VOXEL_MM)
+
     def _offer_to_fusion(self, frame) -> None:
         """Hands the fusion this frame, unless it is still on the last one."""
         if self._fusing or not len(frame.points):
@@ -1193,6 +1251,13 @@ class MainWindow(QMainWindow):
     def _on_surface_ready(self, surface, model) -> None:
         self._meshing = False
         self._update_rea_tools()
+        if model is None:
+            # A live surface: shown while the scan runs, and kept by
+            # nothing. The finished surface is built again at the end, at
+            # the detail the scan deserves.
+            if surface is not None and len(surface[2]):
+                self.viewport.show_surface(*surface)
+            return
         if surface is None:
             self.viewport.show_toast("No surface could be built from this scan", 6000)
             print("no surface could be built", file=sys.stderr, flush=True)
