@@ -1796,6 +1796,10 @@ class LiveMeshTests(WindowTestCase):
         window._offer_live_mesh()
         self.assertEqual(asked, [], "it asked again with no gap")
 
+    def a_surface(self):
+        vertices = np.array([[0, 0, 300], [10, 0, 300], [0, 10, 300]], np.float32)
+        return (vertices, vertices, np.array([[0, 1, 2]], np.uint32))
+
     def test_a_live_surface_is_shown_but_not_kept(self):
         # It is a look at progress, not a result: it must not be hung on a
         # model, or the finished surface would be the rough one.
@@ -1805,21 +1809,46 @@ class LiveMeshTests(WindowTestCase):
                               np.zeros((4, 3), np.uint8),
                               np.zeros((4, 3), np.float32))
         window.model_panel.add_model(model)
-        vertices = np.array([[0, 0, 300], [10, 0, 300], [0, 10, 300]], np.float32)
-        surface = (vertices, vertices, np.array([[0, 1, 2]], np.uint32))
-        window._on_surface_ready(surface, None)   # a live one
+        window.live_mesh_action.setChecked(True)
+        self.scan(window, frames=1)
+        window._on_surface_ready(self.a_surface(), None)   # a live one
         self.assertIsNone(model.surface, "a live surface was kept as the scan's")
         self.assertEqual(window.viewport.view3d.triangle_count, 1)
+        window.scan_panel.cancel()
+
+    def test_one_that_arrives_after_the_scan_is_not_laid_over_the_model(self):
+        # A live surface asked for mid-scan can come back after Complete.
+        # Drawing it then would stand the rough surface in for the real one.
+        window = self.open_window()
+        window.live_mesh_action.setChecked(True)
+        self.scan(window, frames=1)
+        window.scan_panel.complete()
+        QTest.qWait(100)
+        window._on_surface_ready(self.a_surface(), None)
+        self.assertEqual(window.viewport.view3d.triangle_count, 0,
+                         "a stale live surface was drawn over the finished scan")
 
     def test_turning_it_off_puts_the_cloud_back(self):
         window = self.open_window()
         window.live_mesh_action.setChecked(True)
-        vertices = np.array([[0, 0, 300], [10, 0, 300], [0, 10, 300]], np.float32)
-        window._on_surface_ready((vertices, vertices, np.array([[0, 1, 2]], np.uint32)), None)
+        self.scan(window, frames=1)
+        window._on_surface_ready(self.a_surface(), None)
         self.assertEqual(window.viewport.view3d.triangle_count, 1)
         window.live_mesh_action.setChecked(False)
         self.assertEqual(window.viewport.view3d.triangle_count, 0,
                          "the rough surface stayed after it stopped being updated")
+        window.scan_panel.cancel()
+
+    def test_pressing_mesh_while_one_is_melting_says_so(self):
+        window = self.open_window()
+        model = app.ScanModel("Scan", {"Model name": "Scan"},
+                              np.zeros((4, 3), np.float32),
+                              np.zeros((4, 3), np.uint8),
+                              np.zeros((4, 3), np.float32))
+        window.model_panel.add_model(model)
+        window._meshing = True
+        window.build_surface()
+        self.assertIn("Still melting", window.viewport.toast.text())
 
 
 class ShippedTests(unittest.TestCase):

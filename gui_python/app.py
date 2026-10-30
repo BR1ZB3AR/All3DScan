@@ -1231,7 +1231,13 @@ class MainWindow(QMainWindow):
         file has no views, so one surface is fitted through its points
         instead."""
         model = self.model_panel.current_model()
-        if model is None or self._meshing or model.points is None:
+        if model is None or model.points is None:
+            return
+        if self._meshing:
+            # A live surface is being melted. Saying so beats a button that
+            # looks pressed and does nothing.
+            self.viewport.show_toast("Still melting the last surface — try again in "
+                                     "a moment", 4000)
             return
         if model.surface is not None:  # built already; just show it again
             self._show_surface(model)
@@ -1255,7 +1261,13 @@ class MainWindow(QMainWindow):
             # A live surface: shown while the scan runs, and kept by
             # nothing. The finished surface is built again at the end, at
             # the detail the scan deserves.
-            if surface is not None and len(surface[2]):
+            #
+            # One asked for mid-scan can arrive after the scan has ended,
+            # and must not then be laid over the finished model — the rough
+            # surface would stand in for the real one.
+            stale = (self._state is ScanState.IDLE
+                     or not self.live_mesh_action.isChecked())
+            if surface is not None and len(surface[2]) and not stale:
                 self.viewport.show_surface(*surface)
             return
         if surface is None:

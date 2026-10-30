@@ -104,11 +104,12 @@ void main() {
     vec2 offset = gl_PointCoord - vec2(0.5);
     float sqr = dot(offset, offset);
     if (sqr > 0.25) discard;
-    // Treat the splat as a little sphere, so a cloud of them reads as
-    // beads rather than flat discs when they are large on screen.
+    // Shaded by the surface the point sits on, not by the splat's own
+    // roundness. Rounding each splat into a little sphere was tried and
+    // taken out again: it lights every point separately, so a cloud reads
+    // as a heap of beads instead of the surface the points lie on, and
+    // the larger the splats the worse it gets.
     vec3 normal = normalize(v_normal);
-    normal.xy += offset * 1.4;
-    normal = normalize(normal);
     vec3 base = u_use_color ? v_color : u_base_color;
     base = mix(base, v_highlight.rgb, v_highlight.a);
     frag = vec4(shade(normal, base), 1.0);
