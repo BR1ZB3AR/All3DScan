@@ -6,6 +6,43 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Tracking gets worse as coverage gets better (2026-10-30)
+
+**Observed, and unexplained.** Two scans of different scenes on the same
+scanner, minutes apart, same settings, both infrared:
+
+| coverage | frames placed |
+|---|---|
+| 35.8% | 14 of 141 — **10%** |
+| 0.9% | 119 of 122 — **98%** |
+
+More data tracked far worse. That is the opposite of what the earlier work
+assumed, where poor tracking was blamed on there being too little to align.
+
+**Inferred, untested.** `kMinOverlap` (0.30) asks what share of the *frame*
+lies on the model already known. A frame bringing a lot of new surface
+therefore scores low and is thrown out — exactly the frame wanted when
+moving around an object — while a small frame wholly inside the model
+scores high. If that is the mechanism, the gate works against its purpose.
+Not measured: these were two different scenes, so it is one pair of
+numbers, not a controlled comparison.
+
+**Tried and taken out: re-seeding a lost frame from the centroids.** When a
+frame would not sit on the model, it was tried again from a pose sliding
+its middle onto the model's, owing nothing to the pose that had failed.
+Measured A/B on one scene, 18 s each: 119 of 122 placed without it, 115 of
+120 with — no difference, because tracking was not failing there. And the
+unit test `a_frame_that_does_not_belong_is_left_out` went red: the same
+shape half a metre away, which must be rejected, slides onto the model and
+fits perfectly. Centroid re-seeding lets any similarly-shaped frame fit
+anywhere, destroying the ability to reject a frame that does not belong.
+Reverted; the test is why.
+
+**What would settle the first part:** two scans of *one* scene at different
+coverages — the same object, exposed to give say 5% and 30% — logging the
+overlap and RMSE of every rejected frame. If rejected frames at high
+coverage show low overlap but good RMSE, the gate is the cause.
+
 ## A narrower depth search finds more surface (2026-10-28)
 
 **Observed.** The decoder searches the working distance it is given, and
