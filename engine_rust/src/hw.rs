@@ -94,6 +94,19 @@ mod ffi {
         fn serial(self: &Pop4Sensor) -> &CxxString;
         #[cxx_name = "backendName"]
         fn backend_name(self: &Pop4Sensor) -> &CxxString;
+
+        #[cxx_name = "hasColorCalibration"]
+        fn has_color_calibration(self: &Pop4Sensor) -> bool;
+        #[cxx_name = "colorLens"]
+        fn color_lens(self: &Pop4Sensor) -> &CxxVector<f64>;
+        #[cxx_name = "colorRotation"]
+        fn color_rotation(self: &Pop4Sensor) -> &CxxVector<f64>;
+        #[cxx_name = "colorTranslation"]
+        fn color_translation(self: &Pop4Sensor) -> &CxxVector<f64>;
+        #[cxx_name = "colorCalWidth"]
+        fn color_cal_width(self: &Pop4Sensor) -> u32;
+        #[cxx_name = "colorCalHeight"]
+        fn color_cal_height(self: &Pop4Sensor) -> u32;
         #[cxx_name = "lastError"]
         fn last_error(self: &Pop4Sensor) -> &CxxString;
     }
@@ -149,6 +162,54 @@ fn points_of(xyz: &CxxVector<f32>) -> Vec<Point3<f32>> {
     let (xyz, rest) = xyz.as_slice().as_chunks::<3>();
     debug_assert!(rest.is_empty(), "C++ point buffer is not x, y, z triples");
     xyz.iter().map(|&[x, y, z]| Point3::new(x, y, z)).collect()
+}
+
+/// Where the colour camera sits relative to the depth camera, and what lens
+/// it has. The rotation and translation take a point in the depth camera's
+/// own frame — which is the frame a scan's points are already in — into the
+/// colour camera's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorCalibration {
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+    /// k1, k2, p1, p2, k3.
+    pub distortion: [f64; 5],
+    /// 3x3, row-major.
+    pub rotation: [f64; 9],
+    /// Millimetres.
+    pub translation: [f64; 3],
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ColorCalibration {
+    /// Where a point in the depth camera's frame lands in the colour
+    /// image, in its own pixels. None when the point is behind the colour
+    /// camera, where there is no image to land in.
+    ///
+    /// The lens bends light, so the straight-line projection is pushed out
+    /// again by the same amount the factory measured — without that, the
+    /// overlay drifts further from the object the nearer the edge it is.
+    pub fn project(&self, point: [f64; 3]) -> Option<(f64, f64)> {
+        let r = &self.rotation;
+        let moved = [
+            r[0] * point[0] + r[1] * point[1] + r[2] * point[2] + self.translation[0],
+            r[3] * point[0] + r[4] * point[1] + r[5] * point[2] + self.translation[1],
+            r[6] * point[0] + r[7] * point[1] + r[8] * point[2] + self.translation[2],
+        ];
+        if moved[2] <= 1.0 {
+            return None; // behind the camera, or so close it is meaningless
+        }
+        let (x, y) = (moved[0] / moved[2], moved[1] / moved[2]);
+        let [k1, k2, p1, p2, k3] = self.distortion;
+        let r2 = x * x + y * y;
+        let radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+        let bent_x = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+        let bent_y = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        Some((self.fx * bent_x + self.cx, self.fy * bent_y + self.cy))
+    }
 }
 
 /// The mock depth camera from hw_cpp.
@@ -340,6 +401,32 @@ impl Pop4Sensor {
         self.inner.serial().to_string_lossy().into_owned()
     }
 
+    /// Where the colour camera is, relative to the depth camera, and what
+    /// lens it has: everything needed to draw the scan over the colour
+    /// view. None when the scanner's calibration files could not be read.
+    pub fn color_calibration(&self) -> Option<ColorCalibration> {
+        if !self.inner.has_color_calibration() {
+            return None;
+        }
+        let lens = self.inner.color_lens().as_slice();
+        let rotation = self.inner.color_rotation().as_slice();
+        let translation = self.inner.color_translation().as_slice();
+        if lens.len() != 9 || rotation.len() != 9 || translation.len() != 3 {
+            return None;
+        }
+        Some(ColorCalibration {
+            fx: lens[0],
+            fy: lens[1],
+            cx: lens[2],
+            cy: lens[3],
+            distortion: [lens[4], lens[5], lens[6], lens[7], lens[8]],
+            rotation: rotation.try_into().ok()?,
+            translation: translation.try_into().ok()?,
+            width: self.inner.color_cal_width(),
+            height: self.inner.color_cal_height(),
+        })
+    }
+
     pub fn backend_name(&self) -> String {
         self.inner.backend_name().to_string_lossy().into_owned()
     }
@@ -360,6 +447,91 @@ impl Pop4Sensor {
 
 #[cfg(test)]
 mod tests {
+
+    /// The POP 4's own colour calibration, as read off the scanner
+    /// (serial D26545575B6S00E1B, 2026-10-30) from /data/camparam.
+    fn real_color_calibration() -> ColorCalibration {
+        ColorCalibration {
+            fx: 1557.55,
+            fy: 1557.55,
+            cx: 633.89,
+            cy: 518.03,
+            distortion: [0.12374, -0.60751, -0.0003, -0.00024, 1.091],
+            rotation: [
+                0.99517, -0.00260, -0.09809, //
+                0.00234, 0.99999, -0.00274, //
+                0.09810, 0.00249, 0.99517,
+            ],
+            translation: [-24.033, 0.027, -2.404],
+            width: 1280,
+            height: 1024,
+        }
+    }
+
+    #[test]
+    fn a_point_on_the_depth_axis_lands_near_the_middle_of_the_colour_image() {
+        let cal = real_color_calibration();
+        // Straight ahead at 400 mm. The colour camera sits 24 mm to the
+        // side and turned about 5.6 degrees, so it does not land exactly
+        // in the middle — but it must land well inside the image.
+        let (u, v) = cal.project([0.0, 0.0, 400.0]).unwrap();
+        assert!(
+            (0.0..1280.0).contains(&u) && (0.0..1024.0).contains(&v),
+            "({u}, {v}) is off the colour image"
+        );
+        // The two cameras are nearly level, so the row should be close to
+        // the middle; the column is pulled aside by the baseline.
+        assert!((v - 518.0).abs() < 60.0, "row {v} is not near the middle");
+    }
+
+    #[test]
+    fn a_point_further_away_lands_nearer_the_middle() {
+        // The two cameras are side by side, so the parallax between them
+        // shrinks with distance: a far point is nearly straight ahead for
+        // both, a near one is well off to the side.
+        let cal = real_color_calibration();
+        let near = cal.project([0.0, 0.0, 250.0]).unwrap();
+        let far = cal.project([0.0, 0.0, 2000.0]).unwrap();
+        assert!(
+            (far.0 - cal.cx).abs() < (near.0 - cal.cx).abs(),
+            "far {far:?} should sit nearer the middle than near {near:?}"
+        );
+    }
+
+    #[test]
+    fn moving_right_in_the_scan_moves_right_in_the_colour_image() {
+        let cal = real_color_calibration();
+        let left = cal.project([-40.0, 0.0, 400.0]).unwrap();
+        let middle = cal.project([0.0, 0.0, 400.0]).unwrap();
+        let right = cal.project([40.0, 0.0, 400.0]).unwrap();
+        assert!(left.0 < middle.0 && middle.0 < right.0,
+                "{left:?} {middle:?} {right:?} are not in order");
+        let up = cal.project([0.0, -40.0, 400.0]).unwrap();
+        let down = cal.project([0.0, 40.0, 400.0]).unwrap();
+        assert!(up.1 < down.1, "down should be further down the image");
+    }
+
+    #[test]
+    fn a_point_behind_the_colour_camera_has_nowhere_to_land() {
+        let cal = real_color_calibration();
+        assert!(cal.project([0.0, 0.0, -500.0]).is_none());
+        assert!(cal.project([0.0, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn the_lens_bending_is_applied_and_grows_towards_the_edge() {
+        let cal = real_color_calibration();
+        let straight = ColorCalibration { distortion: [0.0; 5], ..cal };
+        // In the middle the bending is nothing; out at the edge it matters.
+        let middle_bent = cal.project([0.0, 0.0, 400.0]).unwrap();
+        let middle_straight = straight.project([0.0, 0.0, 400.0]).unwrap();
+        let middle_gap = (middle_bent.0 - middle_straight.0).hypot(middle_bent.1 - middle_straight.1);
+        let edge_bent = cal.project([110.0, 90.0, 400.0]).unwrap();
+        let edge_straight = straight.project([110.0, 90.0, 400.0]).unwrap();
+        let edge_gap = (edge_bent.0 - edge_straight.0).hypot(edge_bent.1 - edge_straight.1);
+        assert!(edge_gap > middle_gap + 1.0,
+                "bending should grow towards the edge: {middle_gap} then {edge_gap}");
+    }
     use super::*;
 
     #[test]

@@ -87,6 +87,18 @@ public:
     // should be dropped and a new one opened.
     bool connected() const;
 
+    // The factory calibration that maps a depth point into the colour
+    // camera's image, for drawing the scan over the colour view. Read from
+    // the scanner's own files while connecting; absent when they could not
+    // be read, which costs only that overlay.
+    bool hasColorCalibration() const noexcept { return hasColorCal_; }
+    // fx, fy, cx, cy, then k1 k2 p1 p2 k3.
+    const std::vector<double>& colorLens() const noexcept { return colorLens_; }
+    const std::vector<double>& colorRotation() const noexcept { return colorRotation_; }
+    const std::vector<double>& colorTranslation() const noexcept { return colorTranslation_; }
+    uint32_t colorCalWidth() const noexcept { return colorCalWidth_; }
+    uint32_t colorCalHeight() const noexcept { return colorCalHeight_; }
+
     // The share of the newest frame's pixels that got depth.
     float validFraction() const;
 
@@ -111,6 +123,17 @@ public:
     const std::string& lastError() const noexcept { return error_; }
 
 private:
+    // Reads the colour camera's calibration from the scanner's own files.
+    void readColorCalibration();
+
+    // The colour camera's factory calibration, if it could be read.
+    bool hasColorCal_ = false;
+    std::vector<double> colorLens_;
+    std::vector<double> colorRotation_;
+    std::vector<double> colorTranslation_;
+    uint32_t colorCalWidth_ = 0;
+    uint32_t colorCalHeight_ = 0;
+
     bool check(bool ok);
     bool captureFirstFrame();
 

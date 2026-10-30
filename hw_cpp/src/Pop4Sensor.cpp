@@ -1,5 +1,7 @@
 #include "all3dscan/Pop4Sensor.h"
 
+#include "decoder/RgbCalibration.h"
+
 #include <stdexcept>
 #include <string>
 
@@ -10,6 +12,7 @@
 namespace all3dscan::hw {
 
 namespace protocol = revoscan::protocol;
+namespace decoder = revoscan::decoder;
 
 namespace {
 
@@ -40,6 +43,12 @@ protocol::ScanMode toMode(uint8_t mode) {
 } // namespace
 
 Pop4Sensor::Pop4Sensor() : scanner_(protocol::makeRevopointPop4Protocol()) {
+    // Before anything claims the depth interface. The file channel and the
+    // depth interface cannot both be held, and connecting claims it: doing
+    // this afterwards leaves the capture node unusable (VIDIOC_QBUF: No
+    // such device), which is how it was found. Failing costs the colour
+    // overlay and nothing else, so it never stops a connection.
+    readColorCalibration();
     // A live view: show the newest frame, never one that waited in the queue.
     scanner_->setNewestFrameOnly(true);
     if (!scanner_->connect()) {
@@ -105,6 +114,30 @@ Pop4Sensor::~Pop4Sensor() {
         }
     } catch (...) {
     }
+}
+
+void Pop4Sensor::readColorCalibration() {
+    // The three blobs the vendor stores beside camparam.yaml. They map a
+    // point in the rectified left depth frame — which is the frame our
+    // points are already in — into the colour camera's image.
+    std::string error;
+    const auto prgb = protocol::pop4::readDeviceFile("/data/camparam/Prgb.bin", &error);
+    const auto distort = protocol::pop4::readDeviceFile("/data/camparam/Distort.bin", &error);
+    const auto lcRt = protocol::pop4::readDeviceFile("/data/camparam/LC_RT.bin", &error);
+    if (!prgb || !distort || !lcRt) {
+        return;
+    }
+    const auto cal = decoder::parseRgbCalibration(*prgb, *distort, *lcRt, &error);
+    if (!cal) {
+        return;
+    }
+    colorLens_ = {cal->fx(), cal->fy(), cal->cx(), cal->cy(),
+                  cal->D[0], cal->D[1], cal->D[2], cal->D[3], cal->D[4]};
+    colorRotation_.assign(cal->R.begin(), cal->R.end());
+    colorTranslation_.assign(cal->T.begin(), cal->T.end());
+    colorCalWidth_ = static_cast<uint32_t>(cal->width);
+    colorCalHeight_ = static_cast<uint32_t>(cal->height);
+    hasColorCal_ = true;
 }
 
 bool Pop4Sensor::check(bool ok) {

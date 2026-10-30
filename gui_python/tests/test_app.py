@@ -1620,6 +1620,91 @@ class SettingsTests(WindowTestCase):
         self.assertEqual(g.platform_override(g.Graphics(window_system="wayland")), "wayland")
 
 
+class ColourOverlayTests(WindowTestCase):
+    """Drawing the scan over the colour camera, through the scanner's own
+    calibration, so it lands on the object it was measured from."""
+
+    #: This POP 4's own numbers, read off it on 2026-10-30.
+    CALIBRATION = {
+        "fx": 1557.55, "fy": 1557.55, "cx": 633.89, "cy": 518.03,
+        "distortion": [0.12374, -0.60751, -0.0003, -0.00024, 1.091],
+        "rotation": [0.99517, -0.00260, -0.09809, 0.00234, 0.99999, -0.00274,
+                     0.09810, 0.00249, 0.99517],
+        "translation": [-24.033, 0.027, -2.404], "width": 1280, "height": 1024,
+    }
+
+    def test_a_point_ahead_lands_on_the_colour_image(self):
+        points = np.array([[0.0, 0.0, 400.0], [30.0, 20.0, 380.0]], np.float32)
+        pixels, landed = engine.project_to_color(points, self.CALIBRATION)
+        self.assertEqual(pixels.shape, (2, 2))
+        self.assertTrue(landed.all(), pixels)
+        for u, v in pixels:
+            self.assertTrue(0 <= u < 1280 and 0 <= v < 1024, (u, v))
+
+    def test_a_point_behind_the_camera_is_marked_as_nowhere(self):
+        points = np.array([[0.0, 0.0, -300.0]], np.float32)
+        pixels, landed = engine.project_to_color(points, self.CALIBRATION)
+        self.assertFalse(landed[0])
+        self.assertTrue(np.isnan(pixels[0]).all())
+
+    def test_right_in_the_scan_is_right_in_the_picture(self):
+        points = np.array([[-40.0, 0.0, 400.0], [0.0, 0.0, 400.0],
+                           [40.0, 0.0, 400.0]], np.float32)
+        pixels, _ = engine.project_to_color(points, self.CALIBRATION)
+        self.assertLess(pixels[0, 0], pixels[1, 0])
+        self.assertLess(pixels[1, 0], pixels[2, 0])
+
+    def test_a_calibration_missing_a_number_is_refused(self):
+        short = dict(self.CALIBRATION)
+        del short["cx"]
+        with self.assertRaises(ValueError) as refused:
+            engine.project_to_color(np.zeros((1, 3), np.float32), short)
+        self.assertIn("cx", str(refused.exception))
+        wrong = dict(self.CALIBRATION, rotation=[1.0, 0.0, 0.0])
+        with self.assertRaises(ValueError):
+            engine.project_to_color(np.zeros((1, 3), np.float32), wrong)
+
+    def test_the_toggle_waits_for_a_scanner(self):
+        window = self.open_window()
+        self.assertFalse(window.camera_panel.ar_button.isEnabled())
+        self.connect_pop4(window)
+        self.assertTrue(window.camera_panel.ar_button.isEnabled())
+
+    def test_turning_it_on_draws_the_scan_over_the_camera(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window._color_calibration = self.CALIBRATION
+        preview = window.camera_panel.rgb_view
+        self.assertIsNone(preview.overlay_points(), "nothing should be drawn yet")
+        window.camera_panel.ar_button.setChecked(True)
+        self.scan(window, frames=3)
+        wait_until(lambda: preview.overlay_points() is not None, timeout_s=30)
+        drawn = preview.overlay_points()
+        self.assertGreater(len(drawn), 50)
+        # Everything drawn is on the picture; the rest was dropped.
+        self.assertTrue(((drawn[:, 0] >= 0) & (drawn[:, 0] < 1280)).all())
+        self.assertTrue(((drawn[:, 1] >= 0) & (drawn[:, 1] < 1024)).all())
+        window.scan_panel.cancel()
+
+    def test_with_no_calibration_it_draws_nothing_rather_than_guessing(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window._color_calibration = None
+        window.camera_panel.ar_button.setChecked(True)
+        self.scan(window, frames=3)
+        QTest.qWait(200)
+        self.assertIsNone(window.camera_panel.rgb_view.overlay_points())
+        window.scan_panel.cancel()
+
+    def test_losing_the_scanner_takes_the_toggle_with_it(self):
+        window = self.open_window()
+        self.connect_pop4(window)
+        window.camera_panel.ar_button.setChecked(True)
+        window.camera_panel.set_pop4(False)
+        self.assertFalse(window.camera_panel.ar_button.isChecked())
+        self.assertFalse(window.camera_panel.ar_button.isEnabled())
+
+
 class ShippedTests(unittest.TestCase):
     """The window as the launcher starts it: the POP 4 and nothing else.
 

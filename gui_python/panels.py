@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 import rea_engine as rea
 from presets import ACCURACY, OBJECT_TYPES, TRACKING, Preset, find_preset, load_presets
 from viewport3d import SCAN_BLUE, SCAN_GREEN, PointCloudView
-from widgets import DistanceGauge, VideoPreview
+from widgets import ArPreview, DistanceGauge, VideoPreview
 
 
 def section_title(text: str) -> QLabel:
@@ -95,6 +95,7 @@ class CameraPanel(QWidget):
     light_level_changed = pyqtSignal(str, int)  # the light, 0..255
     exposure_changed = pyqtSignal(int)  # microseconds
     auto_exposure_requested = pyqtSignal()
+    ar_toggled = pyqtSignal(bool)  # draw the scan over the colour camera
 
     def __init__(self) -> None:
         super().__init__()
@@ -145,7 +146,17 @@ class CameraPanel(QWidget):
         self.pop4_hint = hint("Exposure and lights need a connected POP 4.")
 
         self.depth_view = VideoPreview("Depth camera")
-        self.rgb_view = VideoPreview("RGB camera")
+        self.rgb_view = ArPreview("RGB camera")
+        # Drawing the scan over the colour view: it lands on the object it
+        # was measured from, so where the two disagree the scan is wrong.
+        self.ar_button = QPushButton("Show the scan on the camera")
+        self.ar_button.setCheckable(True)
+        self.ar_button.setObjectName("arToggle")
+        self.ar_button.setToolTip(
+            "Draws the scan's points over the colour camera, through the scanner's own "
+            "calibration. Where the overlay sits off the object, the scan is off too.")
+        self.ar_button.toggled.connect(self.rgb_view.set_showing)
+        self.ar_button.toggled.connect(self.ar_toggled)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 12)
@@ -156,6 +167,7 @@ class CameraPanel(QWidget):
         layout.addWidget(self.pop4_hint)
         layout.addWidget(self.depth_view, 1)
         layout.addWidget(self.rgb_view, 1)
+        layout.addWidget(self.ar_button)
         self.set_pop4(False)
 
     def set_pop4(self, pop4: bool) -> None:
@@ -163,6 +175,11 @@ class CameraPanel(QWidget):
         self.exposure_box.setEnabled(pop4)
         self.lights.setEnabled(pop4)
         self.pop4_hint.setVisible(not pop4)
+        # The overlay needs the scanner's own calibration, which comes with
+        # the scanner.
+        self.ar_button.setEnabled(pop4)
+        if not pop4:
+            self.ar_button.setChecked(False)
 
     def show_controls(self, lights: dict[str, tuple[bool, int]], exposure_us: int) -> None:
         """Shows the scanner's own settings, without sending them back to it."""

@@ -383,6 +383,32 @@ mod all3dscan_engine {
             self.with(|sensor| sensor.last_error())
         }
 
+        /// Where the colour camera sits relative to the depth camera, read
+        /// from the scanner's own calibration files while connecting. None
+        /// when they could not be read, which costs only the colour
+        /// overlay.
+        ///
+        /// A dict of fx, fy, cx, cy, distortion (5), rotation (9, row-major),
+        /// translation (3, mm), width and height — everything
+        /// project_to_color() needs.
+        #[getter]
+        fn color_calibration<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+            let Some(cal) = self.with(|sensor| sensor.color_calibration())? else {
+                return Ok(None);
+            };
+            let found = PyDict::new(py);
+            found.set_item("fx", cal.fx)?;
+            found.set_item("fy", cal.fy)?;
+            found.set_item("cx", cal.cx)?;
+            found.set_item("cy", cal.cy)?;
+            found.set_item("distortion", cal.distortion.to_vec())?;
+            found.set_item("rotation", cal.rotation.to_vec())?;
+            found.set_item("translation", cal.translation.to_vec())?;
+            found.set_item("width", cal.width)?;
+            found.set_item("height", cal.height)?;
+            Ok(Some(found))
+        }
+
         /// Number of frames captured so far.
         #[getter]
         fn frame_index(&self) -> u64 {
@@ -597,6 +623,81 @@ mod all3dscan_engine {
         found.set_item("trimmed_vertices", trimmed.vertices)?;
         found.set_item("trimmed_triangles", trimmed.triangles)?;
         Ok(found)
+    }
+
+    /// Where each scan point lands in the colour camera's image.
+    ///
+    /// `points` are (N, 3) millimetres in the depth camera's frame, which
+    /// is the frame a scan's cloud is already in, and `calibration` is what
+    /// Pop4Sensor.color_calibration gives. Returns the (N, 2) pixel
+    /// positions and an (N,) mask of the points that landed on the image at
+    /// all — a point behind the colour camera, or off the side of it, has
+    /// nowhere to go.
+    #[pyfunction]
+    fn project_to_color<'py>(
+        py: Python<'py>,
+        points: PyArrayLike2<'py, f32, AllowTypeChange>,
+        calibration: &Bound<'py, PyDict>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<bool>>)> {
+        let number = |name: &str| -> PyResult<f64> {
+            calibration
+                .get_item(name)?
+                .ok_or_else(|| PyValueError::new_err(format!("the calibration has no {name}")))?
+                .extract()
+        };
+        let many = |name: &str, wanted: usize| -> PyResult<Vec<f64>> {
+            let found: Vec<f64> = calibration
+                .get_item(name)?
+                .ok_or_else(|| PyValueError::new_err(format!("the calibration has no {name}")))?
+                .extract()?;
+            if found.len() != wanted {
+                return Err(PyValueError::new_err(format!(
+                    "{name} must have {wanted} numbers, got {}",
+                    found.len()
+                )));
+            }
+            Ok(found)
+        };
+        let cal = hw::ColorCalibration {
+            fx: number("fx")?,
+            fy: number("fy")?,
+            cx: number("cx")?,
+            cy: number("cy")?,
+            distortion: many("distortion", 5)?.try_into().unwrap(),
+            rotation: many("rotation", 9)?.try_into().unwrap(),
+            translation: many("translation", 3)?.try_into().unwrap(),
+            width: number("width")? as u32,
+            height: number("height")? as u32,
+        };
+        let cloud: Vec<Point3<f32>> = triples(&points, "points")?;
+        let (pixels, landed) = py.detach(move || {
+            let mut pixels = Vec::with_capacity(cloud.len() * 2);
+            let mut landed = Vec::with_capacity(cloud.len());
+            for point in &cloud {
+                match cal.project([f64::from(point.x), f64::from(point.y), f64::from(point.z)]) {
+                    Some((u, v)) => {
+                        let on = u >= 0.0
+                            && v >= 0.0
+                            && u < f64::from(cal.width)
+                            && v < f64::from(cal.height);
+                        pixels.push(u as f32);
+                        pixels.push(v as f32);
+                        landed.push(on);
+                    }
+                    None => {
+                        pixels.push(f32::NAN);
+                        pixels.push(f32::NAN);
+                        landed.push(false);
+                    }
+                }
+            }
+            (pixels, landed)
+        });
+        let n = landed.len();
+        Ok((
+            PyArray1::from_vec(py, pixels).reshape([n, 2])?,
+            PyArray1::from_vec(py, landed),
+        ))
     }
 
     /// Whether a POP 4 is plugged in, without opening it.

@@ -208,6 +208,88 @@ class VideoPreview(QFrame):
         self.image.setText("No signal")
 
 
+class _OverlaidImage(QLabel):
+    """The camera's picture with the scan drawn on top of it.
+
+    The points have to be drawn here rather than on the frame around it:
+    Qt paints a parent before its children, so an overlay painted on the
+    frame is covered by the picture a moment later.
+    """
+
+    #: The overlay's colour.
+    OVERLAY = QColor(0, 230, 200)
+    #: At most this many points are drawn. A scan holds far more than a
+    #: preview this size can show, and drawing them all only costs time.
+    MOST_POINTS = 12_000
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.points: np.ndarray | None = None
+        self.frame_size: tuple[int, int] = (0, 0)
+        self.showing = False
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().paintEvent(event)
+        pixmap = self.pixmap()
+        width, height = self.frame_size
+        if (not self.showing or self.points is None or pixmap is None
+                or pixmap.isNull() or width <= 0 or height <= 0):
+            return
+        # The picture is scaled to fit and centred; the overlay has to land
+        # on the same pixels it does.
+        drawn = pixmap.size()
+        scale = min(drawn.width() / width, drawn.height() / height)
+        left = (self.width() - drawn.width()) / 2
+        top = (self.height() - drawn.height()) / 2
+        points = self.points
+        if len(points) > self.MOST_POINTS:
+            points = points[:: max(1, len(points) // self.MOST_POINTS)]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.OVERLAY, 1.6))
+        painter.setOpacity(0.75)
+        for u, v in points:
+            painter.drawPoint(QPointF(left + u * scale, top + v * scale))
+        painter.end()
+
+
+class ArPreview(VideoPreview):
+    """The colour camera's view with the scan drawn on top of it.
+
+    Each scan point is projected into the colour image through the
+    scanner's own factory calibration, so the points land on the object
+    they were measured from rather than merely near it. That is what makes
+    this worth looking at: where the overlay and the object disagree, the
+    scan does too.
+    """
+
+    def __init__(self, title: str = "RGB camera") -> None:
+        super().__init__(title)
+        # VideoPreview made a plain label; this one can draw on itself.
+        overlaid = _OverlaidImage(self.image.text())
+        overlaid.setObjectName(self.image.objectName())
+        overlaid.setAlignment(self.image.alignment())
+        overlaid.setSizePolicy(self.image.sizePolicy())
+        overlaid.setMinimumHeight(self.image.minimumHeight())
+        self.layout().replaceWidget(self.image, overlaid)
+        self.image.deleteLater()
+        self.image = overlaid
+
+    def set_overlay(self, pixels, frame_size: tuple[int, int]) -> None:
+        """Takes the projected points, in the colour image's own pixels,
+        and the size of that image."""
+        self.image.points = pixels if pixels is not None and len(pixels) else None
+        self.image.frame_size = frame_size
+        self.image.update()
+
+    def set_showing(self, showing: bool) -> None:
+        self.image.showing = showing
+        self.image.update()
+
+    def overlay_points(self):
+        """What is being drawn, for the tests to look at."""
+        return self.image.points
+
 class RibbonGroup(QWidget):
     """A captioned group of buttons on the ribbon."""
 

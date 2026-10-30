@@ -310,7 +310,9 @@ class ScanWorker(QObject):
                   for name in ("projector", "fill light")}
         return {"kind": "pop4", "serial": pop4.serial, "backend": pop4.backend,
                 "mode": pop4.scan_mode, "exposure_us": pop4.exposure_us,
-                "lights": lights, "intrinsics": pop4.intrinsics}
+                "lights": lights, "intrinsics": pop4.intrinsics,
+                # Where the colour camera is, for drawing the scan over it.
+                "color_calibration": getattr(pop4, "color_calibration", None)}
 
 
 @dataclass(frozen=True, eq=False)
@@ -577,6 +579,9 @@ class MainWindow(QMainWindow):
         self._present_ticks = 0  # consecutive looks that found a POP 4
         self._absent_ticks = 0  # and consecutive looks that did not
         self._other_scanners: list = []  # found on the bus, but not drivable
+        # The colour camera's own calibration, for the overlay. None until a
+        # scanner that carries it connects.
+        self._color_calibration = None
         self._scan_mode = "infrared"  # the POP 4's, as last confirmed
         self._scan_mode_asked = "infrared"
         self._thread = QThread(self)
@@ -1006,6 +1011,7 @@ class MainWindow(QMainWindow):
         # whether or not a scan is running.
         self.camera_panel.depth_view.show_image(frame.ir)
         self.camera_panel.rgb_view.show_image(frame.rgb)
+        self._draw_on_the_camera(frame)
         self.viewport.gauge.set_depths(frame.depth_mm)
         if self._state is ScanState.IDLE:
             # Aiming, not scanning: nothing here is counted or kept, and the
@@ -1037,6 +1043,36 @@ class MainWindow(QMainWindow):
         if self._previewing():
             wait = 1.0 / self.PREVIEW_FPS - (time.perf_counter() - self._requested_at)
             self._next_frame.start(max(0, int(wait * 1000)))
+
+    #: The most points offered to the colour overlay. It only has to cover
+    #: the object on a preview-sized image; the rest is wasted work.
+    AR_MAX_POINTS = 40_000
+
+    def _draw_on_the_camera(self, frame) -> None:
+        """Puts the scan's points over the colour camera's view.
+
+        The points are projected through the scanner's own factory
+        calibration, so they land on the object they were measured from.
+        That is what makes the overlay worth looking at: where it sits off
+        the object, the scan is off too."""
+        preview = self.camera_panel.rgb_view
+        if not self.camera_panel.ar_button.isChecked() or self._color_calibration is None:
+            return
+        # The model where there is one, so the overlay shows what has been
+        # built up rather than only the newest look at it.
+        cloud = self._fused[0] if self._fused is not None else frame.points
+        if cloud is None or not len(cloud):
+            preview.set_overlay(None, (0, 0))
+            return
+        step = max(len(cloud) // self.AR_MAX_POINTS, 1)
+        try:
+            pixels, landed = engine.project_to_color(cloud[::step], self._color_calibration)
+        except (ValueError, OSError) as exc:
+            print(f"the colour overlay failed: {describe(exc)}", file=sys.stderr, flush=True)
+            self.camera_panel.ar_button.setChecked(False)
+            return
+        size = (self._color_calibration["width"], self._color_calibration["height"])
+        preview.set_overlay(pixels[landed], size)
 
     def _without_speckle(self, cloud: tuple) -> tuple:
         """The model with the stray points taken out. A scan leaves specks
@@ -1665,6 +1701,7 @@ class MainWindow(QMainWindow):
     def _on_sensor_changed(self, settings: dict) -> None:
         self._connecting = False
         self._intrinsics = tuple(settings.get("intrinsics", ()))
+        self._color_calibration = settings.get("color_calibration")
         self._pop4 = settings["kind"] == "pop4"
         if self._pop4:
             self._reconnects = 0
