@@ -286,7 +286,7 @@ class MenuTests(WindowTestCase):
         window = self.open_window()
         menus = self.menus(window)
         self.assertEqual(list(menus),
-                         ["&File", "&Edit", "&Theme", "&Help", "&Settings…", "&About"])
+                         ["&File", "&Edit", "&Theme", "&Settings…", "&Help", "&About"])
         self.assertEqual(menus["&Theme"], ["Dark", "Light", "Custom…"])
         # Each does one thing, so neither opens a submenu.
         self.assertIsNone(menus["&About"])
@@ -1531,10 +1531,11 @@ class SettingsTests(WindowTestCase):
         self.addCleanup(chosen.deleteLater)
         return chosen
 
-    def test_it_sits_in_the_menu_bar_left_of_about(self):
+    def test_it_sits_in_the_menu_bar_before_help(self):
+        # Settings is reached while scanning; Help is read once.
         window = self.open_window()
         names = [a.text() for a in window.menuBar().actions()]
-        self.assertEqual(names[-2:], ["&Settings…", "&About"])
+        self.assertEqual(names[-3:], ["&Settings…", "&Help", "&About"])
 
     def test_a_preset_sets_the_choices_below_it(self):
         import graphics as g

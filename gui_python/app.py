@@ -845,6 +845,12 @@ class MainWindow(QMainWindow):
             self.theme_actions.addAction(choice)
             theme_menu.addAction(choice)
 
+        # Settings before Help: it is used while scanning, where Help is
+        # read once. A heading of its own rather than a menu, since it
+        # opens one window.
+        bar.addAction(item("&Settings…", self.show_settings, "Ctrl+,",
+                           tip="How the 3D view is drawn"))
+
         help_menu = bar.addMenu("&Help")
         help_menu.addAction(item("&Shortcuts…", self._show_shortcuts, "F1"))
         help_menu.addAction(item("Scanning &tips…", self._show_tips))
@@ -853,9 +859,6 @@ class MainWindow(QMainWindow):
             "Printable &marker sheet…", self.save_marker_sheet,
             tip="Save a sheet of tracking markers to print, for marker tracking"))
 
-        # Headings of their own rather than menus, since each holds one thing.
-        bar.addAction(item("&Settings…", self.show_settings, "Ctrl+,",
-                           tip="How the 3D view is drawn"))
         bar.addAction(item("&About", self._show_about))
 
     def show_settings(self) -> None:
