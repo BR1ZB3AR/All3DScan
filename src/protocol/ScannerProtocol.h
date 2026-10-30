@@ -35,6 +35,12 @@ struct RawFrame {
     uint32_t width = 0;
     uint32_t height = 0;
     std::vector<uint16_t> depthMm;
+    // The same depth before it was rounded to whole millimetres: width*height
+    // floats, or empty from a producer that has none to give (the raw Y16
+    // capture, the mock, a replayed dump). The stereo match knows depth to a
+    // fraction of a millimetre, and rounding it away before the point cloud
+    // was built was costing about 40% of the per-frame noise.
+    std::vector<float> depth;
     std::vector<uint8_t> rgb; // empty if not available
     uint64_t timestampUs = 0;
     DepthEncoding encoding = DepthEncoding::MetricMillimeters;

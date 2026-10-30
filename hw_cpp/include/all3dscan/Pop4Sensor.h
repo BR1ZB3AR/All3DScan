@@ -149,6 +149,7 @@ private:
     uint64_t frameIndex_ = 0;
     std::vector<float> points_;
     std::vector<uint16_t> depthMm_;
+    std::vector<float> depth_;  // the same, unrounded; empty when not given
     std::vector<uint8_t> ir_;
     std::vector<uint8_t> depthRgb_;
     std::vector<uint8_t> color_;

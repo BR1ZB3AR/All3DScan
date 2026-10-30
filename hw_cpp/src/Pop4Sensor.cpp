@@ -162,6 +162,7 @@ bool Pop4Sensor::capture(int32_t timeoutMs) {
         cx_ = lens.cx;
         cy_ = lens.cy;
         depthMm_ = std::move(frame->depthMm);
+        depth_ = std::move(frame->depth);
         depthRgb_ = std::move(frame->rgb);
     } else {
         // The packed images came but gave no depth, which is most frames in
@@ -171,6 +172,7 @@ bool Pop4Sensor::capture(int32_t timeoutMs) {
         width_ = kDecodedWidth;
         height_ = kDecodedHeight;
         depthMm_.assign(static_cast<size_t>(width_) * height_, 0);
+        depth_.clear();
         depthRgb_.clear();
     }
     const size_t pixels = static_cast<size_t>(width_) * height_;
@@ -182,10 +184,14 @@ bool Pop4Sensor::capture(int32_t timeoutMs) {
         if (!(lens.fx > 0.0 && lens.fy > 0.0)) {
             throw std::runtime_error("POP 4: the depth camera has no calibration");
         }
+        // The unrounded depth where the decoder gave it; the whole
+        // millimetres otherwise, which is what the cloud was always built from.
+        const bool fine = depth_.size() == pixels;
         points_.reserve(pixels * 3);
         for (uint32_t v = 0; v < height_; ++v) {
             for (uint32_t u = 0; u < width_; ++u) {
-                const float z = depthMm_[static_cast<size_t>(v) * width_ + u];
+                const size_t at = static_cast<size_t>(v) * width_ + u;
+                const float z = fine ? depth_[at] : static_cast<float>(depthMm_[at]);
                 if (z <= 0.0f) {
                     continue;
                 }

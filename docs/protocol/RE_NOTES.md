@@ -6,6 +6,44 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## Depth was rounded to whole millimetres before the cloud was built (2026-10-30)
+
+**Observed.** Holding the scanner still for 32 frames and reading each
+pixel's depth over time: of the pixels that had depth in every frame, **68%
+returned the identical value all 32 times** and 32% flickered between
+exactly two adjacent integers. The median per-pixel noise was 0.000 mm.
+That is only possible if depth is quantised to 1 mm, and it is:
+`Pop4DepthDecoder.cpp` stored the stereo match's float depth as
+`static_cast<uint16_t>`, and `Pop4Sensor` built the point cloud from that.
+
+**Derived.** `static_cast` truncates toward zero, so every depth was up to
+1 mm nearer the camera than measured, 0.5 mm on average — a systematic
+shrink of the whole scan toward the scanner — on top of ±0.5 mm of rounding
+noise per point (0.29 mm RMS by 1/√12).
+
+**Changed.** `RawFrame` carries the unrounded depth beside the whole-mm
+copy; the sensor builds points from it; the whole-mm copy is rounded, not
+truncated, so the TSDF and the previews lose the bias too. Measured on
+fresh frames afterwards:
+
+| | before | after |
+|---|---|---|
+| point depths that are whole millimetres | 100% | **0%** |
+| point z minus whole-mm image, per point | +0 to +1 (mean ~+0.5) | **−0.50 to +0.50, mean +0.005** |
+| per-frame surface thickness, median | 0.44–0.48 mm | **0.400 mm** |
+
+The thickness gain is smaller than the naive 1/√12 estimate predicted
+(0.37), because neighbouring pixels' truncation errors were correlated
+along a surface rather than independent. The removed bias matters more than
+the removed noise: it was distorting scale.
+
+**On "4D" (averaging depth over time).** The flickering 32% averaged down
+exactly as independent noise should — 0.331, 0.232, 0.165, 0.104 mm for
+N = 1, 2, 4, 8 — but the frozen 68% could not be helped by any averaging,
+because the sub-millimetre information was destroyed before it arrived.
+With the float depth it now survives, so temporal averaging of stationary
+frames is worth building; it was not before. **Not yet built.**
+
 ## Tracking gets worse as coverage gets better (2026-10-30)
 
 **Observed, and unexplained.** Two scans of different scenes on the same

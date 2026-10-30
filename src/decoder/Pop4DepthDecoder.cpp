@@ -992,6 +992,7 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
     out.timestampUs = rawY16.timestampUs;
     out.encoding = protocol::DepthEncoding::MetricMillimeters;
     out.depthMm.assign(kImagePixels, 0);
+    out.depth.assign(kImagePixels, 0.0f);
     ambientTexture(rawY16, leftAmbient, maps_.lx, maps_.ly, out.rgb);
 
     uint32_t validDepth = 0;
@@ -1006,7 +1007,11 @@ std::optional<protocol::RawFrame> Pop4DepthDecoder::decode(const protocol::RawFr
             disp[p] = -1.0f;
             continue;
         }
-        out.depthMm[p] = static_cast<uint16_t>(std::clamp(z, 1.0f, 65535.0f));
+        out.depth[p] = z;
+        // Rounded, not truncated: static_cast toward zero put every depth up
+        // to a millimetre nearer the camera than it was, half a millimetre
+        // on average, which shrank the whole scan toward the scanner.
+        out.depthMm[p] = static_cast<uint16_t>(std::lround(std::clamp(z, 1.0f, 65535.0f)));
         ++validDepth;
         sumD += disp[p];
         sumD2 += static_cast<double>(disp[p]) * disp[p];

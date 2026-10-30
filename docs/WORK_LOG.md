@@ -10,6 +10,29 @@ the application around it.
 
 ---
 
+## 2026-10-30 — Beads, and depth that was rounded to whole millimetres
+
+**The beads had two causes in the renderer, both mine.** Eye-dome lighting
+read the sub-millimetre depth steps between neighbouring splats as contours
+and drew a dark ring round every splat; it now ignores steps under 1.5 mm,
+three times the per-frame noise. And splats were hard-edged discs meeting
+at edges; they are drawn in two passes now, depth then soft-rimmed colour,
+blended where they overlap. Close up, a cloud 0.75 mm apart drawn 15 px
+wide is still visibly a mosaic — at that zoom the view of a scan is its
+mesh, which Live mesh is for.
+
+**Depth was truncated to whole millimetres before the cloud was built.**
+Found by holding the scanner still: 68% of pixels returned the identical
+integer for 32 frames. Fixed by carrying the float depth through and
+rounding the whole-mm copy. Measured: every point now sub-millimetre; the
+systematic ~0.5 mm shrink toward the camera gone (per-point error −0.50 to
++0.50, mean +0.005); per-frame thickness 0.44–0.48 → **0.400 mm**.
+
+**Tried and reverted:** re-seeding a lost frame from the centroids. A/B
+showed no gain, and the test that keeps a frame half a metre away from
+being merged went red — sliding middles together lets any similar shape
+fit anywhere.
+
 ## 2026-10-30 — The 3D view, and settings for it
 
 **The renderer was already on the GPU; shading was what was missing.**
