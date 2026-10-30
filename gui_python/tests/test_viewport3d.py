@@ -134,19 +134,40 @@ class RenderTestCase(unittest.TestCase):
                                          min(int(fx * width), width - 1)])
 
 
+def brightness(pixel) -> float:
+    return sum(pixel) / 3.0
+
+
+def leans(pixel, channel: int, by: int = 40) -> bool:
+    """Whether a shaded pixel is clearly that channel's colour.
+
+    The lighting multiplies a colour by an amount that depends on which way
+    the surface faces, and adds a white highlight, so a drawn pixel is never
+    the colour that went in. What survives any lighting worth having is
+    which channel leads."""
+    others = [c for n, c in enumerate(pixel) if n != channel]
+    return all(pixel[channel] - other > by for other in others)
+
+
 class RenderTests(RenderTestCase):
     def test_no_color_draws_scan_blue_and_color_the_points_own(self):
         self.view.set_cloud(*walls())
         blue = self.pixel(self.grab())
-        self.assertTrue(close(blue, BLUE), blue)
+        self.assertTrue(leans(blue, 2), blue)  # the scan's own blue
         self.view.set_color_mode(True)
         # The near red wall hides the green one behind it.
-        self.assertEqual(self.pixel(self.grab()), (220, 30, 30))
+        red = self.pixel(self.grab())
+        self.assertTrue(leans(red, 0), red)
 
     def test_colour_channels_stay_in_order(self):
+        # Not the exact values, which the lighting decides, but that red
+        # stays ahead of green and green ahead of blue: a channel swap
+        # anywhere between numpy and the shader would show here.
         self.view.set_color_mode(True)
         self.view.set_cloud(*wall(colour=(220, 120, 30)))
-        self.assertEqual(self.pixel(self.grab()), (220, 120, 30))
+        r, g, b = self.pixel(self.grab())
+        self.assertGreater(r, g + 20, (r, g, b))
+        self.assertGreater(g, b + 20, (r, g, b))
 
     def test_up_and_left_in_the_sensors_view_stay_up_and_left(self):
         # Sensor axes: x right, y down. A red patch up and left, a green one down and right.
@@ -156,27 +177,56 @@ class RenderTests(RenderTestCase):
         self.view.set_cloud(*(np.vstack(pair) for pair in zip(red, green)))
         rgb = self.grab()
         # Framed on both, 400 mm away: each lands 0.31 of the half-width and
-        # 0.27 of the half-height from the middle.
-        self.assertEqual(self.pixel(rgb, 0.5 - 0.155, 0.5 - 0.1375), (220, 30, 30))
-        self.assertEqual(self.pixel(rgb, 0.5 + 0.155, 0.5 + 0.1375), (30, 220, 30))
+        # 0.27 of the half-height from the middle. Which patch is where is
+        # the point; the lighting decides how bright each one comes out.
+        up_left = self.pixel(rgb, 0.5 - 0.155, 0.5 - 0.1375)
+        down_right = self.pixel(rgb, 0.5 + 0.155, 0.5 + 0.1375)
+        self.assertTrue(leans(up_left, 0), up_left)      # red, up and left
+        self.assertTrue(leans(down_right, 1), down_right)  # green, down and right
 
     def test_surfaces_turned_away_are_shaded_darker(self):
         points, colors, _ = walls()
-        tilted = np.tile(np.array([0.0, -1.0, -1.0]) / np.sqrt(2), (len(points), 1))
-        self.view.set_cloud(points, colors, tilted.astype(np.float32))
-        light = 0.3 + 0.7 / np.sqrt(2)  # 45 degrees from the viewer
-        shaded = self.pixel(self.grab())
-        self.assertTrue(close(shaded, [round(c * 255 * light) for c in SCAN_BLUE]), shaded)
+        facing = np.tile(np.array([0.0, 0.0, -1.0]), (len(points), 1))
+        self.view.set_cloud(points, colors, facing.astype(np.float32))
+        straight_on = self.pixel(self.grab())
+        # The same wall turned 60 degrees from the viewer.
+        turned = np.tile(np.array([0.0, -np.sqrt(3) / 2, -0.5]), (len(points), 1))
+        self.view.set_cloud(points, colors, turned.astype(np.float32))
+        away = self.pixel(self.grab())
+        self.assertLess(brightness(away), brightness(straight_on),
+                        (away, straight_on))
+        # ...but still lit: a surface that goes black reads as a hole.
+        self.assertGreater(brightness(away), 12, away)
 
-    def test_orbiting_either_way_shades_alike(self):
+    def test_the_same_view_is_drawn_the_same_way_twice(self):
+        # The lighting is fixed to the viewer, so orbiting changes how a
+        # surface is shaded — that is what shows its shape. What must not
+        # change is the same view drawn again.
         self.view.set_cloud(*wall())
-        light = 0.3 + 0.7 * np.cos(np.radians(45))
-        expected = [round(c * 255 * light) for c in SCAN_BLUE]
         for yaw in (np.radians(45), -np.radians(45)):
             self.view.camera.yaw = yaw
             self.view.update()
-            seen = self.pixel(self.grab())
-            self.assertTrue(close(seen, expected), (yaw, seen, expected))
+            once = self.pixel(self.grab())
+            self.view.update()
+            self.assertEqual(self.pixel(self.grab()), once, yaw)
+
+    def test_a_curved_surface_is_shaded_across_its_curve(self):
+        # A flat lamp at the eye shades everything facing the viewer alike,
+        # which flattens a scan. The key light is off to one side so that
+        # curvature reads as a gradient: this is that gradient.
+        points, colors, _ = wall(60.0, 400.0, count=60)
+        across = points[:, 0] / max(np.abs(points[:, 0]).max(), 1e-6)
+        normals = np.stack([across, np.zeros_like(across),
+                            -np.sqrt(np.clip(1 - across ** 2, 0, 1))], axis=1)
+        self.view.set_cloud(points, colors, normals.astype(np.float32))
+        rgb = self.grab()
+        row = rgb[rgb.shape[0] // 2].astype(int)
+        # The lit pixels: bluer than the grey background.
+        lit = row[row[:, 2] - row[:, 0] > 20]
+        self.assertGreater(len(lit), 20, "the curved wall was not drawn")
+        spread = lit.sum(axis=1).max() - lit.sum(axis=1).min()
+        self.assertGreater(spread / 3.0, 10,
+                           f"a curved surface came out flat: spread {spread / 3.0:.1f}")
 
     def test_splats_are_sized_in_millimetres_up_to_a_cap(self):
         point = (np.array([[0.0, 0.0, 400.0]], np.float32), np.array([[220, 30, 30]], np.uint8),
@@ -188,7 +238,9 @@ class RenderTests(RenderTestCase):
         def width_px() -> int:
             rgb = self.grab()
             row = rgb[rgb.shape[0] // 2].astype(int)
-            return int(np.sum(row[:, 0] - row[:, 2] > 100))  # red, not grey
+            # Anything leaning red at all is part of the splat; the shading
+            # dims its edge, so "strongly red" would measure the middle.
+            return int(np.sum(row[:, 0] - row[:, 2] > 20))
 
         height_px = self.grab().shape[0]
         focal_px = height_px / (2 * np.tan(np.radians(OrbitCamera.FOV_Y) / 2))
@@ -202,7 +254,8 @@ class RenderTests(RenderTestCase):
         self.view.set_cloud(*wall(depth_mm=300.0))
         self.grab()
         self.view.set_cloud(*wall(400.0, 900.0))  # not framed again: the camera stays
-        self.assertTrue(close(self.pixel(self.grab()), BLUE))
+        seen = self.pixel(self.grab())
+        self.assertTrue(leans(seen, 2), seen)
 
     def test_the_background_is_a_grey_gradient(self):
         rgb = self.grab()
@@ -223,14 +276,20 @@ class RenderTests(RenderTestCase):
         points, colors, normals = wall()
         tint = np.zeros((len(points), 4), np.uint8)
         self.view.set_cloud(points, colors, normals, tint)
-        self.assertTrue(close(self.pixel(self.grab()), BLUE))  # no alpha: untouched
+        untinted = self.pixel(self.grab())
+        self.assertTrue(leans(untinted, 2), untinted)  # no alpha: still blue
         tint[:] = (245, 165, 36, 255)
         self.view.set_highlight(tint)
-        self.assertEqual(self.pixel(self.grab()), (245, 165, 36))
+        tinted = self.pixel(self.grab())
+        self.assertTrue(leans(tinted, 0), tinted)  # the tint is orange
         tint[:, 3] = 128  # half way between the tint and scan blue
         self.view.set_highlight(tint)
-        halfway = [round((t * 128 + b * 127) / 255) for t, b in zip((245, 165, 36), BLUE)]
-        self.assertTrue(close(self.pixel(self.grab()), halfway), self.pixel(self.grab()))
+        half = self.pixel(self.grab())
+        for channel in range(3):
+            low, high = sorted((untinted[channel], tinted[channel]))
+            self.assertTrue(low - 12 <= half[channel] <= high + 12,
+                            f"channel {channel}: {half} is not between "
+                            f"{untinted} and {tinted}")
         with self.assertRaises(ValueError):
             self.view.set_highlight(tint[:-1])
 
@@ -242,7 +301,8 @@ class RenderTests(RenderTestCase):
         self.view.makeCurrent()
         self.view.initializeGL()
         self.view.doneCurrent()
-        self.assertTrue(close(self.pixel(self.grab()), BLUE))
+        again = self.pixel(self.grab())
+        self.assertTrue(leans(again, 2), again)
 
     def test_another_view_going_leaves_this_ones_context_current(self):
         # Python can collect a closed view while this one draws; Qt then has
@@ -401,7 +461,7 @@ class PlatformContextTests(unittest.TestCase):
     def test_wayland_draws_with_opengl_es_through_egl(self):
         probe = probe_context("wayland", "es")
         self.assertEqual((probe.get("pyopengl"), probe.get("es")), ("egl", True), probe)
-        self.assertTrue(close(probe["centre"], BLUE), probe)
+        self.assertTrue(leans(probe["centre"], 2), probe)
 
     @unittest.skipUnless(os.environ.get("DISPLAY"), "needs an X11 display")
     def test_x11_draws_with_a_core_profile_through_glx(self):
@@ -409,7 +469,7 @@ class PlatformContextTests(unittest.TestCase):
         probe = probe_context("xcb", "core")
         self.assertEqual((probe.get("pyopengl"), probe.get("profile")), ("glx", "CoreProfile"),
                          probe)
-        self.assertTrue(close(probe["centre"], BLUE), probe)
+        self.assertTrue(leans(probe["centre"], 2), probe)
 
 
 if __name__ == "__main__":

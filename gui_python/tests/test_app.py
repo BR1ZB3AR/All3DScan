@@ -282,12 +282,15 @@ class MenuTests(WindowTestCase):
             found[action.text()] = ([a.text() for a in menu.actions()] if menu else None)
         return found
 
-    def test_the_menu_bar_holds_file_edit_theme_help_and_about(self):
+    def test_the_menu_bar_holds_file_edit_theme_help_settings_and_about(self):
         window = self.open_window()
         menus = self.menus(window)
-        self.assertEqual(list(menus), ["&File", "&Edit", "&Theme", "&Help", "&About"])
+        self.assertEqual(list(menus),
+                         ["&File", "&Edit", "&Theme", "&Help", "&Settings…", "&About"])
         self.assertEqual(menus["&Theme"], ["Dark", "Light", "Custom…"])
-        self.assertIsNone(menus["&About"])  # one thing to do, so no submenu
+        # Each does one thing, so neither opens a submenu.
+        self.assertIsNone(menus["&About"])
+        self.assertIsNone(menus["&Settings…"])
         self.assertIn("&Quit", menus["&File"])
         self.assertIn("Export STEP", menus["&File"])
         self.assertIn("Fusion", menus["&Edit"])
@@ -1516,6 +1519,105 @@ class CloudSurfaceTests(WindowTestCase):
         wait_until(lambda: not window._meshing, timeout_s=60)
         self.assertIsNone(model.surface)
         self.assertTrue(window.mesh_action.isEnabled(), "the button stayed stuck")
+
+
+class SettingsTests(WindowTestCase):
+    """The Settings window: what the 3D view is drawn with."""
+
+    def dialog(self, window, settings=None):
+        from settings_dialog import SettingsDialog
+        import graphics as g
+        chosen = SettingsDialog(settings or g.Graphics(), window, gpu="Test GPU")
+        self.addCleanup(chosen.deleteLater)
+        return chosen
+
+    def test_it_sits_in_the_menu_bar_left_of_about(self):
+        window = self.open_window()
+        names = [a.text() for a in window.menuBar().actions()]
+        self.assertEqual(names[-2:], ["&Settings…", "&About"])
+
+    def test_a_preset_sets_the_choices_below_it(self):
+        import graphics as g
+        window = self.open_window()
+        chosen = self.dialog(window)
+        chosen.presets.choose("Performance")
+        self.assertEqual(chosen.settings().antialiasing, 0)
+        self.assertFalse(chosen.settings().eye_dome)
+        chosen.presets.choose("Quality")
+        self.assertEqual(chosen.settings().antialiasing, 8)
+        self.assertTrue(chosen.settings().eye_dome)
+        self.assertEqual(g.matching_preset(chosen.settings()), "Quality")
+
+    def test_changing_a_choice_by_hand_makes_it_custom(self):
+        window = self.open_window()
+        chosen = self.dialog(window)
+        chosen.presets.choose("Quality")
+        chosen.eye_dome.setChecked(False)
+        self.assertEqual(chosen.presets.chosen_key(), "Custom")
+
+    def test_apply_hands_back_the_settings_without_closing(self):
+        window = self.open_window()
+        chosen = self.dialog(window)
+        got = []
+        chosen.applied.connect(got.append)
+        chosen.presets.choose("Performance")
+        chosen.apply_button.click()
+        self.assertEqual(len(got), 1)
+        self.assertFalse(got[0].eye_dome)
+        # Apply does not close it: a change can be seen against the scan
+        # behind and then thought better of.
+        self.assertEqual(chosen.result(), 0)
+        # Having applied, there is nothing further to apply.
+        self.assertFalse(chosen.apply_button.isEnabled())
+        # OK is what closes it, handing the settings back once more.
+        chosen.buttons.accepted.emit()
+        self.assertEqual(len(got), 2)
+        self.assertEqual(chosen.result(), int(app.QDialog.DialogCode.Accepted))
+
+    def test_cancel_hands_back_nothing(self):
+        window = self.open_window()
+        chosen = self.dialog(window)
+        got = []
+        chosen.applied.connect(got.append)
+        chosen.presets.choose("Performance")
+        chosen.reject()
+        self.assertEqual(got, [])
+
+    def test_the_settings_reach_the_3d_view(self):
+        import graphics as g
+        window = self.open_window()
+        window._use_graphics(g.Graphics(eye_dome=False, splat_mm=5.0,
+                                        eye_dome_strength=20.0))
+        view = window.viewport.view3d
+        self.assertFalse(view.renderer.halo.wanted)
+        self.assertAlmostEqual(view.splat_mm, 5.0)
+        self.assertAlmostEqual(view.renderer.halo.strength, 20.0)
+
+    def test_what_needs_a_restart_says_so(self):
+        import graphics as g
+        window = self.open_window()
+        chosen = self.dialog(window, g.Graphics(antialiasing=4, window_system="automatic"))
+        self.assertNotIn("Applies after a restart", chosen.restart_note.text())
+        chosen.antialiasing.setCurrentIndex(chosen.antialiasing.findData(8))
+        self.assertIn("smoothing", chosen.restart_note.text())
+        chosen.window_system.choose("x11")
+        self.assertIn("the window system", chosen.restart_note.text())
+
+    def test_settings_out_of_range_are_brought_back_rather_than_breaking_it(self):
+        import graphics as g
+        silly = g.Graphics(antialiasing=999, eye_dome_strength=-40.0, splat_mm=0.0,
+                           point_budget=1, window_system="plan9").tidy()
+        self.assertIn(silly.antialiasing, g.ANTIALIASING)
+        self.assertGreaterEqual(silly.eye_dome_strength, 0.0)
+        self.assertGreater(silly.splat_mm, 0.0)
+        self.assertGreaterEqual(silly.point_budget, 50_000)
+        self.assertEqual(silly.window_system, "automatic")
+
+    def test_the_window_system_choice_becomes_a_platform_name(self):
+        import graphics as g
+        self.assertIsNone(g.platform_override(g.Graphics(window_system="automatic")))
+        self.assertEqual(g.platform_override(g.Graphics(window_system="x11")), "xcb")
+        self.assertEqual(g.platform_override(g.Graphics(window_system="wayland")), "wayland")
 
 
 class ShippedTests(unittest.TestCase):

@@ -13,6 +13,9 @@ import theme
 import viewport3d
 import widgets
 
+#: How many samples the 3D view asks for per pixel, to smooth its edges.
+MSAA_SAMPLES = 4
+
 HERE = Path(__file__).resolve().parent
 APP_ICON = HERE.parent / "resources/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png"
 # The launcher entry's file name (install_desktop_entry.py) and, on Wayland,
@@ -54,7 +57,7 @@ def uses_wayland(argv: list[str] | None = None) -> bool:
 _configured_for: str | None = None
 
 
-def configure_opengl(argv: list[str] | None = None) -> None:
+def configure_opengl(argv: list[str] | None = None, samples: int | None = None) -> None:
     """Asks for the OpenGL context the 3D view is written for. Call it before
     the QApplication is created, with the arguments it will be given: Qt
     reads the default format then.
@@ -72,6 +75,11 @@ def configure_opengl(argv: list[str] | None = None) -> None:
         surface.setVersion(3, 3)
         surface.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     surface.setDepthBufferSize(24)
+    # Without this the edges of every triangle and every splat come out
+    # stepped. Four samples is the usual trade: most of the smoothing for a
+    # quarter of the cost of sixteen. A driver that will not give them hands
+    # back a context with fewer, which only costs the smoothing.
+    surface.setSamples(samples if samples is not None else MSAA_SAMPLES)
     QSurfaceFormat.setDefaultFormat(surface)
 
 

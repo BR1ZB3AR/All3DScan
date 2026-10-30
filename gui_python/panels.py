@@ -704,6 +704,14 @@ class Viewport(QFrame):
         self._step = 1  # the display thinning of the shown cloud
         self.view3d.failed.connect(self._on_3d_failed)
 
+    def use_graphics(self, settings) -> None:
+        """Passes the graphics settings down to the 3D view."""
+        self.view3d.use_graphics(settings)
+
+    def describe_gpu(self) -> str:
+        """What is drawing the 3D view."""
+        return self.view3d.describe_gpu()
+
     def set_stage(self, scanning: bool) -> None:
         """Scanning shows the distance gauge and draws the cloud green; a
         finished model shows the rendering choice and goes blue."""

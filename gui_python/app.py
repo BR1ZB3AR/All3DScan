@@ -38,6 +38,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -48,6 +49,7 @@ from PyQt6.QtWidgets import (
 )
 
 import all3dscan_engine as engine
+import graphics
 import rea_engine as rea
 import scanners
 import theme
@@ -63,6 +65,7 @@ from common import (
     theme_named,
     warn_if_platform_differs,
 )
+from settings_dialog import SettingsDialog
 from theme_dialog import CustomThemeDialog
 from panels import CameraPanel, ModelPanel, ScanModel, ScanPanel, ScanState, Viewport, tint
 from viewport3d import image_pixels
@@ -836,8 +839,25 @@ class MainWindow(QMainWindow):
         help_menu.addAction(item("&Shortcuts…", self._show_shortcuts, "F1"))
         help_menu.addAction(item("Scanning &tips…", self._show_tips))
 
-        # A heading of its own rather than a menu, since it holds one thing.
+        # Headings of their own rather than menus, since each holds one thing.
+        bar.addAction(item("&Settings…", self.show_settings, "Ctrl+,",
+                           tip="How the 3D view is drawn"))
         bar.addAction(item("&About", self._show_about))
+
+    def show_settings(self) -> None:
+        """The Settings window. Apply shows a change against the scan on
+        screen behind without closing, so it can be judged rather than
+        guessed at."""
+        dialog = SettingsDialog(graphics.current(), self, gpu=self.viewport.describe_gpu())
+        dialog.applied.connect(self._use_graphics)
+        dialog.exec()
+
+    def _use_graphics(self, settings) -> None:
+        """Takes the graphics settings, remembers them, and applies the ones
+        that do not need the app restarted."""
+        graphics.remember(settings)
+        self.viewport.use_graphics(settings)
+        print(f"graphics: {settings}", flush=True)
 
     def set_theme(self, name: str) -> None:
         """Dresses the window in a theme and remembers it for next time."""
@@ -1941,7 +1961,15 @@ def main(argv: list[str] | None = None) -> int:
     args, qt_args = parser.parse_known_args(argv)
 
     qt_argv = [sys.argv[0], *qt_args]
-    configure_opengl(qt_argv)  # before the QApplication, which reads it
+    # The window system and the samples per pixel have to be settled before
+    # the QApplication exists, since Qt reads both as it starts.
+    chosen = graphics.current()
+    asked = graphics.platform_override(chosen)
+    if asked and not any(a.startswith(("-platform", "--platform")) for a in qt_argv):
+        # An explicit -platform on the command line still wins: someone who
+        # started the app a particular way meant it.
+        qt_argv[1:1] = ["-platform", asked]
+    configure_opengl(qt_argv, samples=chosen.antialiasing)
     app = QApplication(qt_argv)
     warn_if_platform_differs()
     app.setApplicationName("All3DScan")
@@ -1960,6 +1988,7 @@ def main(argv: list[str] | None = None) -> int:
     # The smoke test runs with no one watching, so it scans the stand-in.
     mock = engine.MockDepthSensor(640, 480, seed=0) if args.mock or args.smoke_test else None
     window = MainWindow(mock)
+    window.viewport.use_graphics(chosen)
     window.show()
     if args.smoke_test:
         run_smoke_test(app, window)
