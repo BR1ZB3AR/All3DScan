@@ -17,6 +17,7 @@ to STEP (rea_engine.py):
 
 import argparse
 import math
+import shutil
 import sys
 import tempfile
 import time
@@ -32,10 +33,13 @@ from PyQt6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QUrl,
     pyqtSignal,
     pyqtSlot,
 )
-from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QDesktopServices, QIcon, QKeySequence, QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -54,6 +58,7 @@ import rea_engine as rea
 import scanners
 import theme
 from common import (
+    MARKER_SHEETS,
     APP_ICON,
     APP_ID,
     apply_theme,
@@ -843,6 +848,10 @@ class MainWindow(QMainWindow):
         help_menu = bar.addMenu("&Help")
         help_menu.addAction(item("&Shortcuts…", self._show_shortcuts, "F1"))
         help_menu.addAction(item("Scanning &tips…", self._show_tips))
+        help_menu.addSeparator()
+        help_menu.addAction(item(
+            "Printable &marker sheet…", self.save_marker_sheet,
+            tip="Save a sheet of tracking markers to print, for marker tracking"))
 
         # Headings of their own rather than menus, since each holds one thing.
         bar.addAction(item("&Settings…", self.show_settings, "Ctrl+,",
@@ -932,6 +941,53 @@ class MainWindow(QMainWindow):
             "the lighting or the object changes.</p>"
             "<p>Move slowly: each frame is aligned onto the last, and the Tracking "
             "count in the status bar shows how many are landing.</p>"))
+
+    #: The sheet to offer. The scattered one: a regular grid of markers
+    #: repeats itself, and marker tracking recognises a constellation by the
+    #: distances within it, so a grid matches the map in many places at once.
+    MARKER_SHEET = "markers_scattered.pdf"
+
+    def save_marker_sheet(self, path: str | Path | None = None) -> Path | None:
+        """Saves the printable marker sheet somewhere the person can find it.
+
+        Marker tracking needs markers in view, and these are the ones this
+        app's own tool makes: 6 mm centres in 10 mm rings, the size of
+        Revopoint's own adhesive markers, so printed and stuck-on can be
+        mixed."""
+        sheet = MARKER_SHEETS / self.MARKER_SHEET
+        if not sheet.is_file():
+            print(f"the marker sheet is missing from {sheet}", file=sys.stderr, flush=True)
+            QMessageBox.warning(
+                self, "No marker sheet",
+                f"The printable sheet should be at {sheet}, and is not there. It is "
+                f"made by tools/make_marker_sheet.py.")
+            return None
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save the marker sheet", str(Path.home() / self.MARKER_SHEET),
+                "PDF (*.pdf)")
+            if not path:
+                return None
+        path = Path(path).with_suffix(".pdf")
+        try:
+            shutil.copyfile(sheet, path)
+        except OSError as exc:
+            print(f"saving the marker sheet failed: {describe(exc)}", file=sys.stderr,
+                  flush=True)
+            QMessageBox.warning(self, "Could not save the marker sheet", str(exc))
+            return None
+        print(f"marker sheet saved to {path}", flush=True)
+        asked = QMessageBox.question(
+            self, "Marker sheet saved",
+            f"Saved to {path}.\n\nPrint it at 100% — never \"fit to page\". Scaling the "
+            f"sheet scales every distance the scanner measures, and the scan comes out "
+            f"the wrong size. The sheet carries a 100 mm bar: measure it after "
+            f"printing.\n\nOpen it now?",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close,
+            QMessageBox.StandardButton.Open)
+        if asked is QMessageBox.StandardButton.Open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        return path
 
     def _show_about(self) -> None:
         backend = "the mock depth camera"

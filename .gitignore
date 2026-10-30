@@ -15,3 +15,6 @@ target/
 .freebuff/
 *.code-workspace
 build-test/
+
+# Editor lock files, from opening a document in place
+.~lock.*#

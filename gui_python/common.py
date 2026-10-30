@@ -18,6 +18,9 @@ MSAA_SAMPLES = 4
 
 HERE = Path(__file__).resolve().parent
 APP_ICON = HERE.parent / "resources/icons/hicolor/256x256/apps/io.github.all3dscan.All3DScan.png"
+#: Printable sheets of tracking markers, which the app offers to save so
+#: they can be printed. Made by tools/make_marker_sheet.py.
+MARKER_SHEETS = HERE.parent / "resources" / "markers"
 # The launcher entry's file name (install_desktop_entry.py) and, on Wayland,
 # the window's app id, which is how the panel matches the two.
 APP_ID = "io.github.all3dscan.All3DScan.Gui"

@@ -1705,6 +1705,60 @@ class ColourOverlayTests(WindowTestCase):
         self.assertFalse(window.camera_panel.ar_button.isEnabled())
 
 
+class MarkerSheetTests(WindowTestCase):
+    """Handing out the printable marker sheet."""
+
+    def test_it_is_offered_under_help(self):
+        window = self.open_window()
+        help_menu = next(m for m in window.menuBar().actions() if m.text() == "&Help")
+        names = [a.text() for a in help_menu.menu().actions() if a.text()]
+        self.assertIn("Printable &marker sheet…", names)
+
+    def test_the_sheet_ships_with_the_app(self):
+        from common import MARKER_SHEETS
+        sheet = MARKER_SHEETS / app.MainWindow.MARKER_SHEET
+        self.assertTrue(sheet.is_file(), f"{sheet} is missing")
+        # A PDF, and not an empty one.
+        self.assertEqual(sheet.read_bytes()[:5], b"%PDF-")
+        self.assertGreater(sheet.stat().st_size, 2_000)
+
+    def test_it_is_the_scattered_sheet_not_the_grid(self):
+        # A grid of markers repeats itself, so it is kept only to compare
+        # against. Handing it out would be handing out the broken one.
+        self.assertIn("scattered", app.MainWindow.MARKER_SHEET)
+
+    def test_saving_it_writes_a_pdf_where_asked(self):
+        window = self.open_window()
+        into = Path(tempfile.mkdtemp(prefix="all3dscan-markers-"))
+        self.addCleanup(shutil.rmtree, into, True)
+        with mock.patch.object(app.QMessageBox, "question",
+                               return_value=app.QMessageBox.StandardButton.Close):
+            written = window.save_marker_sheet(into / "sheet.pdf")
+        self.assertIsNotNone(written)
+        self.assertTrue(written.is_file())
+        self.assertEqual(written.read_bytes()[:5], b"%PDF-")
+
+    def test_choosing_to_open_it_hands_it_to_the_system(self):
+        window = self.open_window()
+        into = Path(tempfile.mkdtemp(prefix="all3dscan-markers-"))
+        self.addCleanup(shutil.rmtree, into, True)
+        with mock.patch.object(app.QMessageBox, "question",
+                               return_value=app.QMessageBox.StandardButton.Open), \
+             mock.patch.object(app.QDesktopServices, "openUrl") as opened:
+            window.save_marker_sheet(into / "sheet.pdf")
+        self.assertTrue(opened.called)
+
+    def test_a_missing_sheet_is_reported_rather_than_written_empty(self):
+        window = self.open_window()
+        into = Path(tempfile.mkdtemp(prefix="all3dscan-markers-"))
+        self.addCleanup(shutil.rmtree, into, True)
+        with mock.patch.object(app.MainWindow, "MARKER_SHEET", "not_there.pdf"), \
+             mock.patch.object(app.QMessageBox, "warning") as warned:
+            self.assertIsNone(window.save_marker_sheet(into / "sheet.pdf"))
+        self.assertTrue(warned.called)
+        self.assertFalse((into / "sheet.pdf").exists())
+
+
 class ShippedTests(unittest.TestCase):
     """The window as the launcher starts it: the POP 4 and nothing else.
 
