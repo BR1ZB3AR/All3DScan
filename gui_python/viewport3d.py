@@ -77,6 +77,13 @@ in vec3 v_color;
 in vec4 v_highlight;
 uniform bool u_use_color;
 uniform vec3 u_base_color;
+// Splats are drawn twice. Pass 0 lays down only the depth of the front
+// surface; pass 1 draws the colour, soft at the rim and blended where splats
+// overlap, and only where pass 0 said the surface is. One pass with hard
+// discs is what makes a cloud read as beads: every splat meets its
+// neighbour at an edge.
+uniform int u_pass;
+uniform float u_depth_push;  // how far behind itself pass 0 sits, in depth units
 out vec4 frag;
 
 // Three lights rather than one. A single lamp at the eye flattens a scan:
@@ -102,17 +109,28 @@ vec3 shade(vec3 normal, vec3 base) {
 
 void main() {
     vec2 offset = gl_PointCoord - vec2(0.5);
-    float sqr = dot(offset, offset);
-    if (sqr > 0.25) discard;
+    float rim = length(offset) * 2.0;  // 0 at the middle, 1 at the edge
+    if (rim > 1.0) discard;
+    if (u_pass == 0) {
+        // Depth only, sat a hair behind where the splat really is. In the
+        // colour pass a neighbour on the same surface, which may be a
+        // fraction nearer, then is not thrown out for it; a splat on a
+        // surface genuinely farther back still is.
+        gl_FragDepth = gl_FragCoord.z + u_depth_push;
+        frag = vec4(0.0);
+        return;
+    }
+    gl_FragDepth = gl_FragCoord.z;
     // Shaded by the surface the point sits on, not by the splat's own
-    // roundness. Rounding each splat into a little sphere was tried and
-    // taken out again: it lights every point separately, so a cloud reads
-    // as a heap of beads instead of the surface the points lie on, and
-    // the larger the splats the worse it gets.
+    // roundness: rounding each splat into a sphere lights every point
+    // separately, which is beads again.
     vec3 normal = normalize(v_normal);
     vec3 base = u_use_color ? v_color : u_base_color;
     base = mix(base, v_highlight.rgb, v_highlight.a);
-    frag = vec4(shade(normal, base), 1.0);
+    // Solid in the middle, fading over the outer part, so where splats
+    // overlap they blend into one surface instead of meeting as discs.
+    float alpha = 1.0 - smoothstep(0.55, 1.0, rim);
+    frag = vec4(shade(normal, base), alpha);
 }
 """
 
@@ -188,6 +206,11 @@ uniform vec2 u_pixel;     // one pixel, in texture coordinates
 uniform float u_strength;
 uniform float u_near;
 uniform float u_far;
+// A step smaller than this, in millimetres, is noise, not shape. Without
+// it every splat is outlined: neighbours sit at depths a fraction of a
+// millimetre apart, and each such step read as a contour, so a cloud came
+// out as a heap of ringed beads — worse, the larger the splats on screen.
+uniform float u_tolerance;
 out vec4 frag;
 
 // The depth buffer holds a non-linear value; distances have to be compared
@@ -204,7 +227,8 @@ void main() {
         frag = vec4(color, 1.0);
         return;
     }
-    float here = log2(eye_depth(stored));
+    float here_mm = eye_depth(stored);
+    float here = log2(here_mm);
     // Eight neighbours, two pixels out: far enough to catch a contour,
     // near enough not to smear it.
     const vec2 AROUND[8] = vec2[8](
@@ -220,7 +244,10 @@ void main() {
         // Giving it a made-up distance instead turns every point with
         // nothing behind it black, which is most of a sparse cloud.
         if (neighbour >= 1.0) continue;
-        sum += max(0.0, log2(eye_depth(neighbour)) - here);
+        float there_mm = eye_depth(neighbour);
+        // Only a step past the noise counts as a contour.
+        if (there_mm - here_mm <= u_tolerance) { counted += 1.0; continue; }
+        sum += log2(there_mm) - here;
         counted += 1.0;
     }
     // A pixel with no lit neighbours at all is a point on its own; there is
@@ -426,6 +453,9 @@ class DepthHalo:
     #: scans: below about 20 the contours barely show, above about 100 the
     #: cloud goes muddy in its own creases.
     STRENGTH = 55.0
+    #: A depth step this small, in millimetres, is the scanner's own noise
+    #: (0.47 mm a frame, measured), not shape. Steps below it do not darken.
+    TOLERANCE_MM = 1.5
 
     def __init__(self) -> None:
         self.ready = False
@@ -448,7 +478,8 @@ class DepthHalo:
             self._program = _program(header, EDL_VERTEX, EDL_FRAGMENT)
             self._uniforms = {
                 name: GL.glGetUniformLocation(self._program, name)
-                for name in ("u_color", "u_depth", "u_pixel", "u_strength", "u_near", "u_far")
+                for name in ("u_color", "u_depth", "u_pixel", "u_strength", "u_near", "u_far",
+                             "u_tolerance")
             }
             self._vao = GL.glGenVertexArrays(1)
             self._fbo = GL.glGenFramebuffers(1)
@@ -536,6 +567,7 @@ class DepthHalo:
         GL.glUniform1i(self._uniforms["u_depth"], 1)
         GL.glUniform2f(self._uniforms["u_pixel"], 1.0 / width, 1.0 / height)
         GL.glUniform1f(self._uniforms["u_strength"], self.strength)
+        GL.glUniform1f(self._uniforms["u_tolerance"], self.TOLERANCE_MM)
         GL.glUniform1f(self._uniforms["u_near"], near)
         GL.glUniform1f(self._uniforms["u_far"], far)
         GL.glBindVertexArray(self._vao)
@@ -553,6 +585,10 @@ class PointCloudRenderer:
     # Per point: position and normal (float), colour (bytes, RGB) and tint
     # (bytes, RGBA), at attribute locations 0 to 3.
     ATTRIBUTES = ((3, np.float32), (3, np.float32), (3, np.uint8), (4, np.uint8))
+    #: How far behind itself the depth pass sits, in depth-buffer units, so
+    #: that splats on one surface pass the colour pass's depth test against
+    #: each other while a surface behind still fails it.
+    DEPTH_PUSH = 2.0e-4
 
     def __init__(self) -> None:
         self.count = 0  # points in the GPU buffers
@@ -580,7 +616,8 @@ class PointCloudRenderer:
         self._background = _program(header, BACKGROUND_VERTEX, BACKGROUND_FRAGMENT)
         self._uniforms = {name: GL.glGetUniformLocation(self._points, name)
                           for name in ("u_mvp", "u_view_rotation", "u_splat_px",
-                                       "u_max_splat_px", "u_use_color", "u_base_color")}
+                                       "u_max_splat_px", "u_use_color", "u_base_color",
+                                       "u_pass", "u_depth_push")}
         self._background_uniforms = {name: GL.glGetUniformLocation(self._background, name)
                                      for name in ("u_top", "u_bottom")}
         self.point_size_limit = float(GL.glGetFloatv(GL.GL_ALIASED_POINT_SIZE_RANGE)[1])
@@ -731,8 +768,27 @@ class PointCloudRenderer:
                            min(max_splat_px, self.point_size_limit))
             GL.glUniform1i(self._uniforms["u_use_color"], int(use_color))
             GL.glUniform3f(self._uniforms["u_base_color"], *base_color)
+            GL.glUniform1f(self._uniforms["u_depth_push"], self.DEPTH_PUSH)
             GL.glBindVertexArray(self._vao)
+            # Pass one: the depth of the front surface, and nothing else.
+            GL.glColorMask(False, False, False, False)
+            GL.glDepthMask(True)
+            GL.glDepthFunc(GL.GL_LESS)
+            GL.glUniform1i(self._uniforms["u_pass"], 0)
             GL.glDrawArrays(GL.GL_POINTS, 0, self.count)
+            # Pass two: the colour, soft-rimmed and blended where splats
+            # overlap, kept to the surface pass one found.
+            GL.glColorMask(True, True, True, True)
+            GL.glDepthMask(False)
+            GL.glDepthFunc(GL.GL_LEQUAL)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            GL.glUniform1i(self._uniforms["u_pass"], 1)
+            GL.glDrawArrays(GL.GL_POINTS, 0, self.count)
+            # Leave the state as the rest of the frame expects it.
+            GL.glDisable(GL.GL_BLEND)
+            GL.glDepthMask(True)
+            GL.glDepthFunc(GL.GL_LESS)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
         if haloed:

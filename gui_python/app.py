@@ -2035,7 +2035,16 @@ def cloud_pixels(window: MainWindow) -> tuple[int, int]:
     scan_blue = blue > 1.4 * np.maximum(red, green)
     scan_green = green > 1.4 * np.maximum(red, blue)
     # Amber, pink and the rest of the palette: never grey, nor a scan colour.
-    tinted = (np.maximum(red, green) > blue + 15) & ~scan_green
+    # A tint is strongly coloured, so ask for real chroma too: a splat's
+    # soft rim blending green into the grey behind it is faintly green-grey,
+    # not a tint, and would otherwise be counted as one.
+    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+    # ...and a scan colour, however faint, is not a tint: a soft rim blends
+    # green into the grey behind it and comes out green-leading but not
+    # green enough for scan_green. No tint in the palette leads with green.
+    greenish = (green > red + 15) & (green > blue + 15)
+    tinted = ((np.maximum(red, green) > blue + 15) & ~scan_green & ~greenish
+              & (chroma > 40))
     return int((scan_blue | scan_green).sum()), int(tinted.sum())
 
 

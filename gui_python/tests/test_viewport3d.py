@@ -236,11 +236,14 @@ class RenderTests(RenderTestCase):
         self.view.camera.distance = 400.0
 
         def width_px() -> int:
+            # The splat's footprint: every pixel on the middle row that
+            # differs from the background, which the row's first pixel is.
+            # Its rim is soft, so "strongly red" would measure only the
+            # solid middle; this measures the size it was given.
             rgb = self.grab()
             row = rgb[rgb.shape[0] // 2].astype(int)
-            # Anything leaning red at all is part of the splat; the shading
-            # dims its edge, so "strongly red" would measure the middle.
-            return int(np.sum(row[:, 0] - row[:, 2] > 20))
+            background = row[0]
+            return int(np.sum(np.abs(row - background).max(axis=1) > 6))
 
         height_px = self.grab().shape[0]
         focal_px = height_px / (2 * np.tan(np.radians(OrbitCamera.FOV_Y) / 2))
