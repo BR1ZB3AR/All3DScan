@@ -64,8 +64,8 @@ Support levels are evidence-based:
 
 | Vendor | Model/family | USB identity | Level | Notes |
 | --- | --- | --- | --- | --- |
-| Revopoint | POP4 | `2207:110c` | Capture (experimental) | Native XU arming + packed 640×2560 Y16 → approximate metric decode. Factory camparam/Q still open. Revo “AI” features are host-side (see `docs/protocol/RE_NOTES.md` AI parity). |
-| Revopoint | POP/POP2/POP3/MINI/RANGE | vendor `2207` | Candidate | Vendor-wide detection is enabled, but this does not prove protocol compatibility. |
+| Revopoint | POP4 | `2207:110c` | Scanning (infrared mode) | The only scanner that scans live. Infrared mode works end to end: projector, lights and exposure; the scanner's own factory calibration; tracking; live mesh; meshing. Blue-laser mode projects but cannot scan yet (it needs a line-laser decoder), and marker tracking is not built yet. Revo "AI" features are host-side (see `docs/protocol/RE_NOTES.md`, 2026-10-31). |
+| Revopoint | POP/POP2/POP3/MINI/RANGE | vendor `2207` | Candidate | Not working yet. Vendor-wide detection is enabled, but no other Revopoint model has been tested, so this does not prove protocol compatibility. |
 | Creality | CR-Scan Otter | `2bc5:06da` | Detected | Public Linux descriptor evidence confirms three UVC functions plus HID. Capture/control protocol is not implemented. |
 | Creality | Ferret/Ferret Pro/Raptor | vendor `2bc5` | Candidate | Vendor-wide detection is enabled; model VID/PIDs and protocol behavior require hardware captures. |
 | Einstar / Shining3D | Einstar family | unknown | Candidate | Placeholder entry is disabled until a real `lsusb` capture confirms VID/PID. |

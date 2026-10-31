@@ -7,7 +7,9 @@
 
 A clean-room, open-source **native** Linux scanning application with a dark
 interface, targeting consumer structured-light 3D scanners
-from **Revopoint, Creality, and Einstar**. This is **not** a Wine wrapper:
+from **Revopoint, Creality, and Einstar**. So far, live scanning works on the
+**Revopoint POP 4** only (see [Supported hardware](#supported-hardware)).
+This is **not** a Wine wrapper:
 day-to-day scanning uses Ubuntu's own USB (`uvcvideo`/`hidraw`) and GPU stacks.
 Wine often fails to expose these scanners and cannot drive their Direct3D/CUDA
 paths reliably — that is exactly why this project exists.
@@ -42,14 +44,24 @@ See [`docs/HARDWARE_SUPPORT.md`](docs/HARDWARE_SUPPORT.md) for the
 evidence-based compatibility matrix. Detection does not imply that capture,
 calibration, projector control, or reconstruction is implemented.
 
-| Vendor | USB VID | Status |
-| --- | --- | --- |
-| Revopoint (POP4/POP/POP2/POP3/MINI/RANGE) | `2207` | Confirmed `2207:110c`; vendor-wide match enabled |
-| Creality (CR-Scan Otter/Ferret/Ferret Pro/Raptor) | `2bc5` | Confirmed `2bc5:06da` (Otter); vendor-wide match enabled |
-| Einstar / Shining3D | `2231`* | Placeholder, disabled — confirm VID via `lsusb` and enable |
+**Only the Revopoint POP 4 scans live today.** Every other scanner below is
+recognised when plugged in and named in the scanner list, but cannot take a
+scan yet. Scan with the vendor's own software, then open the export here with
+**File → Open scan**.
 
-\* The Einstar VID is not yet confirmed here. Attach the scanner, run `lsusb`,
-set the real `vendorId` in `resources/devices.json`, and flip `"enabled": true`.
+| Scanner | USB ID | Live scanning |
+| --- | --- | --- |
+| Revopoint POP 4 | `2207:110c` | ✅ **Working** in infrared mode: lights, exposure, factory calibration, tracking, live mesh. Blue-laser mode cannot scan yet, and marker tracking is not built yet. |
+| Revopoint POP / POP 2 / POP 3 / MINI / RANGE | vendor `2207` | ❌ **Not working yet.** Not tested; no protocol work done. |
+| Creality CR-Scan Otter | `2bc5:06da` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
+| Creality CR-Scan Ferret / Ferret Pro / Raptor | vendor `2bc5` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
+| Einstar / Shining3D | not confirmed\* | ❌ **Not working yet.** Detection is off until a real `lsusb` confirms the ID. |
+
+\* The Einstar Rockit was reported as `2207:2001` in
+[issue #2](https://github.com/BR1ZB3AR/All3DScan/issues/2), with a protocol
+description that has not been tested here. To add an Einstar, attach it, run
+`lsusb`, set the real `vendorId` in `resources/devices.json`, and set
+`"enabled": true`.
 
 ## Status
 
