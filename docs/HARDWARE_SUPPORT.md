@@ -64,7 +64,7 @@ Support levels are evidence-based:
 
 | Vendor | Model/family | USB identity | Level | Notes |
 | --- | --- | --- | --- | --- |
-| Revopoint | POP4 | `2207:110c` | Scanning (infrared mode) | The only scanner that scans live. Infrared mode works end to end: projector, lights and exposure; the scanner's own factory calibration; tracking; live mesh; meshing. Blue-laser mode projects but cannot scan yet (it needs a line-laser decoder), and marker tracking is not built yet. Revo "AI" features are host-side (see `docs/protocol/RE_NOTES.md`, 2026-10-31). |
+| Revopoint | POP4 | `2207:110c` | Scanning (in development, infrared mode) | The only scanner that can take a scan live, and still being developed. Infrared mode runs end to end: projector, lights and exposure; the scanner's own factory calibration; tracking; live mesh; meshing. Still to come: blue-laser mode projects but cannot scan yet (it needs a line-laser decoder); marker tracking is not built yet; depth and tracking are unreliable on dark or plain objects. Revo "AI" features are host-side (see `docs/protocol/RE_NOTES.md`, 2026-10-31). |
 | Revopoint | POP/POP2/POP3/MINI/RANGE | vendor `2207` | Candidate | Not working yet. Vendor-wide detection is enabled, but no other Revopoint model has been tested, so this does not prove protocol compatibility. |
 | Creality | CR-Scan Otter | `2bc5:06da` | Detected | Public Linux descriptor evidence confirms three UVC functions plus HID. Capture/control protocol is not implemented. |
 | Creality | Ferret/Ferret Pro/Raptor | vendor `2bc5` | Candidate | Vendor-wide detection is enabled; model VID/PIDs and protocol behavior require hardware captures. |

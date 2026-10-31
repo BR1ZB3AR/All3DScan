@@ -7,8 +7,9 @@
 
 A clean-room, open-source **native** Linux scanning application with a dark
 interface, targeting consumer structured-light 3D scanners
-from **Revopoint, Creality, and Einstar**. So far, live scanning works on the
-**Revopoint POP 4** only (see [Supported hardware](#supported-hardware)).
+from **Revopoint, Creality, and Einstar**. So far, live scanning is being
+developed on the **Revopoint POP 4** only, and is still in development there
+(see [Supported hardware](#supported-hardware)).
 This is **not** a Wine wrapper:
 day-to-day scanning uses Ubuntu's own USB (`uvcvideo`/`hidraw`) and GPU stacks.
 Wine often fails to expose these scanners and cannot drive their Direct3D/CUDA
@@ -44,14 +45,15 @@ See [`docs/HARDWARE_SUPPORT.md`](docs/HARDWARE_SUPPORT.md) for the
 evidence-based compatibility matrix. Detection does not imply that capture,
 calibration, projector control, or reconstruction is implemented.
 
-**Only the Revopoint POP 4 scans live today.** Every other scanner below is
-recognised when plugged in and named in the scanner list, but cannot take a
-scan yet. Scan with the vendor's own software, then open the export here with
+**Live scanning is in development, on the Revopoint POP 4 only.** The POP 4
+can take a scan, but it is still being developed. Every other scanner below
+is recognised when plugged in and named in the scanner list, but cannot take
+a scan yet. Scan with the vendor's own software, then open the export here with
 **File → Open scan**.
 
 | Scanner | USB ID | Live scanning |
 | --- | --- | --- |
-| Revopoint POP 4 | `2207:110c` | ✅ **Working** in infrared mode: lights, exposure, factory calibration, tracking, live mesh. Blue-laser mode cannot scan yet, and marker tracking is not built yet. |
+| Revopoint POP 4 | `2207:110c` | 🚧 **In development.** Scans in infrared mode: lights, exposure, factory calibration, tracking, live mesh. Still to come: blue-laser scanning, marker tracking, and more reliable tracking and depth on dark or plain objects. |
 | Revopoint POP / POP 2 / POP 3 / MINI / RANGE | vendor `2207` | ❌ **Not working yet.** Not tested; no protocol work done. |
 | Creality CR-Scan Otter | `2bc5:06da` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
 | Creality CR-Scan Ferret / Ferret Pro / Raptor | vendor `2bc5` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
