@@ -6,6 +6,79 @@ Status: **Phase B in progress.** Device identified and enumerated
 "Step 1" and "Step 3" below. This changes the implementation plan (see
 bottom of this doc).
 
+## The vendor's tracking is geometry, on the host; markers are not tracked here (2026-10-31)
+
+Asked whether the POP 4's "built-in AI" could be retrained for tracking.
+
+**Observed — the vendor app carries no neural network at all.** The native
+libraries of RevoScan 6.0.2.4 (`artifacts/apk_revoscan_6.0.2.4/lib/*.so`)
+were searched for every common inference runtime: RKNN, TFLite, ONNX,
+TensorRT, ncnn, MNN. None appears. The only "segmentation" strings are
+ffmpeg's VP9 internals.
+
+**Observed — its marker tracking is classical, and runs in the app.**
+`lib3DCamera.so` names `src/algo/markersPoints.cpp` (CPU and GPU versions),
+`createMarkersPoints` / `createMarkersPointsGPU`, `getMarkersInfo`,
+`cs::FeaturePointUtils::matchMarkers(std::vector<Point2f>&,
+std::vector<Point2f>&)` and "feature point reconstruct match markers
+failed". That is markers found as 2D points, matched between images and
+reconstructed. Each tracking mode gets a `slam_register_<mode>_320_200.cfg`
+in `assets/` (marker, feature, dark, face, body, hd). The six files are all
+the same 5 lines (normal smoothing, interval scales), so the modes differ in
+code, not in these files.
+
+**Derived — All3DScan ignores the Tracking setting.** Feature, Marker and
+Global marker only pick the vendor preset's distance band and the label on
+the model. Every frame is aligned by geometry-only point-to-plane ICP
+(`fusion_cpp/FrameFusion`). On a flat marker mat, a plane leaves in-plane
+sliding and turning unconstrained, so a frame can count as "tracked" while
+it slides.
+
+**Unknown.** Which Rockchip SoC the scanner uses (USB vendor `2207`), and
+whether it has an NPU. Nothing found so far runs a model on it. Putting one
+there would mean writing to the scanner, which this project does not do.
+
+**The vendor's own product page agrees.** Read 2026-10-31 at
+revopoint3d.com/products/pop4-wireless-hybrid-3d-scanner:
+- The spec table gives "CPU: /" (not disclosed) and "Built in Chip
+  Computing: Depth Map Computing". The chip is claimed for depth, not
+  tracking.
+- The AI claims are "Real-time AI Segmentation" (for post-processing) and
+  "AI-Powered … 3DGS Modeling … in Revo Scan 6". The page's platform table
+  lists "AI Intelligent Segmentation" per host (Windows-NVIDIA,
+  Windows-AMD, macOS, Android, iOS), so it is host software.
+- "Tracking Methods: Feature, Marker, Global Marker, Color."
+- The FAQ: "In laser line scanning mode, using markers is a must … at least
+  five markers are visible within each frame."
+- The multi-line laser runs at "105 fps (NVIDIA GPU), 60 fps (CPU)", so the
+  line decoding is on the host too.
+
+So blue-laser scanning needs marker tracking even in the vendor's software.
+Here, marker tracking comes first.
+
+This supersedes the "Inferred" reading of "POP4 'AI-powered' parity" below:
+for tracking, at least, nothing is learned.
+
+### Images for finding markers: switch the projector off
+
+**Observed (2026-10-31).** Raw ten-image frames were dumped, 10 frames per
+lighting, in infrared at 3000 us exposure, looking at the speaker scene:
+
+| | images 0–3 / 5–8, local contrast | images 4 / 9 | points a frame (median, range) |
+|---|---|---|---|
+| projector on | 2,440–2,625 (patterned) | 3,820 / 3,296 | 2,726 (1,994–3,462) |
+| projector off | 629–827 (clean) | 3,838 / 3,240 | 1,790 (1,150–2,527) |
+| off, fill light on | 1,091–1,561 (clean) | 4,023 / 3,318 | 2,383 (1,644–2,875) |
+
+With the projector off, both cameras give pattern-free images: 0–3 from the
+right camera, 5–8 from the left. Images 4 and 9 keep their speckle either
+way, as found on 10-14.
+
+**Unresolved.** Depth fell with the projector off (7 of 10 frames below the
+projector-on minimum). That contradicts the 10-14 measurement (9.03% vs
+9.13%). The phases ran in sequence, so drift is not ruled out. An on/off/on
+comparison has to settle it before marker tracking turns the projector off.
+
 ## Depth was rounded to whole millimetres before the cloud was built (2026-10-30)
 
 **Observed.** Holding the scanner still for 32 frames and reading each
