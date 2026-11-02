@@ -1,11 +1,14 @@
 # Grants non-root USB access to supported consumer 3D scanners so All3DScan
 # can talk to them via libusb/hidraw and V4L2 without running as root.
 #
-# Confirmed IDs:
-#   2207:110c  Revopoint POP4 / POP / POP2 / POP3 / MINI / RANGE (Chishine3d)
+# Known IDs:
+#   2207:110c  Revopoint POP 4 (Chishine3d), confirmed here
+#   2207:2001  Einstar Rockit, seen on a live unit by a contributor (issue #3)
+#   2207:001f  Einstar Rockit, the id Einstar's own software looks for
 #   2bc5:06da  Creality CR-Scan Otter (Orbbec depth module)
-# Vendor-wide rules also cover newer Revopoint (2207) and Creality (2bc5)
-# models. Add your Einstar/Shining3D VID here once confirmed with `lsusb`.
+# Vendor 2207 is Rockchip's, the chip maker's, so the rule below covers
+# Revopoint and Einstar scanners alike, and other Rockchip devices too.
+# Vendor-wide rules also cover newer Creality (2bc5) models.
 #
 # Access is granted to the logged-in seat user via TAG+="uaccess" (systemd
 # logind ACLs), which works on Ubuntu, Fedora and Arch alike — no distro-
@@ -17,7 +20,7 @@
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
 # then unplug and replug the scanner.
 
-# Revopoint (vendor 2207)
+# Revopoint and Einstar (vendor 2207, Rockchip's)
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", TAG+="uaccess"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2207", TAG+="uaccess"
 

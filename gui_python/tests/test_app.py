@@ -1395,6 +1395,34 @@ class ScannerListTests(unittest.TestCase):
         found = self.found(("2207", "110c"))
         self.assertEqual(found[0].label, "POP4")
 
+    def test_an_exact_entry_wins_wherever_it_sits_in_the_list(self):
+        # 2207 is Rockchip's vendor id, and both Revopoint and Einstar use
+        # it (issue #3: a live Einstar Rockit is 2207:2001). Listed after a
+        # vendor-wide 2207 line, the Rockit's own line must still win, or
+        # the Rockit is called a Revopoint.
+        listing = {"devices": [
+            {"vendor": "Revopoint", "vendorId": "2207", "productId": "*", "label": "any 2207"},
+            {"vendor": "Einstar", "vendorId": "2207", "productId": "2001", "label": "Rockit"},
+        ]}
+        path = self.listing()
+        path.write_text(json.dumps(listing))
+        found = scanners.plugged_in(sysfs=self.bus(("2207", "2001"), ("2207", "9999")),
+                                    devices=path)
+        named = {s.product_id: (s.vendor, s.label) for s in found}
+        self.assertEqual(named["2001"], ("Einstar", "Rockit"))
+        self.assertEqual(named["9999"], ("Revopoint", "any 2207"))
+
+    def test_the_shipped_list_names_an_einstar_rockit_as_one(self):
+        # The real resources/devices.json, against both ids issue #3 gives:
+        # 2001 seen on a live unit, 001f the one Einstar's software looks for.
+        found = scanners.plugged_in(sysfs=self.bus(("2207", "2001"), ("2207", "001f"),
+                                                   ("2207", "110c")))
+        named = {s.product_id: s for s in found}
+        for product in ("2001", "001f"):
+            self.assertEqual(named[product].vendor, "Einstar", product)
+            self.assertFalse(named[product].drivable, product)
+        self.assertEqual(named["110c"].name, "Revopoint POP 4 (USB)")
+
     def test_a_vendor_wide_entry_still_names_an_unknown_model(self):
         found = self.found(("2207", "9999"))
         self.assertEqual(len(found), 1)

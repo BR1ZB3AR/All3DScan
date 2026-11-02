@@ -104,21 +104,25 @@ def plugged_in(sysfs: Path | None = None, devices: Path | None = None) -> list[S
 
     A device matches an entry when the vendor agrees and either the product
     agrees or the entry covers the whole vendor, which is how devices.json
-    says "any model from these people".
+    says "any model from these people". An entry naming the exact product
+    beats a vendor-wide one wherever the two sit in the file: vendor 2207 is
+    Rockchip's, and both Revopoint and Einstar scanners use it.
     """
     known = known_devices(devices)
     found: dict[tuple[str, str], Scanner] = {}
-    for vendor_id, product_id in usb_devices(sysfs):
+    for vendor_id, product_id in set(usb_devices(sysfs)):
+        exact = whole_vendor = None
         for entry in known:
-            wanted = str(entry.get("vendorId", "")).lower()
-            product = str(entry.get("productId", "*")).lower()
-            if wanted != vendor_id or product not in ("*", "", product_id):
+            if str(entry.get("vendorId", "")).lower() != vendor_id:
                 continue
-            scanner = Scanner(vendor_id, product_id,
-                              entry.get("vendor", "Unknown"),
-                              entry.get("label", ""))
-            # An entry naming this exact product beats a vendor-wide one.
-            if product != "*" or (vendor_id, product_id) not in found:
-                found[(vendor_id, product_id)] = scanner
-            break
+            product = str(entry.get("productId", "*")).lower()
+            if product == product_id:
+                exact = exact or entry
+            elif product in ("*", ""):
+                whole_vendor = whole_vendor or entry
+        entry = exact or whole_vendor
+        if entry is not None:
+            found[(vendor_id, product_id)] = Scanner(vendor_id, product_id,
+                                                     entry.get("vendor", "Unknown"),
+                                                     entry.get("label", ""))
     return sorted(found.values(), key=lambda s: (not s.drivable, s.vendor, s.product_id))

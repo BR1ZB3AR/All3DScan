@@ -58,13 +58,13 @@ a scan yet. Scan with the vendor's own software, then open the export here with
 | Revopoint POP / POP 2 / POP 3 / MINI / RANGE | vendor `2207` | ❌ **Not working yet.** Not tested; no protocol work done. |
 | Creality CR-Scan Otter | `2bc5:06da` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
 | Creality CR-Scan Ferret / Ferret Pro / Raptor | vendor `2bc5` | ❌ **Not working yet.** Recognised on USB; no capture protocol. |
-| Einstar / Shining3D | not confirmed\* | ❌ **Not working yet.** Detection is off until a real `lsusb` confirms the ID. |
+| Einstar Rockit | `2207:2001`\* | ❌ **Not working yet.** Recognised on USB. It is not a camera like the POP 4 (USB networking, a HID command channel and a vendor data stream), so it needs protocol work of its own. |
 
-\* The Einstar Rockit was reported as `2207:2001` in
-[issue #2](https://github.com/BR1ZB3AR/All3DScan/issues/2), with a protocol
-description that has not been tested here. To add an Einstar, attach it, run
-`lsusb`, set the real `vendorId` in `resources/devices.json`, and set
-`"enabled": true`.
+\* As seen on a live unit by a contributor
+([issue #3](https://github.com/BR1ZB3AR/All3DScan/issues/3)), who also found
+Einstar's own software looking for `2207:001f`; both are listed. No Rockit
+has been attached here. `2207` is Rockchip's vendor ID, which Revopoint and
+Einstar scanners both use.
 
 ## Status
 

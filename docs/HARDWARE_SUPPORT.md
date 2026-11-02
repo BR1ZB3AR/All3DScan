@@ -68,8 +68,8 @@ Support levels are evidence-based:
 | Revopoint | POP/POP2/POP3/MINI/RANGE | vendor `2207` | Candidate | Not working yet. Vendor-wide detection is enabled, but no other Revopoint model has been tested, so this does not prove protocol compatibility. |
 | Creality | CR-Scan Otter | `2bc5:06da` | Detected | Public Linux descriptor evidence confirms three UVC functions plus HID. Capture/control protocol is not implemented. |
 | Creality | Ferret/Ferret Pro/Raptor | vendor `2bc5` | Candidate | Vendor-wide detection is enabled; model VID/PIDs and protocol behavior require hardware captures. |
-| Einstar / Shining3D | Einstar family | unknown | Candidate | Placeholder entry is disabled until a real `lsusb` capture confirms VID/PID. |
-| Einstar / Shining3D | Einstar Rockit | `2207:2001` (reported) | Candidate | VID/PID and a full protocol description were contributed in [issue #2](https://github.com/BR1ZB3AR/All3DScan/issues/2). Nothing in it is verified here — no Rockit has been attached — and none of its commands are wired up. It describes a laser-line scanner with on-device peak extraction, which shares no transport with the POP4's UVC path. |
+| Einstar / Shining3D | Einstar Rockit | `2207:2001` observed, `2207:001f` in vendor software | Candidate | Two contributors have reported it ([issue #2](https://github.com/BR1ZB3AR/All3DScan/issues/2), [issue #3](https://github.com/BR1ZB3AR/All3DScan/issues/3)). A live unit enumerated as `2207:2001` (macOS, pyusb), as a USB 3.2 composite: CDC-NCM networking, a vendor bulk pair and a HID command channel. EXStar Hub 1.1.3-10 filters on `2207:001f`. Both ids are in `devices.json`, so a Rockit is named rather than mistaken for a Revopoint (`2207` is Rockchip's vendor id, which both use). Nothing in either report is verified here — no Rockit has been attached — and none of its commands are wired up. It shares no transport with the POP4's UVC path. |
+| Einstar / Shining3D | Other Einstar models | unknown | Candidate | No ids known. |
 
 ## Reporting another model
 
